@@ -1,1 +1,0 @@
-C:\Users\abdal\OneDrive\Desktop\ide\rust\target\release\libipc_protocol.rlib: C:\Users\abdal\OneDrive\Desktop\ide\rust\crates\application-core\src\lib.rs C:\Users\abdal\OneDrive\Desktop\ide\rust\crates\ipc-protocol\src\lib.rs

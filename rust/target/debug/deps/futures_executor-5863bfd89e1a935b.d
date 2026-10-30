@@ -1,9 +1,0 @@
-C:\Users\abdal\OneDrive\Desktop\ide\rust\target\debug\deps\futures_executor-5863bfd89e1a935b.d: C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-executor-0.3.34\src\lib.rs C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-executor-0.3.34\src\local_pool.rs C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-executor-0.3.34\src\enter.rs
-
-C:\Users\abdal\OneDrive\Desktop\ide\rust\target\debug\deps\libfutures_executor-5863bfd89e1a935b.rlib: C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-executor-0.3.34\src\lib.rs C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-executor-0.3.34\src\local_pool.rs C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-executor-0.3.34\src\enter.rs
-
-C:\Users\abdal\OneDrive\Desktop\ide\rust\target\debug\deps\libfutures_executor-5863bfd89e1a935b.rmeta: C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-executor-0.3.34\src\lib.rs C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-executor-0.3.34\src\local_pool.rs C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-executor-0.3.34\src\enter.rs
-
-C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-executor-0.3.34\src\lib.rs:
-C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-executor-0.3.34\src\local_pool.rs:
-C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-executor-0.3.34\src\enter.rs:

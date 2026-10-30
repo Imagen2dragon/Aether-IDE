@@ -1,1 +1,0 @@
-C:\Users\abdal\OneDrive\Desktop\ide\rust\target\release\libsyntax_engine.rlib: C:\Users\abdal\OneDrive\Desktop\ide\rust\crates\application-core\src\lib.rs C:\Users\abdal\OneDrive\Desktop\ide\rust\crates\syntax-engine\src\lib.rs

@@ -1,0 +1,28 @@
+# Rust build artifacts
+/rust/target/
+**/target/
+**/*.rs.bk
+Cargo.lock
+
+# Node / JS dependencies and build artifacts
+node_modules/
+**/node_modules/
+dist/*.zip
+dist/windows-x64/
+.npm
+npm-debug.log*
+
+# OS and Editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Environment and secrets
+.env
+.env.*
+*.token
+*.pem
+*.key

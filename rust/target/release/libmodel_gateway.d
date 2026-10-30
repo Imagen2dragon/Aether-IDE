@@ -1,1 +1,0 @@
-C:\Users\abdal\OneDrive\Desktop\ide\rust\target\release\libmodel_gateway.rlib: C:\Users\abdal\OneDrive\Desktop\ide\rust\crates\application-core\src\lib.rs C:\Users\abdal\OneDrive\Desktop\ide\rust\crates\model-gateway\src\lib.rs C:\Users\abdal\OneDrive\Desktop\ide\rust\crates\security-core\src\lib.rs

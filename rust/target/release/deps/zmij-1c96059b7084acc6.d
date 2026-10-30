@@ -1,9 +1,0 @@
-C:\Users\abdal\OneDrive\Desktop\ide\rust\target\release\deps\zmij-1c96059b7084acc6.d: C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zmij-1.0.23\src\lib.rs C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zmij-1.0.23\src\stdarch_x86.rs C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zmij-1.0.23\src\traits.rs
-
-C:\Users\abdal\OneDrive\Desktop\ide\rust\target\release\deps\libzmij-1c96059b7084acc6.rlib: C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zmij-1.0.23\src\lib.rs C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zmij-1.0.23\src\stdarch_x86.rs C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zmij-1.0.23\src\traits.rs
-
-C:\Users\abdal\OneDrive\Desktop\ide\rust\target\release\deps\libzmij-1c96059b7084acc6.rmeta: C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zmij-1.0.23\src\lib.rs C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zmij-1.0.23\src\stdarch_x86.rs C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zmij-1.0.23\src\traits.rs
-
-C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zmij-1.0.23\src\lib.rs:
-C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zmij-1.0.23\src\stdarch_x86.rs:
-C:\Users\abdal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zmij-1.0.23\src\traits.rs:
