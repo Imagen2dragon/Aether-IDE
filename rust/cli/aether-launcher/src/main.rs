@@ -1,4 +1,5 @@
 mod webview2_runtime;
+mod win32_host;
 
 use std::env;
 use std::net::TcpStream;
@@ -102,9 +103,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Launch Standalone Desktop Workbench
     println!(" [*] Launching AetherIDE Standalone Desktop Workbench...");
-    let workbench_html = exe_dir.join("workbench").join("index.html");
-    let electron_exe = exe_dir.join("workbench").join("electron.exe");
-    let electron_main = exe_dir.join("workbench").join("dist").join("main.js");
+    let workbench_dir = exe_dir.join("workbench");
+    let workbench_html = workbench_dir.join("index.html");
+    let electron_exe = workbench_dir.join("electron.exe");
+    let electron_main = workbench_dir.join("dist").join("main.js");
 
     if electron_exe.exists() && electron_main.exists() {
         println!(" [✓] Launching bundled Electron runtime...");
@@ -112,12 +114,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Detect and launch native Microsoft WebView2 Evergreen Host
+    // Gate 3 (P0): Primary True Native HWND-Embedded WebView2 Host
+    #[cfg(windows)]
+    {
+        println!(" [✓] Initializing True Native Win32 + Microsoft WebView2 Embedded Host...");
+        let session_token = std::fs::read_to_string(&token_file)
+            .ok()
+            .map(|s| s.trim().to_string());
+
+        let host_config = win32_host::native::HostConfig {
+            workbench_dir: workbench_dir.clone(),
+            user_data_dir: data_dir.clone(),
+            session_token,
+            daemon_port: 44888,
+        };
+        let host = win32_host::native::Win32WebView2Host::new(host_config);
+        match host.run() {
+            Ok(()) => {
+                println!("\nAetherIDE session terminated cleanly.");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: Native Win32 WebView2 Host failed ({:?}); attempting app-mode fallback...",
+                    e
+                );
+            }
+        }
+    }
+
+    // Fallback: Detect and launch external Microsoft WebView2 App Host
     let webview2 = webview2_runtime::detect_webview2_runtime();
     if webview2.is_available {
         let ver = webview2.version.as_deref().unwrap_or("Evergreen");
         println!(
-            " [✓] Starting Native Microsoft WebView2 Host (version: {})...",
+            " [✓] Starting Fallback Microsoft WebView2 App Host (version: {})...",
             ver
         );
         match webview2_runtime::launch_webview2_host(&webview2, &workbench_html, &data_dir) {
@@ -127,7 +158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(e) => {
                 eprintln!(
-                    "Warning: WebView2 launch failed ({}); attempting fallback...",
+                    "Warning: WebView2 fallback launch failed ({}); attempting default browser...",
                     e
                 );
             }
@@ -135,7 +166,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Fallback: Open workbench in default browser
-    println!(" [!] WebView2 unavailable; opening Aether Workbench in default browser...");
+    println!(" [!] Opening Aether Workbench in default browser...");
     let url = format!(
         "file:///{}",
         workbench_html.to_string_lossy().replace('\\', "/")

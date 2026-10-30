@@ -10,6 +10,7 @@
     "pack:win": "electron-builder --win --x64"
   },
   "dependencies": {
+    "monaco-editor": "^0.49.0",
     "ws": "^8.17.0"
   },
   "devDependencies": {
