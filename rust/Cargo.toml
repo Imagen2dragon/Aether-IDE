@@ -20,6 +20,8 @@ members = [
     "crates/checkpoint-engine",
     "crates/diagnostics",
     "crates/mobile-build-manager",
+    "crates/lsp-client",
+    "crates/workspace-sync",
     "services/aether-daemon",
     "cli/aether-cli",
     "cli/aether-launcher",
@@ -49,6 +51,8 @@ futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 parking_lot = "0.12"
 bytes = "1.9"
+sha2 = "0.10"
+ring = "0.17"
 
 # Local workspace crate dependencies
 application-core = { path = "crates/application-core" }
@@ -70,3 +74,5 @@ project-brain = { path = "crates/project-brain" }
 checkpoint-engine = { path = "crates/checkpoint-engine" }
 diagnostics = { path = "crates/diagnostics" }
 mobile-build-manager = { path = "crates/mobile-build-manager" }
+lsp-client = { path = "crates/lsp-client" }
+workspace-sync = { path = "crates/workspace-sync" }

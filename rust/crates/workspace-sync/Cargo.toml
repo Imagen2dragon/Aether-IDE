@@ -1,0 +1,22 @@
+[package]
+name = "workspace-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+application-core.workspace = true
+security-core.workspace = true
+ipc-protocol.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+bytes.workspace = true
+parking_lot.workspace = true
+sha2.workspace = true
+ring.workspace = true

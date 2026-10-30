@@ -82,6 +82,68 @@ pub enum IpcRequest {
         model: Option<String>,
         system: Option<String>,
     },
+    LspOpenDocument {
+        path: String,
+        content: String,
+        language_id: Option<String>,
+    },
+    LspChangeDocument {
+        path: String,
+        content: String,
+        version: i64,
+    },
+    LspCloseDocument {
+        path: String,
+    },
+    LspCompletion {
+        path: String,
+        line: u32,
+        character: u32,
+    },
+    LspHover {
+        path: String,
+        line: u32,
+        character: u32,
+    },
+    LspDefinition {
+        path: String,
+        line: u32,
+        character: u32,
+    },
+    LspDiagnostics {
+        path: String,
+    },
+    TerminalSpawn {
+        shell: Option<String>,
+        cwd: Option<String>,
+        cols: Option<u16>,
+        rows: Option<u16>,
+    },
+    TerminalWrite {
+        session_id: u32,
+        data: String,
+    },
+    TerminalResize {
+        session_id: u32,
+        cols: u16,
+        rows: u16,
+    },
+    TerminalClose {
+        session_id: u32,
+    },
+    SyncGeneratePairing {
+        device_name: Option<String>,
+        host: Option<String>,
+        port: Option<u16>,
+    },
+    SyncGetManifest {
+        workspace_path: String,
+        workspace_name: Option<String>,
+    },
+    SyncDiffManifests {
+        local_manifest: serde_json::Value,
+        remote_manifest: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +229,21 @@ pub enum IpcEvent {
         build_id: String,
         status: String,
         log_line: String,
+    },
+    LspPublishDiagnostics {
+        path: String,
+        diagnostics: Vec<serde_json::Value>,
+    },
+    TerminalOutput {
+        session_id: u32,
+        data: String,
+    },
+    SyncProgress {
+        session_id: String,
+        files_transferred: usize,
+        total_files: usize,
+        bytes_transferred: u64,
+        status: String,
     },
 }
 

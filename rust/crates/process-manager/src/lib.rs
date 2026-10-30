@@ -9,10 +9,10 @@ use tokio::sync::mpsc;
 
 #[cfg(windows)]
 #[allow(clippy::upper_case_acronyms)]
-mod win32_job {
-    type HANDLE = *mut std::ffi::c_void;
-    type BOOL = i32;
-    type DWORD = u32;
+pub mod win32_job {
+    pub type HANDLE = *mut std::ffi::c_void;
+    pub type BOOL = i32;
+    pub type DWORD = u32;
 
     const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: DWORD = 0x00002000;
     const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: DWORD = 9;
@@ -118,6 +118,14 @@ mod win32_job {
                 CloseHandle(proc_handle);
                 ok != 0
             }
+        }
+
+        /// Assigns an existing process handle to this job object.
+        ///
+        /// # Safety
+        /// `proc_handle` must be a valid Win32 process handle with PROCESS_SET_QUOTA access rights.
+        pub unsafe fn assign_process_handle(&self, proc_handle: HANDLE) -> bool {
+            AssignProcessToJobObject(self.handle, proc_handle) != 0
         }
 
         pub fn terminate(&self, exit_code: u32) -> bool {

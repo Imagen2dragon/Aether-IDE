@@ -1,6 +1,8 @@
+mod webview2_runtime;
+
 use std::env;
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
@@ -110,42 +112,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Launch standalone window via system Webview/Edge in app mode (no browser chrome)
-    let edge_paths = [
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    ];
-
-    let mut launched = false;
-    for edge in &edge_paths {
-        if Path::new(edge).exists() {
-            println!(" [✓] Starting Standalone Desktop Window: {}", edge);
-            let app_arg = format!(
-                "--app=file:///{}",
-                workbench_html.to_string_lossy().replace('\\', "/")
-            );
-            let status = Command::new(edge)
-                .arg(app_arg)
-                .arg("--window-size=1440,900")
-                .arg("--window-name=AetherIDE")
-                .spawn();
-
-            if status.is_ok() {
-                launched = true;
-                break;
+    // Detect and launch native Microsoft WebView2 Evergreen Host
+    let webview2 = webview2_runtime::detect_webview2_runtime();
+    if webview2.is_available {
+        let ver = webview2.version.as_deref().unwrap_or("Evergreen");
+        println!(
+            " [✓] Starting Native Microsoft WebView2 Host (version: {})...",
+            ver
+        );
+        match webview2_runtime::launch_webview2_host(&webview2, &workbench_html, &data_dir) {
+            Ok(_) => {
+                println!("\nAetherIDE Environment Ready. Press Ctrl+C or close window to exit.");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: WebView2 launch failed ({}); attempting fallback...",
+                    e
+                );
             }
         }
     }
 
-    if !launched {
-        // Fallback: Open workbench in default browser
-        println!(" [✓] Opening Aether Workbench in default browser...");
-        let url = format!(
-            "file:///{}",
-            workbench_html.to_string_lossy().replace('\\', "/")
-        );
-        let _ = Command::new("cmd").args(["/c", "start", &url]).spawn();
-    }
+    // Fallback: Open workbench in default browser
+    println!(" [!] WebView2 unavailable; opening Aether Workbench in default browser...");
+    let url = format!(
+        "file:///{}",
+        workbench_html.to_string_lossy().replace('\\', "/")
+    );
+    let _ = Command::new("cmd").args(["/c", "start", &url]).spawn();
 
     println!("\nAetherIDE Environment Ready. Press Ctrl+C or close window to exit.");
     Ok(())

@@ -4,6 +4,95 @@
 //
 
 import Foundation
+import Network
+
+// MARK: - Workspace Synchronization Models
+
+public struct PairingSession: Codable, Equatable {
+    public let host: String
+    public let port: UInt16
+    public let sessionId: String
+    public let pskHex: String
+    public let expiresAt: UInt64
+
+    public var isExpired: Bool {
+        let now = UInt64(Date().timeIntervalSince1970)
+        return now > expiresAt
+    }
+
+    public static func parsePairingUri(_ uriString: String) -> PairingSession? {
+        guard uriString.hasPrefix("aether://pair?"),
+              let components = URLComponents(string: uriString),
+              let queryItems = components.queryItems else {
+            return nil
+        }
+
+        var host: String?
+        var port: UInt16?
+        var sessionId: String?
+        var pskHex: String?
+        var expiresAt: UInt64?
+
+        for item in queryItems {
+            switch item.name {
+            case "host": host = item.value
+            case "port": if let v = item.value, let p = UInt16(v) { port = p }
+            case "session": sessionId = item.value
+            case "key": pskHex = item.value
+            case "exp": if let v = item.value, let e = UInt64(v) { expiresAt = e }
+            default: break
+            }
+        }
+
+        guard let h = host, let p = port, let s = sessionId, let k = pskHex, let exp = expiresAt else {
+            return nil
+        }
+
+        return PairingSession(host: h, port: p, sessionId: s, pskHex: k, expiresAt: exp)
+    }
+}
+
+public struct SyncFileEntry: Codable, Equatable {
+    public let path: String
+    public let size: UInt64
+    public let sha256: String
+    public let modifiedAt: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case path
+        case size
+        case sha256
+        case modifiedAt = "modified_at"
+    }
+}
+
+public struct SyncWorkspaceManifest: Codable, Equatable {
+    public let workspaceName: String
+    public let rootHash: String
+    public let entries: [String: SyncFileEntry]
+    public let generatedAt: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case workspaceName = "workspace_name"
+        case rootHash = "root_hash"
+        case entries
+        case generatedAt = "generated_at"
+    }
+}
+
+public struct SyncManifestDiff: Codable, Equatable {
+    public let toUpload: [String]
+    public let toDownload: [String]
+    public let toDelete: [String]
+    public let conflicts: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case toUpload = "to_upload"
+        case toDownload = "to_download"
+        case toDelete = "to_delete"
+        case conflicts
+    }
+}
 
 public final class AetherBridge: ObservableObject {
     public static let shared = AetherBridge()
@@ -13,8 +102,57 @@ public final class AetherBridge: ObservableObject {
     @Published public var port: UInt16 = 44888
     @Published public var sessionToken: String = ""
     @Published public var statusMessage: String = "Disconnected"
+    @Published public var activePairing: PairingSession? = nil
 
     private init() {}
+
+    public func pairWithUri(_ uri: String) -> Bool {
+        guard let session = PairingSession.parsePairingUri(uri) else {
+            self.statusMessage = "Invalid QR code URI"
+            return false
+        }
+        if session.isExpired {
+            self.statusMessage = "Pairing session expired"
+            return false
+        }
+        self.activePairing = session
+        self.host = session.host
+        self.port = session.port
+        self.sessionToken = session.pskHex
+        self.statusMessage = "Paired with \(session.host):\(session.port)"
+        return true
+    }
+
+    public func computeDiff(local: SyncWorkspaceManifest, remote: SyncWorkspaceManifest) -> SyncManifestDiff {
+        var toUpload: [String] = []
+        var toDownload: [String] = []
+        var conflicts: [String] = []
+
+        for (path, localEntry) in local.entries {
+            if let remoteEntry = remote.entries[path] {
+                if localEntry.sha256 != remoteEntry.sha256 {
+                    if localEntry.modifiedAt != remoteEntry.modifiedAt {
+                        conflicts.append(path)
+                    } else {
+                        toUpload.append(path)
+                    }
+                }
+            } else {
+                toUpload.append(path)
+            }
+        }
+
+        for (path, _) in remote.entries where local.entries[path] == nil {
+            toDownload.append(path)
+        }
+
+        return SyncManifestDiff(
+            toUpload: toUpload,
+            toDownload: toDownload,
+            toDelete: [],
+            conflicts: conflicts
+        )
+    }
 
     public func verifySessionToken(expected: String, provided: String) -> Bool {
         #if canImport(AetherFFI)
