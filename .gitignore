@@ -7,8 +7,8 @@ Cargo.lock
 # Node / JS dependencies and build artifacts
 node_modules/
 **/node_modules/
-dist/*.zip
-dist/windows-x64/
+dist/
+dist/*
 .npm
 npm-debug.log*
 
