@@ -22,6 +22,7 @@ members = [
     "crates/mobile-build-manager",
     "services/aether-daemon",
     "cli/aether-cli",
+    "cli/aether-launcher",
 ]
 
 [workspace.package]

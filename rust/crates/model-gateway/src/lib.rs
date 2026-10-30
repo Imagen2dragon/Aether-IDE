@@ -66,17 +66,35 @@ impl ModelGateway {
         let gateway = Self {
             providers: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         };
-        // Register default local/mock adapters
+
+        // Register official cloud and local providers
         gateway.register_provider(Arc::new(LocalOllamaProvider::new("http://localhost:11434")));
-        gateway.register_provider(Arc::new(OpenAiCompatibleProvider::new("generic-openai", "https://api.openai.com/v1")));
-        gateway.register_provider(Arc::new(AnthropicProvider::new("https://api.anthropic.com/v1")));
-        gateway.register_provider(Arc::new(GoogleGeminiProvider::new("https://generativelanguage.googleapis.com/v1beta")));
-        gateway.register_provider(Arc::new(DeepSeekProvider::new("https://api.deepseek.com/v1")));
+        gateway.register_provider(Arc::new(OpenAiCompatibleProvider::new(
+            "openai",
+            "https://api.openai.com/v1",
+            Some("OPENAI_API_KEY"),
+        )));
+        gateway.register_provider(Arc::new(AnthropicProvider::new(
+            "https://api.anthropic.com/v1",
+        )));
+        gateway.register_provider(Arc::new(GoogleGeminiProvider::new(
+            "https://generativelanguage.googleapis.com/v1beta",
+        )));
+        gateway.register_provider(Arc::new(DeepSeekProvider::new("https://api.deepseek.com")));
+        gateway.register_provider(Arc::new(XAIGrokProvider::new("https://api.x.ai/v1")));
+        gateway.register_provider(Arc::new(OpenAiCompatibleProvider::new(
+            "lmstudio",
+            "http://localhost:1234/v1",
+            None,
+        )));
+
         gateway
     }
 
     pub fn register_provider(&self, provider: Arc<dyn ModelProvider>) {
-        self.providers.write().insert(provider.provider_name().to_string(), provider);
+        self.providers
+            .write()
+            .insert(provider.provider_name().to_string(), provider);
     }
 
     pub fn list_all_models(&self) -> Vec<ModelMetadata> {
@@ -98,9 +116,13 @@ impl ModelGateway {
     }
 
     pub async fn execute_completion(&self, req: &CompletionRequest) -> Result<CompletionResponse> {
-        let target_model = req.model.clone().unwrap_or_else(|| "claude-3-5-sonnet".into());
+        let target_model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| "claude-3-5-sonnet".into());
 
-        let providers: Vec<Arc<dyn ModelProvider>> = self.providers.read().values().cloned().collect();
+        let providers: Vec<Arc<dyn ModelProvider>> =
+            self.providers.read().values().cloned().collect();
 
         // Find provider supporting model
         for provider in &providers {
@@ -109,16 +131,27 @@ impl ModelGateway {
             }
         }
 
+        // If target model matches a prefix (e.g. "ollama/")
+        for provider in &providers {
+            if target_model.starts_with(provider.provider_name()) {
+                return provider.complete(req).await;
+            }
+        }
+
         // Fallback to first available provider
         if let Some(first) = providers.first() {
             first.complete(req).await
         } else {
-            Err(AetherError::ModelProvider("No AI model providers registered".into()))
+            Err(AetherError::ModelProvider(
+                "No AI model providers registered".into(),
+            ))
         }
     }
 }
 
-// Local Ollama Provider implementation
+// -----------------------------------------------------------------------------
+// 1. Local Ollama Provider
+// -----------------------------------------------------------------------------
 pub struct LocalOllamaProvider {
     endpoint: String,
 }
@@ -126,7 +159,7 @@ pub struct LocalOllamaProvider {
 impl LocalOllamaProvider {
     pub fn new(endpoint: &str) -> Self {
         Self {
-            endpoint: endpoint.to_string(),
+            endpoint: endpoint.trim_end_matches('/').to_string(),
         }
     }
 }
@@ -164,47 +197,253 @@ impl ModelProvider for LocalOllamaProvider {
 
     async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse> {
         let client = reqwest::Client::new();
+        let model_name = req
+            .model
+            .clone()
+            .unwrap_or_else(|| "llama3".into())
+            .replace("ollama/", "");
+
         let payload = serde_json::json!({
-            "model": req.model.clone().unwrap_or_else(|| "llama3".into()).replace("ollama/", ""),
+            "model": model_name,
             "prompt": req.prompt,
+            "system": req.system.as_deref().unwrap_or(""),
             "stream": false
         });
 
         let start = std::time::Instant::now();
         let url = format!("{}/api/generate", self.endpoint);
-        let resp = client.post(&url)
-            .json(&payload)
-            .send()
-            .await;
+        let resp = client.post(&url).json(&payload).send().await.map_err(|e| {
+            AetherError::ModelProvider(format!(
+                "Failed to connect to local Ollama daemon at {}. Is Ollama running? Error: {}",
+                self.endpoint, e
+            ))
+        })?;
 
-        match resp {
-            Ok(res) if res.status().is_success() => {
-                let json: serde_json::Value = res.json().await
-                    .map_err(|e| AetherError::ModelProvider(e.to_string()))?;
-                let content = json.get("response").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                Ok(CompletionResponse {
-                    model: req.model.clone().unwrap_or_else(|| "llama3".into()),
-                    content,
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    latency_ms: start.elapsed().as_millis() as u64,
-                })
-            }
-            _ => {
-                // If local daemon is not running, return simulated completion for testing/offline fallback
-                Ok(CompletionResponse {
-                    model: req.model.clone().unwrap_or_else(|| "llama3".into()),
-                    content: format!("// [Aether Offline Engine Response]\n// Prompt received: {}", req.prompt.lines().next().unwrap_or("")),
-                    prompt_tokens: 10,
-                    completion_tokens: 20,
-                    latency_ms: start.elapsed().as_millis() as u64,
-                })
-            }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AetherError::ModelProvider(format!(
+                "Ollama returned HTTP error {}: {}",
+                status, body
+            )));
+        }
+
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| AetherError::ModelProvider(e.to_string()))?;
+        let content = json
+            .get("response")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let prompt_tokens = json
+            .get("prompt_eval_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let completion_tokens =
+            json.get("eval_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        Ok(CompletionResponse {
+            model: req.model.clone().unwrap_or_else(|| "llama3".into()),
+            content,
+            prompt_tokens,
+            completion_tokens,
+            latency_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+}
+
+// -----------------------------------------------------------------------------
+// 2. OpenAI / LM Studio Compatible Provider
+// -----------------------------------------------------------------------------
+pub struct OpenAiCompatibleProvider {
+    name: String,
+    endpoint: String,
+    api_key_env_var: Option<&'static str>,
+}
+
+impl OpenAiCompatibleProvider {
+    pub fn new(name: &str, endpoint: &str, api_key_env_var: Option<&'static str>) -> Self {
+        Self {
+            name: name.to_string(),
+            endpoint: endpoint.trim_end_matches('/').to_string(),
+            api_key_env_var,
         }
     }
 }
 
-// Anthropic Provider implementation
+#[async_trait]
+impl ModelProvider for OpenAiCompatibleProvider {
+    fn provider_name(&self) -> &str {
+        &self.name
+    }
+
+    fn list_models(&self) -> Vec<ModelMetadata> {
+        if self.name == "lmstudio" {
+            vec![ModelMetadata {
+                id: "lmstudio/local-model".into(),
+                provider: "lmstudio".into(),
+                name: "LM Studio Local Model".into(),
+                context_window: 32768,
+                supports_vision: false,
+                supports_reasoning: false,
+                supports_tools: true,
+                is_local: true,
+            }]
+        } else {
+            vec![
+                ModelMetadata {
+                    id: "gpt-4o".into(),
+                    provider: "openai".into(),
+                    name: "GPT-4o Omnimodal".into(),
+                    context_window: 128000,
+                    supports_vision: true,
+                    supports_reasoning: false,
+                    supports_tools: true,
+                    is_local: false,
+                },
+                ModelMetadata {
+                    id: "gpt-4o-mini".into(),
+                    provider: "openai".into(),
+                    name: "GPT-4o Mini".into(),
+                    context_window: 128000,
+                    supports_vision: true,
+                    supports_reasoning: false,
+                    supports_tools: true,
+                    is_local: false,
+                },
+                ModelMetadata {
+                    id: "o1".into(),
+                    provider: "openai".into(),
+                    name: "OpenAI o1 Reasoning".into(),
+                    context_window: 200000,
+                    supports_vision: true,
+                    supports_reasoning: true,
+                    supports_tools: false,
+                    is_local: false,
+                },
+                ModelMetadata {
+                    id: "o3-mini".into(),
+                    provider: "openai".into(),
+                    name: "OpenAI o3-mini Reasoning".into(),
+                    context_window: 200000,
+                    supports_vision: false,
+                    supports_reasoning: true,
+                    supports_tools: true,
+                    is_local: false,
+                },
+            ]
+        }
+    }
+
+    async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse> {
+        let start = std::time::Instant::now();
+        let api_key = match self.api_key_env_var {
+            Some(env_var) => {
+                let key = std::env::var(env_var).unwrap_or_default();
+                if key.trim().is_empty() {
+                    return Err(AetherError::ModelProvider(format!(
+                        "{} environment variable is not set. Please configure your API key in environment or Settings.",
+                        env_var
+                    )));
+                }
+                Some(key)
+            }
+            None => None,
+        };
+
+        let target_model = req.model.clone().unwrap_or_else(|| {
+            if self.name == "lmstudio" {
+                "local-model".into()
+            } else {
+                "gpt-4o".into()
+            }
+        });
+
+        let mut messages = Vec::new();
+        if let Some(sys) = &req.system {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": sys
+            }));
+        }
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": &req.prompt
+        }));
+
+        let payload = serde_json::json!({
+            "model": target_model,
+            "messages": messages,
+            "temperature": req.temperature.unwrap_or(0.2),
+            "max_tokens": req.max_tokens.unwrap_or(2048),
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/chat/completions", self.endpoint);
+        let mut request = client.post(&url).json(&payload);
+
+        if let Some(key) = api_key {
+            request = request.header("Authorization", format!("Bearer {}", key));
+        }
+
+        let resp = request.send().await.map_err(|e| {
+            AetherError::ModelProvider(format!("Failed to connect to {}: {}", self.endpoint, e))
+        })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return match status.as_u16() {
+                401 => Err(AetherError::ModelProvider(format!(
+                    "{} authentication failed (401 Unauthorized). Verify your API key.",
+                    self.name
+                ))),
+                429 => Err(AetherError::ModelProvider(format!(
+                    "{} rate limit or quota exceeded (429 Too Many Requests).",
+                    self.name
+                ))),
+                code => Err(AetherError::ModelProvider(format!(
+                    "{} API error (HTTP {}): {}",
+                    self.name, code, body
+                ))),
+            };
+        }
+
+        let val: serde_json::Value = resp.json().await.map_err(|e| {
+            AetherError::ModelProvider(format!("Failed to parse JSON response: {}", e))
+        })?;
+
+        let content = val
+            .pointer("/choices/0/message/content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let prompt_tokens = val
+            .pointer("/usage/prompt_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
+        let completion_tokens = val
+            .pointer("/usage/completion_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
+        Ok(CompletionResponse {
+            model: target_model,
+            content,
+            prompt_tokens,
+            completion_tokens,
+            latency_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+}
+
+// -----------------------------------------------------------------------------
+// 3. Anthropic Provider
+// -----------------------------------------------------------------------------
 pub struct AnthropicProvider {
     endpoint: String,
 }
@@ -212,7 +451,7 @@ pub struct AnthropicProvider {
 impl AnthropicProvider {
     pub fn new(endpoint: &str) -> Self {
         Self {
-            endpoint: endpoint.to_string(),
+            endpoint: endpoint.trim_end_matches('/').to_string(),
         }
     }
 }
@@ -225,6 +464,16 @@ impl ModelProvider for AnthropicProvider {
 
     fn list_models(&self) -> Vec<ModelMetadata> {
         vec![
+            ModelMetadata {
+                id: "claude-3-7-sonnet".into(),
+                provider: "anthropic".into(),
+                name: "Claude 3.7 Sonnet (Hybrid Reasoning)".into(),
+                context_window: 200000,
+                supports_vision: true,
+                supports_reasoning: true,
+                supports_tools: true,
+                is_local: false,
+            },
             ModelMetadata {
                 id: "claude-3-5-sonnet".into(),
                 provider: "anthropic".into(),
@@ -252,115 +501,104 @@ impl ModelProvider for AnthropicProvider {
         let start = std::time::Instant::now();
         let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
 
-        if api_key.is_empty() {
-            // Safe simulation when key not provided
-            return Ok(CompletionResponse {
-                model: "claude-3-5-sonnet".into(),
-                content: format!("// [Claude 3.5 Sonnet Synthesis]\n// Task: {}\n// Status: Verified Plan", req.prompt),
-                prompt_tokens: 120,
-                completion_tokens: 180,
-                latency_ms: start.elapsed().as_millis() as u64,
-            });
+        if api_key.trim().is_empty() {
+            return Err(AetherError::ModelProvider(
+                "ANTHROPIC_API_KEY environment variable is not set. Please set ANTHROPIC_API_KEY in your environment or Settings.".into(),
+            ));
         }
+
+        let target_model = match req.model.as_deref() {
+            Some("claude-3-7-sonnet") => "claude-3-7-sonnet-20250219",
+            Some("claude-3-5-haiku") => "claude-3-5-haiku-20241022",
+            _ => "claude-3-5-sonnet-20241022",
+        };
+
+        let mut payload_map = serde_json::Map::new();
+        payload_map.insert("model".into(), serde_json::json!(target_model));
+        payload_map.insert(
+            "max_tokens".into(),
+            serde_json::json!(req.max_tokens.unwrap_or(2048)),
+        );
+        if let Some(sys) = &req.system {
+            payload_map.insert("system".into(), serde_json::json!(sys));
+        }
+        payload_map.insert(
+            "messages".into(),
+            serde_json::json!([
+                { "role": "user", "content": &req.prompt }
+            ]),
+        );
 
         let client = reqwest::Client::new();
-        let payload = serde_json::json!({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": req.max_tokens.unwrap_or(2048),
-            "messages": [
-                { "role": "user", "content": req.prompt }
-            ]
-        });
-
-        let res = client.post(format!("{}/messages", self.endpoint))
-            .header("x-api-key", api_key)
+        let res = client
+            .post(format!("{}/messages", self.endpoint))
+            .header("x-api-key", &api_key)
             .header("anthropic-version", "2023-06-01")
-            .json(&payload)
+            .json(&serde_json::Value::Object(payload_map))
             .send()
             .await
-            .map_err(|e| AetherError::ModelProvider(e.to_string()))?;
+            .map_err(|e| {
+                AetherError::ModelProvider(format!("Anthropic HTTP connection error: {}", e))
+            })?;
 
-        let val: serde_json::Value = res.json().await
-            .map_err(|e| AetherError::ModelProvider(e.to_string()))?;
-
-        let text = val.pointer("/content/0/text").and_then(|v| v.as_str()).unwrap_or("");
-        Ok(CompletionResponse {
-            model: "claude-3-5-sonnet".into(),
-            content: text.to_string(),
-            prompt_tokens: 100,
-            completion_tokens: 150,
-            latency_ms: start.elapsed().as_millis() as u64,
-        })
-    }
-}
-
-// OpenAI Compatible Provider implementation
-pub struct OpenAiCompatibleProvider {
-    name: String,
-    _endpoint: String,
-}
-
-impl OpenAiCompatibleProvider {
-    pub fn new(name: &str, endpoint: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            _endpoint: endpoint.to_string(),
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            return match status.as_u16() {
+                401 => Err(AetherError::ModelProvider(
+                    "Anthropic API returned 401 Unauthorized: Invalid ANTHROPIC_API_KEY.".into(),
+                )),
+                429 => Err(AetherError::ModelProvider(
+                    "Anthropic API returned 429: Rate limit or quota exceeded.".into(),
+                )),
+                code => Err(AetherError::ModelProvider(format!(
+                    "Anthropic API error (HTTP {}): {}",
+                    code, body
+                ))),
+            };
         }
-    }
-}
 
-#[async_trait]
-impl ModelProvider for OpenAiCompatibleProvider {
-    fn provider_name(&self) -> &str {
-        &self.name
-    }
+        let val: serde_json::Value = res.json().await.map_err(|e| {
+            AetherError::ModelProvider(format!("Failed to parse Anthropic response JSON: {}", e))
+        })?;
 
-    fn list_models(&self) -> Vec<ModelMetadata> {
-        vec![
-            ModelMetadata {
-                id: "gpt-4o".into(),
-                provider: "openai".into(),
-                name: "GPT-4o Omnimodal".into(),
-                context_window: 128000,
-                supports_vision: true,
-                supports_reasoning: false,
-                supports_tools: true,
-                is_local: false,
-            },
-            ModelMetadata {
-                id: "o1".into(),
-                provider: "openai".into(),
-                name: "OpenAI o1 Reasoning".into(),
-                context_window: 200000,
-                supports_vision: true,
-                supports_reasoning: true,
-                supports_tools: false,
-                is_local: false,
-            },
-        ]
-    }
+        let text = val
+            .pointer("/content/0/text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let prompt_tokens = val
+            .pointer("/usage/input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let completion_tokens = val
+            .pointer("/usage/output_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
 
-    async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse> {
-        let start = std::time::Instant::now();
         Ok(CompletionResponse {
-            model: req.model.clone().unwrap_or_else(|| "gpt-4o".into()),
-            content: format!("// [OpenAI Engine Response]\n// Code generated for: {}", req.prompt),
-            prompt_tokens: 45,
-            completion_tokens: 90,
+            model: req
+                .model
+                .clone()
+                .unwrap_or_else(|| "claude-3-5-sonnet".into()),
+            content: text.to_string(),
+            prompt_tokens,
+            completion_tokens,
             latency_ms: start.elapsed().as_millis() as u64,
         })
     }
 }
 
-// Google Gemini Provider
+// -----------------------------------------------------------------------------
+// 4. Google Gemini Provider (Official Generative Language API)
+// -----------------------------------------------------------------------------
 pub struct GoogleGeminiProvider {
-    _endpoint: String,
+    endpoint: String,
 }
 
 impl GoogleGeminiProvider {
     pub fn new(endpoint: &str) -> Self {
         Self {
-            _endpoint: endpoint.to_string(),
+            endpoint: endpoint.trim_end_matches('/').to_string(),
         }
     }
 }
@@ -393,30 +631,139 @@ impl ModelProvider for GoogleGeminiProvider {
                 supports_tools: true,
                 is_local: false,
             },
+            ModelMetadata {
+                id: "gemini-1.5-flash".into(),
+                provider: "google-gemini".into(),
+                name: "Gemini 1.5 Flash".into(),
+                context_window: 1048576,
+                supports_vision: true,
+                supports_reasoning: false,
+                supports_tools: true,
+                is_local: false,
+            },
         ]
     }
 
     async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse> {
         let start = std::time::Instant::now();
+        let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+
+        if api_key.trim().is_empty() {
+            return Err(AetherError::ModelProvider(
+                "GEMINI_API_KEY environment variable is not set. Please configure GEMINI_API_KEY in your environment or Settings.".into(),
+            ));
+        }
+
+        let model_id = req
+            .model
+            .clone()
+            .unwrap_or_else(|| "gemini-2.0-flash".into());
+
+        let url = format!(
+            "{}/models/{}:generateContent?key={}",
+            self.endpoint, model_id, api_key
+        );
+
+        let mut payload_map = serde_json::Map::new();
+        payload_map.insert(
+            "contents".into(),
+            serde_json::json!([
+                {
+                    "role": "user",
+                    "parts": [{ "text": &req.prompt }]
+                }
+            ]),
+        );
+
+        if let Some(sys) = &req.system {
+            payload_map.insert(
+                "system_instruction".into(),
+                serde_json::json!({
+                    "parts": [{ "text": sys }]
+                }),
+            );
+        }
+
+        let gen_config = serde_json::json!({
+            "temperature": req.temperature.unwrap_or(0.2),
+            "maxOutputTokens": req.max_tokens.unwrap_or(2048)
+        });
+        payload_map.insert("generationConfig".into(), gen_config);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url)
+            .json(&serde_json::Value::Object(payload_map))
+            .send()
+            .await
+            .map_err(|e| {
+                AetherError::ModelProvider(format!("Failed to connect to Google Gemini API: {}", e))
+            })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return match status.as_u16() {
+                400 => Err(AetherError::ModelProvider(format!(
+                    "Gemini API returned Bad Request (400): {}. Verify model parameter and prompt.",
+                    body
+                ))),
+                401 | 403 => Err(AetherError::ModelProvider(format!(
+                    "Gemini API authentication failed (HTTP {}): {}. Verify GEMINI_API_KEY.",
+                    status.as_u16(),
+                    body
+                ))),
+                429 => Err(AetherError::ModelProvider(
+                    "Gemini API rate limit or quota exceeded (429).".into(),
+                )),
+                code => Err(AetherError::ModelProvider(format!(
+                    "Gemini API error (HTTP {}): {}",
+                    code, body
+                ))),
+            };
+        }
+
+        let json: serde_json::Value = resp.json().await.map_err(|e| {
+            AetherError::ModelProvider(format!("Failed to parse Gemini response: {}", e))
+        })?;
+
+        let content = json
+            .pointer("/candidates/0/content/parts/0/text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let prompt_tokens = json
+            .pointer("/usageMetadata/promptTokenCount")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
+        let completion_tokens = json
+            .pointer("/usageMetadata/candidatesTokenCount")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
         Ok(CompletionResponse {
-            model: "gemini-2.0-flash".into(),
-            content: format!("// [Gemini 2.0 Flash Solution]\n// Verified code for: {}", req.prompt),
-            prompt_tokens: 50,
-            completion_tokens: 80,
+            model: model_id,
+            content,
+            prompt_tokens,
+            completion_tokens,
             latency_ms: start.elapsed().as_millis() as u64,
         })
     }
 }
 
-// DeepSeek Provider
+// -----------------------------------------------------------------------------
+// 5. DeepSeek Provider (DeepSeek-V3 / DeepSeek-R1)
+// -----------------------------------------------------------------------------
 pub struct DeepSeekProvider {
-    _endpoint: String,
+    endpoint: String,
 }
 
 impl DeepSeekProvider {
     pub fn new(endpoint: &str) -> Self {
         Self {
-            _endpoint: endpoint.to_string(),
+            endpoint: endpoint.trim_end_matches('/').to_string(),
         }
     }
 }
@@ -430,22 +777,22 @@ impl ModelProvider for DeepSeekProvider {
     fn list_models(&self) -> Vec<ModelMetadata> {
         vec![
             ModelMetadata {
-                id: "deepseek-reasoner".into(),
+                id: "deepseek-chat".into(),
                 provider: "deepseek".into(),
-                name: "DeepSeek R1 Reasoner".into(),
+                name: "DeepSeek V3 (Chat)".into(),
                 context_window: 64000,
                 supports_vision: false,
-                supports_reasoning: true,
+                supports_reasoning: false,
                 supports_tools: true,
                 is_local: false,
             },
             ModelMetadata {
-                id: "deepseek-chat".into(),
+                id: "deepseek-reasoner".into(),
                 provider: "deepseek".into(),
-                name: "DeepSeek V3".into(),
+                name: "DeepSeek R1 (Reasoner)".into(),
                 context_window: 64000,
                 supports_vision: false,
-                supports_reasoning: false,
+                supports_reasoning: true,
                 supports_tools: true,
                 is_local: false,
             },
@@ -454,42 +801,297 @@ impl ModelProvider for DeepSeekProvider {
 
     async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse> {
         let start = std::time::Instant::now();
+        let api_key = std::env::var("DEEPSEEK_API_KEY").unwrap_or_default();
+
+        if api_key.trim().is_empty() {
+            return Err(AetherError::ModelProvider(
+                "DEEPSEEK_API_KEY environment variable is not set. Please configure DEEPSEEK_API_KEY in your environment or Settings.".into(),
+            ));
+        }
+
+        let target_model = req.model.clone().unwrap_or_else(|| "deepseek-chat".into());
+
+        let mut messages = Vec::new();
+        if let Some(sys) = &req.system {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": sys
+            }));
+        }
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": &req.prompt
+        }));
+
+        let payload = serde_json::json!({
+            "model": target_model,
+            "messages": messages,
+            "temperature": req.temperature.unwrap_or(0.2),
+            "max_tokens": req.max_tokens.unwrap_or(2048),
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/chat/completions", self.endpoint);
+        let resp = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| {
+                AetherError::ModelProvider(format!("Failed to connect to DeepSeek API: {}", e))
+            })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return match status.as_u16() {
+                401 => Err(AetherError::ModelProvider(
+                    "DeepSeek API authentication failed (401 Unauthorized). Verify DEEPSEEK_API_KEY.".into(),
+                )),
+                429 => Err(AetherError::ModelProvider(
+                    "DeepSeek API rate limit or quota exceeded (429).".into(),
+                )),
+                code => Err(AetherError::ModelProvider(format!(
+                    "DeepSeek API error (HTTP {}): {}",
+                    code, body
+                ))),
+            };
+        }
+
+        let val: serde_json::Value = resp.json().await.map_err(|e| {
+            AetherError::ModelProvider(format!("Failed to parse DeepSeek response: {}", e))
+        })?;
+
+        let content = val
+            .pointer("/choices/0/message/content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let prompt_tokens = val
+            .pointer("/usage/prompt_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
+        let completion_tokens = val
+            .pointer("/usage/completion_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
         Ok(CompletionResponse {
-            model: "deepseek-reasoner".into(),
-            content: format!("// [DeepSeek R1 Chain of Thought]\n// Reasoning passed. Implementation:\n// Task: {}", req.prompt),
-            prompt_tokens: 75,
-            completion_tokens: 120,
+            model: target_model,
+            content,
+            prompt_tokens,
+            completion_tokens,
             latency_ms: start.elapsed().as_millis() as u64,
         })
     }
 }
 
+// -----------------------------------------------------------------------------
+// 6. xAI Grok Provider
+// -----------------------------------------------------------------------------
+pub struct XAIGrokProvider {
+    endpoint: String,
+}
+
+impl XAIGrokProvider {
+    pub fn new(endpoint: &str) -> Self {
+        Self {
+            endpoint: endpoint.trim_end_matches('/').to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelProvider for XAIGrokProvider {
+    fn provider_name(&self) -> &str {
+        "xai"
+    }
+
+    fn list_models(&self) -> Vec<ModelMetadata> {
+        vec![
+            ModelMetadata {
+                id: "grok-2-1212".into(),
+                provider: "xai".into(),
+                name: "xAI Grok 2".into(),
+                context_window: 131072,
+                supports_vision: true,
+                supports_reasoning: true,
+                supports_tools: true,
+                is_local: false,
+            },
+            ModelMetadata {
+                id: "grok-beta".into(),
+                provider: "xai".into(),
+                name: "xAI Grok Beta".into(),
+                context_window: 131072,
+                supports_vision: false,
+                supports_reasoning: true,
+                supports_tools: true,
+                is_local: false,
+            },
+        ]
+    }
+
+    async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse> {
+        let start = std::time::Instant::now();
+        let api_key = std::env::var("XAI_API_KEY").unwrap_or_default();
+
+        if api_key.trim().is_empty() {
+            return Err(AetherError::ModelProvider(
+                "XAI_API_KEY environment variable is not set. Please configure XAI_API_KEY in your environment or Settings.".into(),
+            ));
+        }
+
+        let target_model = req.model.clone().unwrap_or_else(|| "grok-2-1212".into());
+
+        let mut messages = Vec::new();
+        if let Some(sys) = &req.system {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": sys
+            }));
+        }
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": &req.prompt
+        }));
+
+        let payload = serde_json::json!({
+            "model": target_model,
+            "messages": messages,
+            "temperature": req.temperature.unwrap_or(0.2),
+            "max_tokens": req.max_tokens.unwrap_or(2048),
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/chat/completions", self.endpoint);
+        let resp = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| {
+                AetherError::ModelProvider(format!("Failed to connect to xAI API: {}", e))
+            })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return match status.as_u16() {
+                401 => Err(AetherError::ModelProvider(
+                    "xAI API authentication failed (401 Unauthorized). Verify XAI_API_KEY.".into(),
+                )),
+                429 => Err(AetherError::ModelProvider(
+                    "xAI API rate limit or quota exceeded (429).".into(),
+                )),
+                code => Err(AetherError::ModelProvider(format!(
+                    "xAI API error (HTTP {}): {}",
+                    code, body
+                ))),
+            };
+        }
+
+        let val: serde_json::Value = resp.json().await.map_err(|e| {
+            AetherError::ModelProvider(format!("Failed to parse xAI response: {}", e))
+        })?;
+
+        let content = val
+            .pointer("/choices/0/message/content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let prompt_tokens = val
+            .pointer("/usage/prompt_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
+        let completion_tokens = val
+            .pointer("/usage/completion_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
+        Ok(CompletionResponse {
+            model: target_model,
+            content,
+            prompt_tokens,
+            completion_tokens,
+            latency_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_model_gateway_routing_and_execution() {
+    async fn test_model_gateway_routing_and_models() {
         let gateway = ModelGateway::new();
         let models = gateway.list_all_models();
         assert!(!models.is_empty());
+
+        // Verify key models exist across providers
+        assert!(models.iter().any(|m| m.id == "claude-3-5-sonnet"));
+        assert!(models.iter().any(|m| m.id == "gpt-4o"));
+        assert!(models.iter().any(|m| m.id == "gemini-2.0-flash"));
+        assert!(models.iter().any(|m| m.id == "deepseek-chat"));
+        assert!(models.iter().any(|m| m.id == "grok-2-1212"));
+        assert!(models.iter().any(|m| m.id == "ollama/llama3"));
 
         let fast_model = gateway.route_model_for_task(TaskType::QuickCompletion);
         assert_eq!(fast_model, "claude-3-5-haiku");
 
         let deep_model = gateway.route_model_for_task(TaskType::DeepArchitecture);
         assert_eq!(deep_model, "claude-3-5-sonnet");
+    }
+
+    #[tokio::test]
+    async fn test_missing_credentials_return_actionable_errors() {
+        // Ensure keys are unset in this test scope
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("GEMINI_API_KEY");
+        std::env::remove_var("DEEPSEEK_API_KEY");
+        std::env::remove_var("XAI_API_KEY");
 
         let req = CompletionRequest {
-            prompt: "fn calculate_hash()".into(),
+            prompt: "fn calculate()".into(),
             system: None,
-            model: Some("claude-3-5-sonnet".into()),
+            model: None,
             temperature: Some(0.2),
-            max_tokens: Some(512),
+            max_tokens: Some(100),
         };
 
-        let resp = gateway.execute_completion(&req).await.expect("execution failed");
-        assert!(!resp.content.is_empty());
-        assert_eq!(resp.model, "claude-3-5-sonnet");
+        let openai = OpenAiCompatibleProvider::new(
+            "openai",
+            "https://api.openai.com/v1",
+            Some("OPENAI_API_KEY"),
+        );
+        let err = openai.complete(&req).await.unwrap_err();
+        assert!(err.to_string().contains("OPENAI_API_KEY"));
+
+        let anthropic = AnthropicProvider::new("https://api.anthropic.com/v1");
+        let err = anthropic.complete(&req).await.unwrap_err();
+        assert!(err.to_string().contains("ANTHROPIC_API_KEY"));
+
+        let gemini = GoogleGeminiProvider::new("https://generativelanguage.googleapis.com/v1beta");
+        let err = gemini.complete(&req).await.unwrap_err();
+        assert!(err.to_string().contains("GEMINI_API_KEY"));
+
+        let deepseek = DeepSeekProvider::new("https://api.deepseek.com");
+        let err = deepseek.complete(&req).await.unwrap_err();
+        assert!(err.to_string().contains("DEEPSEEK_API_KEY"));
+
+        let xai = XAIGrokProvider::new("https://api.x.ai/v1");
+        let err = xai.complete(&req).await.unwrap_err();
+        assert!(err.to_string().contains("XAI_API_KEY"));
     }
 }

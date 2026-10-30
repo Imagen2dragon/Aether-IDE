@@ -78,8 +78,13 @@ impl PermissionEngine {
                     PermissionTier::P2ProcessExecution => {
                         // Whitelist check
                         if let ActionType::ExecuteProcess { binary, .. } = action {
-                            let safe_binaries = ["cargo", "git", "npm", "node", "npx", "pytest", "python", "tsc"];
-                            if safe_binaries.iter().any(|b| binary.ends_with(b) || binary == b) {
+                            let safe_binaries = [
+                                "cargo", "git", "npm", "node", "npx", "pytest", "python", "tsc",
+                            ];
+                            if safe_binaries
+                                .iter()
+                                .any(|b| binary.ends_with(b) || binary == b)
+                            {
                                 AuthorizationDecision::Allow
                             } else {
                                 AuthorizationDecision::RequiresUserApproval
@@ -89,9 +94,7 @@ impl PermissionEngine {
                         }
                     }
                     PermissionTier::P3NetworkEgress => AuthorizationDecision::Allow,
-                    PermissionTier::P4Destructive => {
-                        AuthorizationDecision::RequiresUserApproval
-                    }
+                    PermissionTier::P4Destructive => AuthorizationDecision::RequiresUserApproval,
                     PermissionTier::P5CredentialSensitive => {
                         AuthorizationDecision::RequiresUserApproval
                     }
@@ -107,9 +110,14 @@ mod tests {
 
     #[test]
     fn test_observe_mode_blocks_writes() {
-        let action = ActionType::WriteFile { path: "src/main.rs".into() };
+        let action = ActionType::WriteFile {
+            path: "src/main.rs".into(),
+        };
         let decision = PermissionEngine::evaluate(AutonomyMode::Observe, &action);
-        assert_eq!(decision, AuthorizationDecision::Deny(Reason::ObserveModeDisallowsModifications));
+        assert_eq!(
+            decision,
+            AuthorizationDecision::Deny(Reason::ObserveModeDisallowsModifications)
+        );
     }
 
     #[test]

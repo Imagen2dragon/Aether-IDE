@@ -1,4 +1,3 @@
-
 use database_engine::DatabaseEngine;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -88,7 +87,10 @@ impl ProjectBrain {
         }
 
         let mut tests = Vec::new();
-        for dep in visited.iter().chain(std::iter::once(&modified_file.to_string())) {
+        for dep in visited
+            .iter()
+            .chain(std::iter::once(&modified_file.to_string()))
+        {
             if dep.contains("test") || dep.ends_with("_test.rs") || dep.ends_with(".spec.ts") {
                 tests.push(dep.clone());
             }

@@ -41,7 +41,10 @@ impl ProjectIndexer {
                 if let Ok(content) = FilesystemEngine::read_file_string(file) {
                     let symbols = SyntaxEngine::extract_symbols(&content, lang);
                     if !symbols.is_empty() {
-                        let rel_path = file.strip_prefix(root_path).unwrap_or(file).to_string_lossy();
+                        let rel_path = file
+                            .strip_prefix(root_path)
+                            .unwrap_or(file)
+                            .to_string_lossy();
                         if let Ok(count) = self.index.insert_file_symbols(&rel_path, &symbols) {
                             total_symbols += count;
                         }
@@ -52,16 +55,21 @@ impl ProjectIndexer {
 
             if let Some(tx) = &progress_tx {
                 if scanned % 20 == 0 || scanned == files.len() {
-                    let _ = tx.send(IndexProgress {
-                        files_scanned: scanned,
-                        total_symbols,
-                        status: format!("Indexed {}/{} files", scanned, files.len()),
-                    }).await;
+                    let _ = tx
+                        .send(IndexProgress {
+                            files_scanned: scanned,
+                            total_symbols,
+                            status: format!("Indexed {}/{} files", scanned, files.len()),
+                        })
+                        .await;
                 }
             }
         }
 
-        info!("Finished indexing: {} files, {} symbols", scanned, total_symbols);
+        info!(
+            "Finished indexing: {} files, {} symbols",
+            scanned, total_symbols
+        );
         Ok(IndexProgress {
             files_scanned: scanned,
             total_symbols,

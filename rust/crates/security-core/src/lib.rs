@@ -7,11 +7,23 @@ fn get_patterns() -> &'static Vec<(&'static str, Regex)> {
     SECRET_PATTERNS.get_or_init(|| {
         vec![
             ("OPENAI_KEY", Regex::new(r"sk-[A-Za-z0-9]{32,}").unwrap()),
-            ("ANTHROPIC_KEY", Regex::new(r"sk-ant-[A-Za-z0-9\-_]{32,}").unwrap()),
-            ("GITHUB_TOKEN", Regex::new(r"(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}").unwrap()),
+            (
+                "ANTHROPIC_KEY",
+                Regex::new(r"sk-ant-[A-Za-z0-9\-_]{32,}").unwrap(),
+            ),
+            (
+                "GITHUB_TOKEN",
+                Regex::new(r"(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}").unwrap(),
+            ),
             ("AWS_ACCESS_KEY", Regex::new(r"AKIA[0-9A-Z]{16}").unwrap()),
-            ("PRIVATE_KEY", Regex::new(r"-----BEGIN [A-Z ]+ PRIVATE KEY-----").unwrap()),
-            ("JWT_TOKEN", Regex::new(r"eyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*").unwrap()),
+            (
+                "PRIVATE_KEY",
+                Regex::new(r"-----BEGIN [A-Z ]+ PRIVATE KEY-----").unwrap(),
+            ),
+            (
+                "JWT_TOKEN",
+                Regex::new(r"eyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*").unwrap(),
+            ),
         ]
     })
 }
@@ -22,7 +34,9 @@ impl SecretRedactor {
     pub fn redact(input: &str) -> String {
         let mut result = input.to_string();
         for (name, re) in get_patterns() {
-            result = re.replace_all(&result, format!("[REDACTED_{}]", name)).to_string();
+            result = re
+                .replace_all(&result, format!("[REDACTED_{}]", name))
+                .to_string();
         }
         result
     }
@@ -46,7 +60,18 @@ impl TokenManager {
 
     pub fn verify_token(expected: &str, provided: Option<&str>) -> bool {
         match provided {
-            Some(token) => token == expected,
+            Some(token) => {
+                let exp_bytes = expected.as_bytes();
+                let prov_bytes = token.as_bytes();
+                if exp_bytes.len() != prov_bytes.len() {
+                    return false;
+                }
+                let mut diff = 0u8;
+                for (a, b) in exp_bytes.iter().zip(prov_bytes.iter()) {
+                    diff |= a ^ b;
+                }
+                diff == 0
+            }
             None => false,
         }
     }

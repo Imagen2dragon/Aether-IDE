@@ -24,15 +24,17 @@ impl FilesystemEngine {
             return Ok(());
         }
 
-        let entries = fs::read_dir(current)
-            .map_err(|e| AetherError::Io(e))?;
+        let entries = fs::read_dir(current).map_err(AetherError::Io)?;
 
         for entry in entries.flatten() {
             let path = entry.path();
             let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
             // Check exclusions
-            if exclude_patterns.iter().any(|pattern| file_name == pattern || file_name.starts_with('.')) {
+            if exclude_patterns
+                .iter()
+                .any(|pattern| file_name == pattern || file_name.starts_with('.'))
+            {
                 continue;
             }
 
@@ -59,7 +61,7 @@ impl FilesystemEngine {
     }
 
     pub fn read_file_string<P: AsRef<Path>>(path: P) -> Result<String> {
-        fs::read_to_string(path).map_err(|e| AetherError::Io(e))
+        fs::read_to_string(path).map_err(AetherError::Io)
     }
 }
 
@@ -69,10 +71,12 @@ mod tests {
 
     #[test]
     fn test_atomic_write_and_read() {
-        let temp_dir = std::env::temp_dir().join(format!("aether_fs_test_{}", uuid::Uuid::new_v4().simple()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_fs_test_{}", uuid::Uuid::new_v4().simple()));
         let test_file = temp_dir.join("subdir").join("test.txt");
 
-        FilesystemEngine::write_file_atomic(&test_file, "Hello AetherIDE Atomic").expect("atomic write failed");
+        FilesystemEngine::write_file_atomic(&test_file, "Hello AetherIDE Atomic")
+            .expect("atomic write failed");
         let content = FilesystemEngine::read_file_string(&test_file).expect("read failed");
         assert_eq!(content, "Hello AetherIDE Atomic");
 

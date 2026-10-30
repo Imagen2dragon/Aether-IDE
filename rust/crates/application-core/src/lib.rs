@@ -52,8 +52,7 @@ pub struct AetherConfig {
 
 impl Default for AetherConfig {
     fn default() -> Self {
-        let appdata = std::env::var("LOCALAPPDATA")
-            .unwrap_or_else(|_| ".".to_string());
+        let appdata = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
         let data_dir = PathBuf::from(appdata).join("AetherIDE");
 
         Self {

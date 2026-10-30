@@ -37,8 +37,8 @@ pub struct ProofOfWorkRecord {
 
 impl DatabaseEngine {
     pub fn open_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()
-            .map_err(|e| AetherError::Database(e.to_string()))?;
+        let conn =
+            Connection::open_in_memory().map_err(|e| AetherError::Database(e.to_string()))?;
         let engine = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
@@ -50,8 +50,7 @@ impl DatabaseEngine {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)
-            .map_err(|e| AetherError::Database(e.to_string()))?;
+        let conn = Connection::open(path).map_err(|e| AetherError::Database(e.to_string()))?;
 
         // Enable WAL mode, memory cache, and synchronous=NORMAL
         conn.execute_batch(
@@ -59,7 +58,8 @@ impl DatabaseEngine {
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
              PRAGMA cache_size = -64000;",
-        ).map_err(|e| AetherError::Database(e.to_string()))?;
+        )
+        .map_err(|e| AetherError::Database(e.to_string()))?;
 
         let engine = Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -116,7 +116,8 @@ impl DatabaseEngine {
                 weight REAL DEFAULT 1.0,
                 PRIMARY KEY (source_node, target_node, edge_type)
             );",
-        ).map_err(|e| AetherError::Database(e.to_string()))?;
+        )
+        .map_err(|e| AetherError::Database(e.to_string()))?;
 
         Ok(())
     }
@@ -159,24 +160,24 @@ impl DatabaseEngine {
              LIMIT ?2",
         ).map_err(|e| AetherError::Database(e.to_string()))?;
 
-        let rows = stmt.query_map(params![formatted_query, limit as i64], |row| {
-            Ok(SymbolRecord {
-                id: Some(row.get(0)?),
-                file_path: row.get(1)?,
-                name: row.get(2)?,
-                kind: row.get(3)?,
-                line_start: row.get(4)?,
-                line_end: row.get(5)?,
-                signature: row.get(6)?,
-                docstring: row.get(7)?,
+        let rows = stmt
+            .query_map(params![formatted_query, limit as i64], |row| {
+                Ok(SymbolRecord {
+                    id: Some(row.get(0)?),
+                    file_path: row.get(1)?,
+                    name: row.get(2)?,
+                    kind: row.get(3)?,
+                    line_start: row.get(4)?,
+                    line_end: row.get(5)?,
+                    signature: row.get(6)?,
+                    docstring: row.get(7)?,
+                })
             })
-        }).map_err(|e| AetherError::Database(e.to_string()))?;
+            .map_err(|e| AetherError::Database(e.to_string()))?;
 
         let mut results = Vec::new();
-        for r in rows {
-            if let Ok(sym) = r {
-                results.push(sym);
-            }
+        for sym in rows.flatten() {
+            results.push(sym);
         }
         Ok(results)
     }
@@ -208,25 +209,25 @@ impl DatabaseEngine {
              FROM proof_of_work WHERE task_id = ?1 ORDER BY step_index ASC",
         ).map_err(|e| AetherError::Database(e.to_string()))?;
 
-        let rows = stmt.query_map(params![task_id], |row| {
-            Ok(ProofOfWorkRecord {
-                id: Some(row.get(0)?),
-                task_id: row.get(1)?,
-                step_index: row.get::<_, i64>(2)? as usize,
-                tool_name: row.get(3)?,
-                input_json: row.get(4)?,
-                output_json: row.get(5)?,
-                diff: row.get(6)?,
-                exit_code: row.get(7)?,
-                timestamp: row.get(8)?,
+        let rows = stmt
+            .query_map(params![task_id], |row| {
+                Ok(ProofOfWorkRecord {
+                    id: Some(row.get(0)?),
+                    task_id: row.get(1)?,
+                    step_index: row.get::<_, i64>(2)? as usize,
+                    tool_name: row.get(3)?,
+                    input_json: row.get(4)?,
+                    output_json: row.get(5)?,
+                    diff: row.get(6)?,
+                    exit_code: row.get(7)?,
+                    timestamp: row.get(8)?,
+                })
             })
-        }).map_err(|e| AetherError::Database(e.to_string()))?;
+            .map_err(|e| AetherError::Database(e.to_string()))?;
 
         let mut results = Vec::new();
-        for r in rows {
-            if let Ok(rec) = r {
-                results.push(rec);
-            }
+        for rec in rows.flatten() {
+            results.push(rec);
         }
         Ok(results)
     }
@@ -253,7 +254,9 @@ mod tests {
 
         db.insert_symbol(&sym1).expect("insert symbol failed");
 
-        let search_results = db.search_symbols_fts("validate_jwt", 10).expect("fts failed");
+        let search_results = db
+            .search_symbols_fts("validate_jwt", 10)
+            .expect("fts failed");
         assert_eq!(search_results.len(), 1);
         assert_eq!(search_results[0].name, "validate_jwt_token");
     }

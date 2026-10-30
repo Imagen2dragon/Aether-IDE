@@ -40,13 +40,29 @@ impl EnvironmentDoctor {
         // 1. Rust
         list.push(Self::check_tool("Rust Compiler", "rustc --version", "https://rustup.rs").await);
         // 2. Cargo
-        list.push(Self::check_tool("Cargo Package Manager", "cargo --version", "https://rustup.rs").await);
+        list.push(
+            Self::check_tool(
+                "Cargo Package Manager",
+                "cargo --version",
+                "https://rustup.rs",
+            )
+            .await,
+        );
         // 3. Git
         list.push(Self::check_tool("Git SCM", "git --version", "https://git-scm.com").await);
         // 4. Node.js
-        list.push(Self::check_tool("Node.js Runtime", "node --version", "https://nodejs.org").await);
+        list.push(
+            Self::check_tool("Node.js Runtime", "node --version", "https://nodejs.org").await,
+        );
         // 5. Python
-        list.push(Self::check_tool("Python Interpreter", "python --version", "https://python.org").await);
+        list.push(
+            Self::check_tool(
+                "Python Interpreter",
+                "python --version",
+                "https://python.org",
+            )
+            .await,
+        );
 
         let all_healthy = list.iter().all(|d| d.status == ToolchainStatus::Healthy);
 
@@ -88,7 +104,11 @@ mod tests {
         let report = EnvironmentDoctor::diagnose_all().await;
         assert!(!report.diagnostics.is_empty());
 
-        let rust_diag = report.diagnostics.iter().find(|d| d.name.contains("Rust")).unwrap();
+        let rust_diag = report
+            .diagnostics
+            .iter()
+            .find(|d| d.name.contains("Rust"))
+            .unwrap();
         assert_eq!(rust_diag.status, ToolchainStatus::Healthy);
     }
 }

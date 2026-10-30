@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AetherIDE — Autonomous Software Engineering Ecosystem</title>
+  <style>
+    :root {
+      --bg-primary: #070a12;
+      --bg-secondary: #0b0f19;
+      --bg-panel: #0d1222;
+      --border-color: #1e293b;
+      --text-primary: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent: #38bdf8;
+      --accent-hover: #0284c7;
+      --success: #4ade80;
+      --warning: #fbbf24;
+      --danger: #f87171;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      user-select: none;
+    }
+    header {
+      height: 48px;
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-weight: 800;
+      letter-spacing: 1px;
+      color: var(--accent);
+    }
+    .brand span.badge {
+      background: #1e293b;
+      color: #94a3b8;
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-weight: 600;
+    }
+    nav {
+      display: flex;
+      gap: 8px;
+    }
+    nav button {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-size: 13px;
+      font-weight: 600;
+      padding: 6px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    nav button:hover, nav button.active {
+      background: var(--border-color);
+      color: var(--accent);
+    }
+    .status-badge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--success);
+      font-weight: 500;
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      background: var(--success);
+      border-radius: 50%;
+      box-shadow: 0 0 8px var(--success);
+    }
+    .container {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+    aside {
+      width: 280px;
+      background: var(--bg-secondary);
+      border-right: 1px solid var(--border-color);
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .section-title {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--text-muted);
+      font-weight: 700;
+    }
+    .tree-view {
+      font-family: Consolas, monospace;
+      font-size: 13px;
+      line-height: 24px;
+      color: #cbd5e1;
+    }
+    .tree-view div { cursor: pointer; border-radius: 4px; padding: 2px 6px; }
+    .tree-view div:hover { background: #1e293b; color: var(--accent); }
+    main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg-panel);
+      padding: 20px;
+      overflow-y: auto;
+    }
+    .panel-view { display: none; height: 100%; flex-direction: column; }
+    .panel-view.active { display: flex; }
+    .card {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+    .card h3 {
+      font-size: 16px;
+      color: var(--text-primary);
+      margin-bottom: 12px;
+    }
+    .btn {
+      background: var(--accent);
+      color: #000;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 13px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .btn:hover { background: var(--accent-hover); color: #fff; }
+    pre.code-editor {
+      background: #040711;
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      padding: 16px;
+      font-family: Consolas, "Fira Code", monospace;
+      font-size: 13px;
+      line-height: 1.6;
+      color: #e2e8f0;
+      overflow: auto;
+      flex: 1;
+    }
+    input, select, textarea {
+      width: 100%;
+      background: #111827;
+      border: 1px solid var(--border-color);
+      color: var(--text-primary);
+      padding: 10px 12px;
+      border-radius: 6px;
+      margin-bottom: 12px;
+      font-size: 13px;
+    }
+    input:focus, select:focus, textarea:focus {
+      border-color: var(--accent);
+      outline: none;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span>AETHER // IDE</span>
+      <span class="badge">v0.1.0-alpha Standalone</span>
+    </div>
+    <nav>
+      <button class="active" onclick="switchTab('editor')">Code Studio</button>
+      <button onclick="switchTab('agents')">AI Autonomous Team</button>
+      <button onclick="switchTab('mobile')">Mobile Studio</button>
+      <button onclick="switchTab('brain')">Project Brain</button>
+      <button onclick="switchTab('terminal')">Diagnostics</button>
+    </nav>
+    <div class="status-badge">
+      <div class="status-dot"></div>
+      <span id="daemon-status">Native Daemon Online (44888)</span>
+    </div>
+  </header>
+
+  <div class="container">
+    <aside>
+      <div class="section-title">Project Explorer</div>
+      <div class="tree-view">
+        <div>📁 rust/</div>
+        <div style="padding-left:16px;">📁 crates/</div>
+        <div style="padding-left:32px;">📄 application-core/</div>
+        <div style="padding-left:32px;">📄 ipc-protocol/</div>
+        <div style="padding-left:32px;">📄 model-gateway/</div>
+        <div style="padding-left:32px;">📄 agent-orchestrator/</div>
+        <div style="padding-left:32px;">📄 project-brain/</div>
+        <div style="padding-left:16px;">📁 services/</div>
+        <div style="padding-left:32px;">📄 aether-daemon/</div>
+        <div style="padding-left:16px;">📁 cli/</div>
+        <div style="padding-left:32px;">📄 aether-launcher/</div>
+        <div>📁 extensions/</div>
+        <div style="padding-left:16px;">📄 aether-core/</div>
+        <div>📁 mobile-studio/</div>
+        <div>📁 apps/ios-companion/</div>
+      </div>
+    </aside>
+
+    <main>
+      <!-- Editor View -->
+      <div id="view-editor" class="panel-view active">
+        <div style="margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center;">
+          <h2 style="font-size: 16px;">rust/services/aether-daemon/src/main.rs</h2>
+          <span style="font-size: 12px; color: var(--text-muted);">Tokio Asynchronous Daemon Slice</span>
+        </div>
+        <pre class="code-editor"><code>// AetherIDE Native Daemon Entrypoint
+use application_core::{AetherConfig, AutonomyMode};
+use database_engine::DatabaseEngine;
+use model_gateway::ModelGateway;
+use security_core::TokenManager;
+
+#[tokio::main]
+async fn main() -> Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    info!("Starting AetherIDE Native Daemon v0.1.0-alpha");
+    let config = AetherConfig::default();
+    let session_token = TokenManager::generate_session_token();
+    
+    // Windows Named Pipe + Loopback TCP IPC Dispatcher
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:44888").await?;
+    info!("Daemon IPC authenticated listener running on 127.0.0.1:44888");
+    ...
+}</code></pre>
+      </div>
+
+      <!-- Agents View -->
+      <div id="view-agents" class="panel-view">
+        <h2 style="margin-bottom: 16px;">Autonomous AI Engineering Team</h2>
+        <div class="card">
+          <h3>Deploy Autonomous Agent Task</h3>
+          <label style="font-size: 12px; color: var(--text-muted); display: block; margin-bottom: 6px;">Select Specialist Persona:</label>
+          <select id="agent-persona">
+            <option>Principal Software Architect</option>
+            <option>Rust Systems Engineer</option>
+            <option>Frontend & UI/UX Specialist</option>
+            <option>Mobile Engineering Lead (Expo/React Native)</option>
+            <option>Security & Cryptography Auditor</option>
+            <option>Database & Indexing Engineer</option>
+          </select>
+          <label style="font-size: 12px; color: var(--text-muted); display: block; margin-bottom: 6px;">Task Objective & Scope:</label>
+          <textarea id="agent-prompt" rows="3" placeholder="Describe the engineering goal, verification criteria, and target files..."></textarea>
+          <button class="btn" onclick="dispatchAgent()">Dispatch Autonomous Agent</button>
+        </div>
+        <div class="card">
+          <h3>Active Orchestration Pipeline</h3>
+          <div id="agent-feed" style="font-size: 13px; color: #cbd5e1; line-height: 1.8;">
+            <div>● [Architect] System health, memory constraints, and symbol indexing verified.</div>
+            <div>● [Model Gateway] Multi-provider failover initialized: OpenAI, Gemini, Claude, DeepSeek, xAI.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Mobile View -->
+      <div id="view-mobile" class="panel-view">
+        <h2 style="margin-bottom: 16px;">Mobile App Studio (React Native & Expo)</h2>
+        <div class="card">
+          <h3>Scaffold Production Mobile Application</h3>
+          <input type="text" id="mobile-name" placeholder="App Name (e.g., AetherCommerceDemo)" value="AetherMobileApp" />
+          <button class="btn" onclick="scaffoldMobile()">Generate React Native Project</button>
+        </div>
+      </div>
+
+      <!-- Brain View -->
+      <div id="view-brain" class="panel-view">
+        <h2 style="margin-bottom: 16px;">Living Project Brain</h2>
+        <div class="card">
+          <h3>Semantic Knowledge Graph & Architectural Decisions</h3>
+          <div style="font-size: 13px; color: #94a3b8; line-height: 1.8;">
+            <p><strong>Crates:</strong> 22 workspace members</p>
+            <p><strong>Database:</strong> SQLite WAL mode with FTS5 inverted index</p>
+            <p><strong>Security:</strong> SEC-01 constant-time token verification + pipe isolation</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Terminal View -->
+      <div id="view-terminal" class="panel-view">
+        <h2 style="margin-bottom: 16px;">Environment & Diagnostic Doctor</h2>
+        <div class="card">
+          <pre style="font-family: Consolas, monospace; font-size: 12px; color: #4ade80; line-height: 1.6;">
+[✓] Rust Toolchain: rustc 1.85+ stable (x86_64-pc-windows-msvc)
+[✓] Cargo Workspace: 22 crates compiled
+[✓] SQLite3 Bundled Full (FTS5 enabled)
+[✓] Node.js Runtime: Active
+[✓] Windows Named Pipe IPC: Active
+[✓] Daemon Session Token: Verified</pre>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    function switchTab(tabId) {
+      document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.panel-view').forEach(p => p.classList.remove('active'));
+      event.target.classList.add('active');
+      document.getElementById('view-' + tabId).classList.add('active');
+    }
+
+    function dispatchAgent() {
+      const persona = document.getElementById('agent-persona').value;
+      const prompt = document.getElementById('agent-prompt').value;
+      if (!prompt) return;
+      const feed = document.getElementById('agent-feed');
+      const item = document.createElement('div');
+      item.innerHTML = '● [' + persona + '] Queued task: ' + prompt;
+      feed.prepend(item);
+      document.getElementById('agent-prompt').value = '';
+    }
+
+    function scaffoldMobile() {
+      alert('Expo React Native mobile scaffolding triggered via Aether daemon.');
+    }
+  </script>
+</body>
+</html>

@@ -34,7 +34,12 @@ impl TerminalManager {
         }
     }
 
-    pub fn create_session(&self, title: &str, shell: &str, cwd: Option<PathBuf>) -> TerminalSessionInfo {
+    pub fn create_session(
+        &self,
+        title: &str,
+        shell: &str,
+        cwd: Option<PathBuf>,
+    ) -> TerminalSessionInfo {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let info = TerminalSessionInfo {
             id,
@@ -55,7 +60,10 @@ impl TerminalManager {
         if lock.remove(&id).is_some() {
             Ok(())
         } else {
-            Err(AetherError::Process(format!("Terminal session {} not found", id)))
+            Err(AetherError::Process(format!(
+                "Terminal session {} not found",
+                id
+            )))
         }
     }
 
@@ -68,9 +76,9 @@ impl TerminalManager {
     ) -> Result<process_manager::ProcessOutput> {
         let session = {
             let lock = self.sessions.lock();
-            lock.get(&id).cloned().ok_or_else(|| {
-                AetherError::Process(format!("Terminal session {} not found", id))
-            })?
+            lock.get(&id)
+                .cloned()
+                .ok_or_else(|| AetherError::Process(format!("Terminal session {} not found", id)))?
         };
 
         process_manager::ProcessManager::run_command_streaming(
@@ -79,7 +87,8 @@ impl TerminalManager {
             None,
             stdout_tx,
             stderr_tx,
-        ).await
+        )
+        .await
     }
 }
 

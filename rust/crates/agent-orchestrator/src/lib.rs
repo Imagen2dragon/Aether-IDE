@@ -141,17 +141,22 @@ impl AgentOrchestrator {
         self.personas.clone()
     }
 
-    pub fn spawn_task(
+    pub fn spawn_task(&self, role: &str, objective: &str, autonomy_mode: AutonomyMode) -> String {
+        self.spawn_task_with_worktree(role, objective, autonomy_mode, None)
+    }
+
+    pub fn spawn_task_with_worktree(
         &self,
         role: &str,
         objective: &str,
         autonomy_mode: AutonomyMode,
+        worktree_path: Option<std::path::PathBuf>,
     ) -> String {
         let runtime = AgentRuntime::new(
             role,
             objective,
             autonomy_mode,
-            None,
+            worktree_path,
             self.model_gateway.clone(),
             self.db.clone(),
         );
@@ -177,6 +182,36 @@ impl AgentOrchestrator {
         self.tasks.lock().insert(task_id.to_string(), runtime);
         Ok(task_clone)
     }
+
+    pub async fn approve_step(&self, task_id: &str, step_index: usize) -> Result<AgentTask> {
+        let mut runtime = {
+            let mut lock = self.tasks.lock();
+            lock.remove(task_id)
+                .ok_or_else(|| AetherError::Agent(format!("Task {} not found", task_id)))?
+        };
+
+        let _ = runtime.approve_and_execute_step(step_index).await?;
+        let task_clone = runtime.task.clone();
+        self.tasks.lock().insert(task_id.to_string(), runtime);
+        Ok(task_clone)
+    }
+
+    pub fn reject_step(&self, task_id: &str, step_index: usize, reason: &str) -> Result<AgentTask> {
+        let mut runtime = {
+            let mut lock = self.tasks.lock();
+            lock.remove(task_id)
+                .ok_or_else(|| AetherError::Agent(format!("Task {} not found", task_id)))?
+        };
+
+        if step_index < runtime.task.steps.len() {
+            runtime.task.steps[step_index].output_json = Some(format!("Rejected: {}", reason));
+            runtime.task.status = agent_runtime::TaskStatus::Cancelled;
+        }
+
+        let task_clone = runtime.task.clone();
+        self.tasks.lock().insert(task_id.to_string(), runtime);
+        Ok(task_clone)
+    }
 }
 
 #[cfg(test)]
@@ -192,7 +227,8 @@ mod tests {
         let personas = orchestrator.list_personas();
         assert_eq!(personas.len(), 14);
 
-        let task_id = orchestrator.spawn_task("architect", "Design IPC schema", AutonomyMode::Autopilot);
+        let task_id =
+            orchestrator.spawn_task("architect", "Design IPC schema", AutonomyMode::Autopilot);
         assert!(!task_id.is_empty());
 
         let task = orchestrator.get_task(&task_id);

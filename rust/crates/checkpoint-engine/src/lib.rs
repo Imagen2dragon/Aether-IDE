@@ -70,22 +70,33 @@ mod tests {
 
     #[test]
     fn test_checkpoint_create_and_restore() {
-        let temp_dir = std::env::temp_dir().join(format!("aether_ckpt_test_{}", uuid::Uuid::new_v4().simple()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_ckpt_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         let storage_dir = temp_dir.join(".aether").join("checkpoints");
         let test_file = temp_dir.join("hello.txt");
 
         FilesystemEngine::write_file_atomic(&test_file, "Original text").unwrap();
         let engine = CheckpointEngine::new(&storage_dir);
 
-        let ckpt = engine.create_checkpoint("Initial state", &[test_file.clone()]).unwrap();
+        let ckpt = engine
+            .create_checkpoint("Initial state", std::slice::from_ref(&test_file))
+            .unwrap();
 
         // Mutate file
         FilesystemEngine::write_file_atomic(&test_file, "Modified text").unwrap();
-        assert_eq!(FilesystemEngine::read_file_string(&test_file).unwrap(), "Modified text");
+        assert_eq!(
+            FilesystemEngine::read_file_string(&test_file).unwrap(),
+            "Modified text"
+        );
 
         // Restore checkpoint
         engine.restore_checkpoint(&ckpt).unwrap();
-        assert_eq!(FilesystemEngine::read_file_string(&test_file).unwrap(), "Original text");
+        assert_eq!(
+            FilesystemEngine::read_file_string(&test_file).unwrap(),
+            "Original text"
+        );
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

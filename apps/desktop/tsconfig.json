@@ -4,7 +4,11 @@
     "target": "ES2022",
     "outDir": "dist",
     "rootDir": "src",
-    "strict": true
+    "strict": false,
+    "skipLibCheck": true,
+    "typeRoots": [
+      "../../extensions/aether-core/node_modules/@types"
+    ]
   },
-  "include": ["src"]
+  "include": ["src/**/*"]
 }

@@ -10,7 +10,7 @@ function startDaemon() {
   const isDev = !app.isPackaged;
   const daemonPath = isDev
     ? path.join(__dirname, '../../../rust/target/debug/aether-daemon.exe')
-    : path.join(process.resourcesPath, 'bin/aether-daemon.exe');
+    : path.join((process as any).resourcesPath || path.join(__dirname, '..'), 'bin/aether-daemon.exe');
 
   if (fs.existsSync(daemonPath)) {
     console.log(`[Aether Desktop] Starting native daemon at: ${daemonPath}`);

@@ -47,6 +47,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aether-launcher"
+version = "0.1.0"
+dependencies = [
+ "application-core",
+ "ipc-protocol",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "agent-orchestrator"
 version = "0.1.0"
 dependencies = [
@@ -1500,8 +1510,10 @@ name = "syntax-engine"
 version = "0.1.0"
 dependencies = [
  "application-core",
+ "proc-macro2",
  "regex",
  "serde",
+ "syn 2.0.119",
  "tracing",
 ]
 

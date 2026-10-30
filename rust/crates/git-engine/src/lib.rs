@@ -24,7 +24,9 @@ impl GitEngine {
             None,
             None,
             None,
-        ).await.map_err(|e| AetherError::Process(format!("Git rev-parse failed: {}", e)))?;
+        )
+        .await
+        .map_err(|e| AetherError::Process(format!("Git rev-parse failed: {}", e)))?;
 
         let branch = branch_out.stdout.trim().to_string();
 
@@ -34,7 +36,9 @@ impl GitEngine {
             None,
             None,
             None,
-        ).await.map_err(|e| AetherError::Process(format!("Git status failed: {}", e)))?;
+        )
+        .await
+        .map_err(|e| AetherError::Process(format!("Git status failed: {}", e)))?;
 
         let mut modified = Vec::new();
         let mut staged = Vec::new();
@@ -76,21 +80,24 @@ impl GitEngine {
         agent_id: &str,
     ) -> Result<PathBuf> {
         let repo = repo_path.as_ref();
-        let worktree_dir = repo.join(".aether").join("worktrees").join(format!("agent-{}", agent_id));
+        let worktree_dir = repo
+            .join(".aether")
+            .join("worktrees")
+            .join(format!("agent-{}", agent_id));
         let branch_name = format!("aether-agent/{}", agent_id);
 
         if let Some(parent) = worktree_dir.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        let cmd = format!("git worktree add -b \"{}\" \"{}\"", branch_name, worktree_dir.display());
-        ProcessManager::run_command_streaming(
-            &cmd,
-            Some(repo.to_path_buf()),
-            None,
-            None,
-            None,
-        ).await.map_err(|e| AetherError::Process(format!("Failed to create worktree: {}", e)))?;
+        let cmd = format!(
+            "git worktree add -b \"{}\" \"{}\"",
+            branch_name,
+            worktree_dir.display()
+        );
+        ProcessManager::run_command_streaming(&cmd, Some(repo.to_path_buf()), None, None, None)
+            .await
+            .map_err(|e| AetherError::Process(format!("Failed to create worktree: {}", e)))?;
 
         Ok(worktree_dir)
     }
@@ -99,14 +106,19 @@ impl GitEngine {
         repo_path: P,
         worktree_path: P,
     ) -> Result<()> {
-        let cmd = format!("git worktree remove --force \"{}\"", worktree_path.as_ref().display());
+        let cmd = format!(
+            "git worktree remove --force \"{}\"",
+            worktree_path.as_ref().display()
+        );
         ProcessManager::run_command_streaming(
             &cmd,
             Some(repo_path.as_ref().to_path_buf()),
             None,
             None,
             None,
-        ).await.map_err(|e| AetherError::Process(format!("Failed to remove worktree: {}", e)))?;
+        )
+        .await
+        .map_err(|e| AetherError::Process(format!("Failed to remove worktree: {}", e)))?;
         Ok(())
     }
 
@@ -117,7 +129,9 @@ impl GitEngine {
             None,
             None,
             None,
-        ).await.map_err(|e| AetherError::Process(format!("Git diff failed: {}", e)))?;
+        )
+        .await
+        .map_err(|e| AetherError::Process(format!("Git diff failed: {}", e)))?;
         Ok(out.stdout)
     }
 }

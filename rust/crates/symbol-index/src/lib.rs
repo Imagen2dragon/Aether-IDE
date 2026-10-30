@@ -11,7 +11,11 @@ impl SymbolIndex {
         Self { db }
     }
 
-    pub fn insert_file_symbols(&self, file_path: &str, symbols: &[ExtractedSymbol]) -> Result<usize> {
+    pub fn insert_file_symbols(
+        &self,
+        file_path: &str,
+        symbols: &[ExtractedSymbol],
+    ) -> Result<usize> {
         let mut count = 0;
         for sym in symbols {
             let record = SymbolRecord {

@@ -1,4 +1,6 @@
 import * as net from 'net';
+import * as fs from 'fs';
+import * as path from 'path';
 import * as vscode from 'vscode';
 
 export interface IpcEnvelope {
@@ -13,10 +15,36 @@ export class DaemonClient {
   private pendingRequests = new Map<string, { resolve: (val: any) => void; reject: (err: any) => void }>();
   private buffer = '';
   private port = 44888;
+  private sessionToken: string | null = null;
 
   constructor() {
     const config = vscode.workspace.getConfiguration('aether');
     this.port = config.get<number>('daemonPort', 44888);
+    this.loadSessionToken();
+  }
+
+  private loadSessionToken(): string | null {
+    try {
+      const localAppData = process.env.LOCALAPPDATA || (process.env.HOME ? path.join(process.env.HOME, '.aether') : '.');
+      const tokenFile = process.env.LOCALAPPDATA
+        ? path.join(localAppData, 'AetherIDE', 'daemon_session.token')
+        : path.join(localAppData, 'daemon_session.token');
+
+      if (fs.existsSync(tokenFile)) {
+        this.sessionToken = fs.readFileSync(tokenFile, 'utf8').trim();
+        return this.sessionToken;
+      }
+    } catch (e) {
+      console.warn('[Aether] Error reading daemon session token:', e);
+    }
+    return null;
+  }
+
+  public getSessionToken(): string | null {
+    if (!this.sessionToken) {
+      this.loadSessionToken();
+    }
+    return this.sessionToken;
   }
 
   public async connect(): Promise<void> {
@@ -62,7 +90,7 @@ export class DaemonClient {
     const id = `req-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
     const envelope = {
       id,
-      session_token: null,
+      session_token: this.getSessionToken(),
       type: 'Request',
       data: {
         action,
@@ -86,6 +114,9 @@ export class DaemonClient {
   private handleMessage(raw: string) {
     try {
       const envelope: IpcEnvelope = JSON.parse(raw);
+      if (envelope.session_token) {
+        this.sessionToken = envelope.session_token;
+      }
       if (envelope.type === 'Response' && this.pendingRequests.has(envelope.id)) {
         const { resolve, reject } = this.pendingRequests.get(envelope.id)!;
         this.pendingRequests.delete(envelope.id);

@@ -1,5 +1,5 @@
 # AetherIDE Windows Release Build & Package Script
-# Builds high-performance native Rust core + TypeScript workbench
+# Builds high-performance native Rust core + Standalone Desktop Workbench
 
 $ErrorActionPreference = "Stop"
 $IDE_ROOT = (Get-Item $PSScriptRoot).Parent.FullName
@@ -15,45 +15,56 @@ if (Test-Path $DIST_DIR) {
 }
 New-Item -ItemType Directory -Path $DIST_DIR -Force | Out-Null
 New-Item -ItemType Directory -Path "$DIST_DIR\bin" -Force | Out-Null
-New-Item -ItemType Directory -Path "$DIST_DIR\extensions" -Force | Out-Null
+New-Item -ItemType Directory -Path "$DIST_DIR\extensions\aether-core" -Force | Out-Null
+New-Item -ItemType Directory -Path "$DIST_DIR\workbench\dist" -Force | Out-Null
 
 # 2. Build Rust native core binaries in release mode
-Write-Host "`n[1/4] Compiling Native Rust Daemon and CLI..." -ForegroundColor Yellow
+Write-Host "`n[1/4] Compiling Native Rust Daemon, CLI and Standalone Launcher..." -ForegroundColor Yellow
 Set-Location "$IDE_ROOT\rust"
-cargo build --release --bin aether-daemon --bin aether-cli
+cargo build --release --bin aether-daemon --bin aether-cli --bin AetherIDE
 
 # Copy Rust binaries
 Copy-Item "$IDE_ROOT\rust\target\release\aether-daemon.exe" "$DIST_DIR\bin\" -Force
 Copy-Item "$IDE_ROOT\rust\target\release\aether-cli.exe" "$DIST_DIR\bin\" -Force
-Write-Host "Copied native binaries: aether-daemon.exe, aether-cli.exe" -ForegroundColor Green
+Copy-Item "$IDE_ROOT\rust\target\release\AetherIDE.exe" "$DIST_DIR\AetherIDE.exe" -Force
+Write-Host "Copied native binaries: AetherIDE.exe, bin\aether-daemon.exe, bin\aether-cli.exe" -ForegroundColor Green
 
 # 3. Compile Aether Core Extension
 Write-Host "`n[2/4] Building Aether Core Extension..." -ForegroundColor Yellow
 Set-Location "$IDE_ROOT\extensions\aether-core"
-if (Test-Path "package.json") {
-    # Ensure dependencies compiled
-    npx tsc -p ./
-    Copy-Item "$IDE_ROOT\extensions\aether-core" "$DIST_DIR\extensions\" -Recurse -Force
+$tscPath = "$IDE_ROOT\extensions\aether-core\node_modules\typescript\bin\tsc"
+if (Test-Path $tscPath) {
+    node $tscPath -p "$IDE_ROOT\extensions\aether-core"
+    Copy-Item "$IDE_ROOT\extensions\aether-core\dist" "$DIST_DIR\extensions\aether-core\dist" -Recurse -Force
+    Copy-Item "$IDE_ROOT\extensions\aether-core\package.json" "$DIST_DIR\extensions\aether-core\" -Force
+    Write-Host "Compiled and packaged Aether Core Extension" -ForegroundColor Green
+} else {
+    Write-Warning "TypeScript compiler not found in local extension node_modules."
 }
 
-# 4. Generate Launcher & Portable Distribution
-Write-Host "`n[3/4] Generating Launcher and Start Scripts..." -ForegroundColor Yellow
+# 4. Compile Desktop Workbench
+Write-Host "`n[3/4] Building Standalone Desktop Workbench..." -ForegroundColor Yellow
+Set-Location "$IDE_ROOT\apps\desktop"
+if (Test-Path $tscPath) {
+    node $tscPath -p "$IDE_ROOT\apps\desktop"
+}
+Copy-Item "$IDE_ROOT\apps\desktop\dist\*" "$DIST_DIR\workbench\dist\" -Recurse -Force
+Copy-Item "$IDE_ROOT\apps\desktop\workbench\index.html" "$DIST_DIR\workbench\index.html" -Force
+Copy-Item "$IDE_ROOT\apps\desktop\package.json" "$DIST_DIR\workbench\" -Force
+Write-Host "Packaged Standalone Desktop Workbench" -ForegroundColor Green
+
+# 5. Generate Standalone Launcher Batch
 $LAUNCHER_BAT = @"
 @echo off
 title AetherIDE - Autonomous AI Engineering Platform
-echo Starting Aether Native Daemon...
-start /B "" "%~dp0bin\aether-daemon.exe"
-timeout /t 1 /nobreak >nul
-echo Launching AetherIDE Desktop Workbench...
-start "" code "%~dp0.." --extensionDevelopmentPath="%~dp0extensions\aether-core"
-exit
+"%~dp0AetherIDE.exe" %*
 "@
 Set-Content -Path "$DIST_DIR\AetherIDE.cmd" -Value $LAUNCHER_BAT
 
-# 5. Create Checksums
+# 6. Create Checksums
 Write-Host "`n[4/4] Generating SHA256 Verification Checksums..." -ForegroundColor Yellow
 Set-Location $DIST_DIR
-$files = Get-ChildItem -Recurse -File
+$files = Get-ChildItem -Recurse -File | Where-Object { $_.Name -ne "CHECKSUMS-SHA256.txt" }
 $checksums = foreach ($file in $files) {
     $hash = (Get-FileHash -Path $file.FullName -Algorithm SHA256).Hash
     "$hash  $($file.FullName.Replace($DIST_DIR, ''))"

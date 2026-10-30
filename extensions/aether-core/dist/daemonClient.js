@@ -2,15 +2,41 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.DaemonClient = void 0;
 const net = require("net");
+const fs = require("fs");
+const path = require("path");
 const vscode = require("vscode");
 class DaemonClient {
     client = null;
     pendingRequests = new Map();
     buffer = '';
     port = 44888;
+    sessionToken = null;
     constructor() {
         const config = vscode.workspace.getConfiguration('aether');
         this.port = config.get('daemonPort', 44888);
+        this.loadSessionToken();
+    }
+    loadSessionToken() {
+        try {
+            const localAppData = process.env.LOCALAPPDATA || (process.env.HOME ? path.join(process.env.HOME, '.aether') : '.');
+            const tokenFile = process.env.LOCALAPPDATA
+                ? path.join(localAppData, 'AetherIDE', 'daemon_session.token')
+                : path.join(localAppData, 'daemon_session.token');
+            if (fs.existsSync(tokenFile)) {
+                this.sessionToken = fs.readFileSync(tokenFile, 'utf8').trim();
+                return this.sessionToken;
+            }
+        }
+        catch (e) {
+            console.warn('[Aether] Error reading daemon session token:', e);
+        }
+        return null;
+    }
+    getSessionToken() {
+        if (!this.sessionToken) {
+            this.loadSessionToken();
+        }
+        return this.sessionToken;
     }
     async connect() {
         return new Promise((resolve, reject) => {
@@ -51,7 +77,7 @@ class DaemonClient {
         const id = `req-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
         const envelope = {
             id,
-            session_token: null,
+            session_token: this.getSessionToken(),
             type: 'Request',
             data: {
                 action,
@@ -72,6 +98,9 @@ class DaemonClient {
     handleMessage(raw) {
         try {
             const envelope = JSON.parse(raw);
+            if (envelope.session_token) {
+                this.sessionToken = envelope.session_token;
+            }
             if (envelope.type === 'Response' && this.pendingRequests.has(envelope.id)) {
                 const { resolve, reject } = this.pendingRequests.get(envelope.id);
                 this.pendingRequests.delete(envelope.id);
