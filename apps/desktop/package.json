@@ -1,0 +1,21 @@
+{
+  "name": "aether-desktop",
+  "productName": "AetherIDE",
+  "version": "0.1.0-alpha",
+  "description": "Production-Grade Rust-First AI-Native IDE and Autonomous Software Engineering Ecosystem",
+  "main": "dist/main.js",
+  "scripts": {
+    "start": "tsc && electron .",
+    "build": "tsc",
+    "pack:win": "electron-builder --win --x64"
+  },
+  "dependencies": {
+    "ws": "^8.17.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/ws": "^8.5.10",
+    "electron": "^30.0.9",
+    "typescript": "^5.4.5"
+  }
+}

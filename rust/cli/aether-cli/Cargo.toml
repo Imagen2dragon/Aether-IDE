@@ -1,0 +1,15 @@
+[package]
+name = "aether-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+application-core.workspace = true
+ipc-protocol.workspace = true
+diagnostics.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tracing.workspace = true

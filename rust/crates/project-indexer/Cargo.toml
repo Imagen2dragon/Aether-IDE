@@ -1,0 +1,15 @@
+[package]
+name = "project-indexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+application-core.workspace = true
+filesystem-engine.workspace = true
+syntax-engine.workspace = true
+symbol-index.workspace = true
+database-engine.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true

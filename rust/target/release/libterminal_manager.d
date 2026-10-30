@@ -1,0 +1,1 @@
+C:\Users\abdal\OneDrive\Desktop\ide\rust\target\release\libterminal_manager.rlib: C:\Users\abdal\OneDrive\Desktop\ide\rust\crates\application-core\src\lib.rs C:\Users\abdal\OneDrive\Desktop\ide\rust\crates\process-manager\src\lib.rs C:\Users\abdal\OneDrive\Desktop\ide\rust\crates\security-core\src\lib.rs C:\Users\abdal\OneDrive\Desktop\ide\rust\crates\terminal-manager\src\lib.rs

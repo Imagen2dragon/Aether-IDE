@@ -1,0 +1,31 @@
+[package]
+name = "aether-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+application-core.workspace = true
+ipc-protocol.workspace = true
+security-core.workspace = true
+permission-engine.workspace = true
+database-engine.workspace = true
+filesystem-engine.workspace = true
+syntax-engine.workspace = true
+symbol-index.workspace = true
+project-indexer.workspace = true
+process-manager.workspace = true
+git-engine.workspace = true
+terminal-manager.workspace = true
+model-gateway.workspace = true
+agent-runtime.workspace = true
+agent-orchestrator.workspace = true
+project-brain.workspace = true
+checkpoint-engine.workspace = true
+diagnostics.workspace = true
+mobile-build-manager.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true

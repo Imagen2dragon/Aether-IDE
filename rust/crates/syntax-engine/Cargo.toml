@@ -1,0 +1,11 @@
+[package]
+name = "syntax-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+application-core.workspace = true
+regex.workspace = true
+serde.workspace = true
+tracing.workspace = true

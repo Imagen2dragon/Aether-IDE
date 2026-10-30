@@ -1,0 +1,1 @@
+C:\Users\abdal\OneDrive\Desktop\ide\rust\target\release\libgit_engine.rlib: C:\Users\abdal\OneDrive\Desktop\ide\rust\crates\application-core\src\lib.rs C:\Users\abdal\OneDrive\Desktop\ide\rust\crates\git-engine\src\lib.rs C:\Users\abdal\OneDrive\Desktop\ide\rust\crates\process-manager\src\lib.rs C:\Users\abdal\OneDrive\Desktop\ide\rust\crates\security-core\src\lib.rs

@@ -1,0 +1,13 @@
+[package]
+name = "process-manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+application-core.workspace = true
+security-core.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+async-trait.workspace = true

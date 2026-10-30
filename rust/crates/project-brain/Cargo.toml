@@ -1,0 +1,14 @@
+[package]
+name = "project-brain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+application-core.workspace = true
+database-engine.workspace = true
+syntax-engine.workspace = true
+filesystem-engine.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

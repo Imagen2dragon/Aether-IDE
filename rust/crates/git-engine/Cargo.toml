@@ -1,0 +1,12 @@
+[package]
+name = "git-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+application-core.workspace = true
+process-manager.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true

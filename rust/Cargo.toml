@@ -1,0 +1,71 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/application-core",
+    "crates/ipc-protocol",
+    "crates/security-core",
+    "crates/permission-engine",
+    "crates/database-engine",
+    "crates/filesystem-engine",
+    "crates/syntax-engine",
+    "crates/symbol-index",
+    "crates/project-indexer",
+    "crates/process-manager",
+    "crates/git-engine",
+    "crates/terminal-manager",
+    "crates/model-gateway",
+    "crates/agent-runtime",
+    "crates/agent-orchestrator",
+    "crates/project-brain",
+    "crates/checkpoint-engine",
+    "crates/diagnostics",
+    "crates/mobile-build-manager",
+    "services/aether-daemon",
+    "cli/aether-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Aether Engineering Team"]
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1.43", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
+rusqlite = { version = "0.33", features = ["bundled", "bundled-full"] }
+uuid = { version = "1.13", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1.11"
+async-trait = "0.1"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+parking_lot = "0.12"
+bytes = "1.9"
+
+# Local workspace crate dependencies
+application-core = { path = "crates/application-core" }
+ipc-protocol = { path = "crates/ipc-protocol" }
+security-core = { path = "crates/security-core" }
+permission-engine = { path = "crates/permission-engine" }
+database-engine = { path = "crates/database-engine" }
+filesystem-engine = { path = "crates/filesystem-engine" }
+syntax-engine = { path = "crates/syntax-engine" }
+symbol-index = { path = "crates/symbol-index" }
+project-indexer = { path = "crates/project-indexer" }
+process-manager = { path = "crates/process-manager" }
+git-engine = { path = "crates/git-engine" }
+terminal-manager = { path = "crates/terminal-manager" }
+model-gateway = { path = "crates/model-gateway" }
+agent-runtime = { path = "crates/agent-runtime" }
+agent-orchestrator = { path = "crates/agent-orchestrator" }
+project-brain = { path = "crates/project-brain" }
+checkpoint-engine = { path = "crates/checkpoint-engine" }
+diagnostics = { path = "crates/diagnostics" }
+mobile-build-manager = { path = "crates/mobile-build-manager" }
