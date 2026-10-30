@@ -23,6 +23,11 @@ use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Error)]
 pub enum LspError {
+    #[error("Language server binary '{command}' not found on PATH. {install_hint}")]
+    ServerNotFound {
+        command: String,
+        install_hint: String,
+    },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Serialization error: {0}")]
@@ -94,7 +99,31 @@ impl LspClient {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
-        let mut child = cmd.spawn().map_err(LspError::Io)?;
+        let mut child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                let install_hint = match config.server_id.as_str() {
+                    "rust" => {
+                        "Please install rust-analyzer via 'rustup component add rust-analyzer'"
+                            .to_string()
+                    }
+                    "typescript" => {
+                        "Please install typescript-language-server via 'npm install -g typescript-language-server typescript'"
+                            .to_string()
+                    }
+                    "python" => "Please install pyright via 'pip install pyright'".to_string(),
+                    _ => format!(
+                        "Please ensure '{}' is installed and available on your system PATH.",
+                        config.command
+                    ),
+                };
+                LspError::ServerNotFound {
+                    command: config.command.clone(),
+                    install_hint,
+                }
+            } else {
+                LspError::Io(e)
+            }
+        })?;
 
         let stdin = child.stdin.take().expect("Child stdin must be piped");
         let stdout = child.stdout.take().expect("Child stdout must be piped");
