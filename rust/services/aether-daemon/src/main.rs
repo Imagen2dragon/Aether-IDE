@@ -75,6 +75,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         swarm_coordinator,
     });
 
+    // Register local host and loopback identities with Owner privileges
+    state
+        .role_registry
+        .register_peer("local", workspace_sync::DeviceRole::Owner);
+    state
+        .role_registry
+        .register_peer("host", workspace_sync::DeviceRole::Owner);
+    state
+        .role_registry
+        .register_peer("windows-named-pipe", workspace_sync::DeviceRole::Owner);
+
     // Write token file for UI workbench to authenticate
     let token_file = config.data_dir.join("daemon_session.token");
     let _ = std::fs::create_dir_all(&config.data_dir);
@@ -185,11 +196,24 @@ async fn handle_ipc_envelope(
         return IpcEnvelope {
             id: envelope.id,
             session_token: None,
+            peer_id: envelope.peer_id,
             payload: IpcPayload::Response(IpcResponse::unauthorized(
                 "Access denied: missing or invalid session token",
             )),
         };
     }
+
+    let caller_peer = envelope.peer_id.clone().unwrap_or_else(|| {
+        if peer_info == "windows-named-pipe"
+            || peer_info.starts_with("127.0.0.1:")
+            || peer_info == "local"
+        {
+            "local".to_string()
+        } else {
+            peer_info.to_string()
+        }
+    });
+    let caller_role = state.role_registry.get_role(&caller_peer);
 
     let req = match envelope.payload {
         IpcPayload::Request(r) => r,
@@ -197,6 +221,7 @@ async fn handle_ipc_envelope(
             return IpcEnvelope {
                 id: envelope.id,
                 session_token: Some(state.session_token.clone()),
+                peer_id: envelope.peer_id,
                 payload: IpcPayload::Response(IpcResponse::err("Only Request payloads supported")),
             }
         }
@@ -253,19 +278,26 @@ async fn handle_ipc_envelope(
             cwd,
             timeout_secs,
         } => {
-            let timeout = timeout_secs.map(std::time::Duration::from_secs);
-            let dir = cwd.map(PathBuf::from);
-            match process_manager::ProcessManager::run_command_streaming(
-                &command, dir, timeout, None, None,
-            )
-            .await
-            {
-                Ok(out) => IpcResponse::ok(serde_json::json!({
-                    "exit_code": out.exit_code,
-                    "stdout": out.stdout,
-                    "stderr": out.stderr,
-                })),
-                Err(e) => IpcResponse::err(e.to_string()),
+            if !caller_role.can_write() {
+                IpcResponse::unauthorized(format!(
+                    "Peer '{}' with role {:?} is not authorized to execute commands",
+                    caller_peer, caller_role
+                ))
+            } else {
+                let timeout = timeout_secs.map(std::time::Duration::from_secs);
+                let dir = cwd.map(PathBuf::from);
+                match process_manager::ProcessManager::run_command_streaming(
+                    &command, dir, timeout, None, None,
+                )
+                .await
+                {
+                    Ok(out) => IpcResponse::ok(serde_json::json!({
+                        "exit_code": out.exit_code,
+                        "stdout": out.stdout,
+                        "stderr": out.stderr,
+                    })),
+                    Err(e) => IpcResponse::err(e.to_string()),
+                }
             }
         }
 
@@ -274,21 +306,69 @@ async fn handle_ipc_envelope(
             objective,
             autonomy_mode,
         } => {
-            let mode = match autonomy_mode.to_lowercase().as_str() {
-                "observe" => AutonomyMode::Observe,
-                "autopilot" => AutonomyMode::Autopilot,
-                _ => AutonomyMode::Assist,
-            };
-            let task_id = state.agent_orchestrator.spawn_task(&role, &objective, mode);
-            let _ = state.agent_orchestrator.step_task(&task_id).await;
-            let task = state.agent_orchestrator.get_task(&task_id);
-            IpcResponse::ok(serde_json::to_value(task).unwrap())
+            if !caller_role.can_write() {
+                IpcResponse::unauthorized(format!(
+                    "Peer '{}' with role {:?} is not authorized to create agent tasks",
+                    caller_peer, caller_role
+                ))
+            } else {
+                let mode = match autonomy_mode.to_lowercase().as_str() {
+                    "observe" => AutonomyMode::Observe,
+                    "autopilot" => AutonomyMode::Autopilot,
+                    _ => AutonomyMode::Assist,
+                };
+                let task_id = state.agent_orchestrator.spawn_task(&role, &objective, mode);
+                let _ = state.agent_orchestrator.step_task(&task_id).await;
+                let task = state.agent_orchestrator.get_task(&task_id);
+                IpcResponse::ok(serde_json::to_value(task).unwrap())
+            }
         }
 
         IpcRequest::GetAgentTask { task_id } => match state.agent_orchestrator.get_task(&task_id) {
             Some(task) => IpcResponse::ok(serde_json::to_value(task).unwrap()),
             None => IpcResponse::err("Task not found"),
         },
+
+        IpcRequest::ApproveAgentStep { task_id, step_id } => {
+            if !caller_role.can_write() {
+                IpcResponse::unauthorized(format!(
+                    "Peer '{}' with role {:?} is not authorized to approve agent steps",
+                    caller_peer, caller_role
+                ))
+            } else {
+                let step_idx = step_id.parse::<usize>().unwrap_or(0);
+                match state
+                    .agent_orchestrator
+                    .approve_step(&task_id, step_idx)
+                    .await
+                {
+                    Ok(task) => IpcResponse::ok(serde_json::to_value(task).unwrap()),
+                    Err(e) => IpcResponse::err(e.to_string()),
+                }
+            }
+        }
+
+        IpcRequest::RejectAgentStep {
+            task_id,
+            step_id,
+            reason,
+        } => {
+            if !caller_role.can_write() {
+                IpcResponse::unauthorized(format!(
+                    "Peer '{}' with role {:?} is not authorized to reject agent steps",
+                    caller_peer, caller_role
+                ))
+            } else {
+                let step_idx = step_id.parse::<usize>().unwrap_or(0);
+                match state
+                    .agent_orchestrator
+                    .reject_step(&task_id, step_idx, &reason)
+                {
+                    Ok(task) => IpcResponse::ok(serde_json::to_value(task).unwrap()),
+                    Err(e) => IpcResponse::err(e.to_string()),
+                }
+            }
+        }
 
         IpcRequest::QueryProjectBrain { query: _ } => {
             let graph = state.project_brain.lock().get_graph().clone();
@@ -440,46 +520,62 @@ async fn handle_ipc_envelope(
             cols,
             rows,
         } => {
-            #[cfg(windows)]
-            {
-                let shell_name = shell.unwrap_or_else(|| "powershell".to_string());
-                let cwd_path = cwd.map(PathBuf::from);
-                let cols = cols.unwrap_or(80);
-                let rows = rows.unwrap_or(24);
-                match state
-                    .terminal_manager
-                    .spawn_interactive(&shell_name, cwd_path, cols, rows)
+            if !caller_role.can_write() {
+                IpcResponse::unauthorized(format!(
+                    "Peer '{}' with role {:?} is not authorized to spawn terminals",
+                    caller_peer, caller_role
+                ))
+            } else {
+                #[cfg(windows)]
                 {
-                    Ok(info) => IpcResponse::ok(serde_json::to_value(info).unwrap()),
-                    Err(e) => IpcResponse::err(e.to_string()),
+                    let shell_name = shell.unwrap_or_else(|| "powershell".to_string());
+                    let cwd_path = cwd.map(PathBuf::from);
+                    let cols = cols.unwrap_or(80);
+                    let rows = rows.unwrap_or(24);
+                    match state.terminal_manager.spawn_interactive(
+                        &shell_name,
+                        cwd_path,
+                        cols,
+                        rows,
+                    ) {
+                        Ok(info) => IpcResponse::ok(serde_json::to_value(info).unwrap()),
+                        Err(e) => IpcResponse::err(e.to_string()),
+                    }
                 }
-            }
-            #[cfg(not(windows))]
-            {
-                let info = state.terminal_manager.create_session(
-                    "Terminal",
-                    "bash",
-                    cwd.map(PathBuf::from),
-                );
-                IpcResponse::ok(serde_json::to_value(info).unwrap())
+                #[cfg(not(windows))]
+                {
+                    let info = state.terminal_manager.create_session(
+                        "Terminal",
+                        "bash",
+                        cwd.map(PathBuf::from),
+                    );
+                    IpcResponse::ok(serde_json::to_value(info).unwrap())
+                }
             }
         }
 
         IpcRequest::TerminalWrite { session_id, data } => {
-            #[cfg(windows)]
-            {
-                match state
-                    .terminal_manager
-                    .write_input(session_id, data.as_bytes())
+            if !caller_role.can_write() {
+                IpcResponse::unauthorized(format!(
+                    "Peer '{}' with role {:?} is not authorized to write to terminal",
+                    caller_peer, caller_role
+                ))
+            } else {
+                #[cfg(windows)]
                 {
-                    Ok(written) => IpcResponse::ok(serde_json::json!({ "written": written })),
-                    Err(e) => IpcResponse::err(e.to_string()),
+                    match state
+                        .terminal_manager
+                        .write_input(session_id, data.as_bytes())
+                    {
+                        Ok(written) => IpcResponse::ok(serde_json::json!({ "written": written })),
+                        Err(e) => IpcResponse::err(e.to_string()),
+                    }
                 }
-            }
-            #[cfg(not(windows))]
-            {
-                let _ = (session_id, data);
-                IpcResponse::ok(serde_json::json!({ "written": 0 }))
+                #[cfg(not(windows))]
+                {
+                    let _ = (session_id, data);
+                    IpcResponse::ok(serde_json::json!({ "written": 0 }))
+                }
             }
         }
 
@@ -694,20 +790,34 @@ async fn handle_ipc_envelope(
         }
 
         IpcRequest::RegisterPeerRole { peer_id, role } => {
-            let parsed_role = workspace_sync::DeviceRole::parse(&role);
-            state.role_registry.register_peer(&peer_id, parsed_role);
-            IpcResponse::ok(serde_json::json!({
-                "peer_id": peer_id,
-                "role": format!("{:?}", parsed_role)
-            }))
+            if !caller_role.can_admin() {
+                IpcResponse::unauthorized(format!(
+                    "Peer '{}' with role {:?} is not authorized to register peer roles",
+                    caller_peer, caller_role
+                ))
+            } else {
+                let parsed_role = workspace_sync::DeviceRole::parse(&role);
+                state.role_registry.register_peer(&peer_id, parsed_role);
+                IpcResponse::ok(serde_json::json!({
+                    "peer_id": peer_id,
+                    "role": format!("{:?}", parsed_role)
+                }))
+            }
         }
 
         IpcRequest::RevokePeerRole { peer_id } => {
-            let revoked = state.role_registry.revoke_peer(&peer_id);
-            IpcResponse::ok(serde_json::json!({
-                "peer_id": peer_id,
-                "revoked": revoked
-            }))
+            if !caller_role.can_admin() {
+                IpcResponse::unauthorized(format!(
+                    "Peer '{}' with role {:?} is not authorized to revoke peer roles",
+                    caller_peer, caller_role
+                ))
+            } else {
+                let revoked = state.role_registry.revoke_peer(&peer_id);
+                IpcResponse::ok(serde_json::json!({
+                    "peer_id": peer_id,
+                    "revoked": revoked
+                }))
+            }
         }
 
         IpcRequest::CrdtApplyUpdate {
@@ -890,6 +1000,7 @@ async fn handle_ipc_envelope(
     IpcEnvelope {
         id: envelope.id,
         session_token: Some(state.session_token.clone()),
+        peer_id: envelope.peer_id,
         payload: IpcPayload::Response(response),
     }
 }
@@ -914,6 +1025,9 @@ mod tests {
         let crdt_manager = Arc::new(workspace_sync::CrdtManager::new());
         let awareness_tracker = Arc::new(workspace_sync::AwarenessTracker::new());
         let role_registry = Arc::new(workspace_sync::RoleRegistry::new());
+        role_registry.register_peer("local", workspace_sync::DeviceRole::Owner);
+        role_registry.register_peer("host", workspace_sync::DeviceRole::Owner);
+        role_registry.register_peer("windows-named-pipe", workspace_sync::DeviceRole::Owner);
         let swarm_coordinator =
             Arc::new(agent_orchestrator::SwarmCoordinator::new(&workspace_root));
 
@@ -940,6 +1054,7 @@ mod tests {
         let envelope = IpcEnvelope {
             id: "test-unauth-1".into(),
             session_token: None,
+            peer_id: None,
             payload: IpcPayload::Request(IpcRequest::Ping),
         };
 
@@ -960,6 +1075,7 @@ mod tests {
         let envelope = IpcEnvelope {
             id: "test-invalid-2".into(),
             session_token: Some("invalid-token-12345".into()),
+            peer_id: None,
             payload: IpcPayload::Request(IpcRequest::Ping),
         };
 
@@ -980,6 +1096,7 @@ mod tests {
         let envelope = IpcEnvelope {
             id: "test-valid-3".into(),
             session_token: Some(state.session_token.clone()),
+            peer_id: None,
             payload: IpcPayload::Request(IpcRequest::Ping),
         };
 
@@ -1001,6 +1118,7 @@ mod tests {
         let envelope = IpcEnvelope {
             id: "test-unauth-cmd-4".into(),
             session_token: None,
+            peer_id: None,
             payload: IpcPayload::Request(IpcRequest::RunCommand {
                 command: "echo malicious".into(),
                 cwd: None,
@@ -1028,6 +1146,7 @@ mod tests {
         let envelope = IpcEnvelope {
             id: "test-lsp-diag-5".into(),
             session_token: Some(state.session_token.clone()),
+            peer_id: None,
             payload: IpcPayload::Request(IpcRequest::LspDiagnostics {
                 path: "src/main.rs".into(),
             }),
@@ -1055,6 +1174,7 @@ mod tests {
         let spawn_envelope = IpcEnvelope {
             id: "test-term-spawn-6".into(),
             session_token: Some(state.session_token.clone()),
+            peer_id: None,
             payload: IpcPayload::Request(IpcRequest::TerminalSpawn {
                 shell: Some("cmd".into()),
                 cwd: None,
@@ -1081,6 +1201,7 @@ mod tests {
         let close_envelope = IpcEnvelope {
             id: "test-term-close-7".into(),
             session_token: Some(state.session_token.clone()),
+            peer_id: None,
             payload: IpcPayload::Request(IpcRequest::TerminalClose { session_id }),
         };
 
@@ -1099,6 +1220,7 @@ mod tests {
         let envelope = IpcEnvelope {
             id: "test-sync-pair-8".into(),
             session_token: Some(state.session_token.clone()),
+            peer_id: None,
             payload: IpcPayload::Request(IpcRequest::SyncGeneratePairing {
                 device_name: Some("Test-Device".into()),
                 host: Some("192.168.1.100".into()),
@@ -1133,6 +1255,7 @@ mod tests {
         let envelope = IpcEnvelope {
             id: "test-sync-manifest-9".into(),
             session_token: Some(state.session_token.clone()),
+            peer_id: None,
             payload: IpcPayload::Request(IpcRequest::SyncGetManifest {
                 workspace_path: current_dir.to_string_lossy().to_string(),
                 workspace_name: Some("test-ws".into()),
@@ -1160,6 +1283,7 @@ mod tests {
         let envelope = IpcEnvelope {
             id: "test-crdt-1".into(),
             session_token: Some(state.session_token.clone()),
+            peer_id: None,
             payload: IpcPayload::Request(IpcRequest::CrdtGetDoc {
                 doc_id: "doc-shared-1".into(),
             }),
@@ -1177,6 +1301,7 @@ mod tests {
         let envelope_viewer = IpcEnvelope {
             id: "test-crdt-2".into(),
             session_token: Some(state.session_token.clone()),
+            peer_id: Some("peer-viewer".into()),
             payload: IpcPayload::Request(IpcRequest::CrdtApplyUpdate {
                 doc_id: "doc-shared-1".into(),
                 update_base64: "AAA=".into(),
@@ -1196,6 +1321,7 @@ mod tests {
         let envelope_presence = IpcEnvelope {
             id: "test-presence-1".into(),
             session_token: Some(state.session_token.clone()),
+            peer_id: None,
             payload: IpcPayload::Request(IpcRequest::UpdatePresence {
                 peer_id: "peer-alice".into(),
                 display_name: "Alice Collaborator".into(),
@@ -1215,6 +1341,7 @@ mod tests {
         let envelope_get_presence = IpcEnvelope {
             id: "test-presence-2".into(),
             session_token: Some(state.session_token.clone()),
+            peer_id: None,
             payload: IpcPayload::Request(IpcRequest::GetPresence {
                 file_path: Some("src/main.rs".into()),
             }),
@@ -1240,6 +1367,7 @@ mod tests {
         let envelope_add = IpcEnvelope {
             id: "test-swarm-1".into(),
             session_token: Some(state.session_token.clone()),
+            peer_id: None,
             payload: IpcPayload::Request(IpcRequest::SwarmAddTask {
                 task_id: "swarm-task-1".into(),
                 title: "Build Subsystem".into(),
@@ -1259,6 +1387,7 @@ mod tests {
         let envelope_merge = IpcEnvelope {
             id: "test-merge-1".into(),
             session_token: Some(state.session_token.clone()),
+            peer_id: None,
             payload: IpcPayload::Request(IpcRequest::ThreeWayMerge {
                 base: "fn main() {}\n".into(),
                 ours: "fn main() {}\n".into(),
@@ -1288,6 +1417,7 @@ mod tests {
         let envelope_spoofed = IpcEnvelope {
             id: "test-spoof-1".into(),
             session_token: Some(state.session_token.clone()),
+            peer_id: Some("peer-bob".into()),
             payload: IpcPayload::Request(IpcRequest::CrdtApplyUpdate {
                 doc_id: "doc-vault-1".into(),
                 update_base64: "AAA=".into(),
@@ -1312,6 +1442,7 @@ mod tests {
         let envelope_register = IpcEnvelope {
             id: "test-reg-1".into(),
             session_token: Some(state.session_token.clone()),
+            peer_id: None,
             payload: IpcPayload::Request(IpcRequest::RegisterPeerRole {
                 peer_id: "peer-bob".into(),
                 role: "Editor".into(),
@@ -1332,6 +1463,7 @@ mod tests {
         let envelope_valid = IpcEnvelope {
             id: "test-valid-1".into(),
             session_token: Some(state.session_token.clone()),
+            peer_id: Some("peer-bob".into()),
             payload: IpcPayload::Request(IpcRequest::CrdtApplyUpdate {
                 doc_id: "doc-vault-1".into(),
                 update_base64: update_b64,
@@ -1350,6 +1482,7 @@ mod tests {
         let envelope_revoke = IpcEnvelope {
             id: "test-rev-1".into(),
             session_token: Some(state.session_token.clone()),
+            peer_id: None,
             payload: IpcPayload::Request(IpcRequest::RevokePeerRole {
                 peer_id: "peer-bob".into(),
             }),
@@ -1365,6 +1498,7 @@ mod tests {
         let envelope_after_revoke = IpcEnvelope {
             id: "test-after-rev-1".into(),
             session_token: Some(state.session_token.clone()),
+            peer_id: Some("peer-bob".into()),
             payload: IpcPayload::Request(IpcRequest::CrdtApplyUpdate {
                 doc_id: "doc-vault-1".into(),
                 update_base64: "AAA=".into(),
@@ -1380,6 +1514,145 @@ mod tests {
                 .error
                 .unwrap()
                 .contains("is not authorized to mutate CRDT document"));
+        } else {
+            panic!("Expected response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rbac_daemon_permission_matrix() {
+        let state = create_test_state();
+
+        // Register peer-viewer as Viewer, peer-editor as Editor
+        state
+            .role_registry
+            .register_peer("peer-viewer", workspace_sync::DeviceRole::Viewer);
+        state
+            .role_registry
+            .register_peer("peer-editor", workspace_sync::DeviceRole::Editor);
+
+        // 1. Viewer attempts RunCommand -> Rejected
+        let env_v_cmd = IpcEnvelope {
+            id: "rbac-1".into(),
+            session_token: Some(state.session_token.clone()),
+            peer_id: Some("peer-viewer".into()),
+            payload: IpcPayload::Request(IpcRequest::RunCommand {
+                command: "echo test".into(),
+                cwd: None,
+                timeout_secs: Some(5),
+            }),
+        };
+        let resp_v_cmd = handle_ipc_envelope(&state, env_v_cmd, "127.0.0.1:9999").await;
+        if let IpcPayload::Response(r) = resp_v_cmd.payload {
+            assert!(!r.success);
+            assert_eq!(r.status_code, Some(401));
+            assert!(r
+                .error
+                .unwrap()
+                .contains("not authorized to execute commands"));
+        } else {
+            panic!("Expected response");
+        }
+
+        // 2. Viewer attempts TerminalSpawn -> Rejected
+        let env_v_term = IpcEnvelope {
+            id: "rbac-2".into(),
+            session_token: Some(state.session_token.clone()),
+            peer_id: Some("peer-viewer".into()),
+            payload: IpcPayload::Request(IpcRequest::TerminalSpawn {
+                shell: None,
+                cwd: None,
+                cols: None,
+                rows: None,
+            }),
+        };
+        let resp_v_term = handle_ipc_envelope(&state, env_v_term, "127.0.0.1:9999").await;
+        if let IpcPayload::Response(r) = resp_v_term.payload {
+            assert!(!r.success);
+            assert_eq!(r.status_code, Some(401));
+            assert!(r
+                .error
+                .unwrap()
+                .contains("not authorized to spawn terminals"));
+        } else {
+            panic!("Expected response");
+        }
+
+        // 3. Viewer attempts RegisterPeerRole -> Rejected
+        let env_v_admin = IpcEnvelope {
+            id: "rbac-3".into(),
+            session_token: Some(state.session_token.clone()),
+            peer_id: Some("peer-viewer".into()),
+            payload: IpcPayload::Request(IpcRequest::RegisterPeerRole {
+                peer_id: "peer-hacker".into(),
+                role: "Admin".into(),
+            }),
+        };
+        let resp_v_admin = handle_ipc_envelope(&state, env_v_admin, "127.0.0.1:9999").await;
+        if let IpcPayload::Response(r) = resp_v_admin.payload {
+            assert!(!r.success);
+            assert_eq!(r.status_code, Some(401));
+            assert!(r
+                .error
+                .unwrap()
+                .contains("not authorized to register peer roles"));
+        } else {
+            panic!("Expected response");
+        }
+
+        // 4. Editor attempts RunCommand -> Accepted
+        let env_e_cmd = IpcEnvelope {
+            id: "rbac-4".into(),
+            session_token: Some(state.session_token.clone()),
+            peer_id: Some("peer-editor".into()),
+            payload: IpcPayload::Request(IpcRequest::RunCommand {
+                command: "echo test".into(),
+                cwd: None,
+                timeout_secs: Some(5),
+            }),
+        };
+        let resp_e_cmd = handle_ipc_envelope(&state, env_e_cmd, "127.0.0.1:9999").await;
+        if let IpcPayload::Response(r) = resp_e_cmd.payload {
+            assert!(r.success);
+        } else {
+            panic!("Expected response");
+        }
+
+        // 5. Editor attempts RegisterPeerRole -> Rejected (Editor lacks Admin)
+        let env_e_admin = IpcEnvelope {
+            id: "rbac-5".into(),
+            session_token: Some(state.session_token.clone()),
+            peer_id: Some("peer-editor".into()),
+            payload: IpcPayload::Request(IpcRequest::RegisterPeerRole {
+                peer_id: "peer-guest".into(),
+                role: "Viewer".into(),
+            }),
+        };
+        let resp_e_admin = handle_ipc_envelope(&state, env_e_admin, "127.0.0.1:9999").await;
+        if let IpcPayload::Response(r) = resp_e_admin.payload {
+            assert!(!r.success);
+            assert_eq!(r.status_code, Some(401));
+            assert!(r
+                .error
+                .unwrap()
+                .contains("not authorized to register peer roles"));
+        } else {
+            panic!("Expected response");
+        }
+
+        // 6. Default local host peer (peer_id: None on loopback) has Owner role -> RegisterPeerRole accepted
+        let env_owner_admin = IpcEnvelope {
+            id: "rbac-6".into(),
+            session_token: Some(state.session_token.clone()),
+            peer_id: None,
+            payload: IpcPayload::Request(IpcRequest::RegisterPeerRole {
+                peer_id: "peer-guest".into(),
+                role: "Viewer".into(),
+            }),
+        };
+        let resp_owner = handle_ipc_envelope(&state, env_owner_admin, "127.0.0.1:9999").await;
+        if let IpcPayload::Response(r) = resp_owner.payload {
+            assert!(r.success);
         } else {
             panic!("Expected response");
         }

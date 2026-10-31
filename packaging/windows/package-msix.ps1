@@ -47,7 +47,7 @@ if (-not (Test-Path $AssetsDir)) {
     }
 }
 
-$MsixPath = Join-Path $OutputDir "AetherIDE-v0.1.0-alpha-x64.msix"
+$MsixPath = Join-Path $OutputDir "AetherIDE-v0.1.0-beta.1-x64.msix"
 
 # Look for MakeAppx.exe in Windows Kits
 $WindowsKitsPath = "C:\Program Files (x86)\Windows Kits\10\bin"

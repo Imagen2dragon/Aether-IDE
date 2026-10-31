@@ -4,13 +4,13 @@
 **Document Type:** Strategic Engineering Backlog  
 **Date:** October 31, 2026  
 **Project:** AetherIDE  
-**Status:** ACTIVE BACKLOG (Post-Sprint 07 Commercial Beta)  
+**Status:** ACTIVE BACKLOG (Post-Sprint 08 Beta Release Validation)  
 
 ---
 
-## 1. Sprint 07 Commercial Beta Completed Foundations
+## 1. Sprint 07 & 08 Commercial Beta Completed Foundations
 
-All foundational P0/P1 capabilities from Sprints 01 through 07 are fully implemented and verified:
+All foundational P0/P1 capabilities from Sprints 01 through 08 are fully implemented, independently reproduced, and verified:
 - [x] Monaco Editor workbench integration with LSP syntax, completion, and diagnostics.
 - [x] Native HWND-embedded Microsoft WebView2 host (`aether-launcher`) with COM messaging bridge.
 - [x] Windows ConPTY terminal host with `ScopedJobObject` containment.
@@ -18,11 +18,16 @@ All foundational P0/P1 capabilities from Sprints 01 through 07 are fully impleme
 - [x] Worktree sandboxing (`.aether/worktrees/`) and native three-way merge engine.
 - [x] Yrs/Yjs CRDT multi-user collaboration and cursor awareness tracking.
 - [x] Backend-enforced `RoleRegistry` eliminating role-spoofing privilege elevation.
-- [x] Constant-time session token authentication and filesystem containment (`resolve_contained_path`).
+- [x] Constant-time session token authentication and hardened filesystem containment (`resolve_contained_path` with ADS/UNC/device filters).
+- [x] Stateful `TokenStore` with 24h TTL, token rotation grace periods, and brute-force lockout.
+- [x] Daemon RBAC gating commands, terminals, and agents behind `can_write()` and `can_admin()`.
+- [x] Ed25519 digital update signatures and OS/Arch platform binding.
+- [x] Low Resource Mode runtime optimization (`AetherConfig::enable_low_resource_mode()`).
 - [x] SQLite WAL online backups via native `sqlite3_backup` API.
 - [x] Staged auto-updater with anti-downgrade rollback defense and atomic `.rollback_bak` recovery.
 - [x] Cross-platform release packaging (Windows Inno Setup/MSIX, Linux AppImage/deb, macOS DMG).
-- [x] Storage hygiene: zero in-tree target bloat, 0.449 GB repository footprint in OneDrive.
+- [x] Storage hygiene: zero in-tree target bloat, 1.109 GB repository footprint in OneDrive (< 6.00 GB limit).
+- [x] 82 automated test suites passing across all 24 crates with zero Clippy warnings.
 
 ---
 

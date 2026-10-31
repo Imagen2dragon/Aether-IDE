@@ -846,6 +846,7 @@ pub mod native {
         let envelope = IpcEnvelope {
             id: format!("wb-{}", uuid::Uuid::new_v4().simple()),
             session_token: session_token.map(|s| s.to_string()),
+            peer_id: None,
             payload: IpcPayload::Request(req),
         };
 

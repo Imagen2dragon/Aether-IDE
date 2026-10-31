@@ -2,7 +2,7 @@
 ; Architecture: x64 Windows 10/11
 
 #define MyAppName "AetherIDE"
-#define MyAppVersion "0.1.0-alpha"
+#define MyAppVersion "0.1.0-beta.1"
 #define MyAppPublisher "Aether Technologies"
 #define MyAppURL "https://aetheride.dev"
 #define MyAppExeName "AetherIDE.exe"
