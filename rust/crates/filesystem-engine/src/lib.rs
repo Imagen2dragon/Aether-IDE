@@ -67,8 +67,35 @@ impl FilesystemEngine {
     /// Securely resolves a user-provided relative path against a workspace root.
     /// Strictly guarantees that the resolved target cannot escape the workspace root
     /// via parent directory traversal (`..`), absolute paths, Windows drive letters,
+    /// UNC paths, Alternate Data Streams (ADS), trailing dot/space bypasses,
     /// Windows device files (CON, NUL, AUX, PRN), or filesystem symlinks.
     pub fn resolve_contained_path(root: &Path, user_path: &str) -> Result<PathBuf> {
+        // 1. Explicitly reject null bytes
+        if user_path.contains('\0') {
+            return Err(AetherError::PermissionDenied(
+                "Access Denied: Null bytes are strictly forbidden in paths".into(),
+            ));
+        }
+
+        // 2. Explicitly reject trailing dots or spaces in raw user path (Windows truncation evasion)
+        if user_path.ends_with('.') || user_path.ends_with(' ') {
+            return Err(AetherError::PermissionDenied(
+                "Access Denied: Trailing dot or space in path is forbidden".into(),
+            ));
+        }
+
+        // 3. Reject UNC paths and Windows extended device namespaces
+        let trimmed_leading = user_path.trim_start();
+        if trimmed_leading.starts_with(r"\\")
+            || trimmed_leading.starts_with("//")
+            || trimmed_leading.starts_with(r"\??\")
+            || trimmed_leading.starts_with(r"//?/")
+        {
+            return Err(AetherError::PermissionDenied(
+                "Access Denied: UNC and extended device namespaces are strictly forbidden".into(),
+            ));
+        }
+
         let clean = Path::new(user_path);
         if clean.is_absolute() {
             return Err(AetherError::PermissionDenied(
@@ -95,6 +122,21 @@ impl FilesystemEngine {
                 }
                 std::path::Component::Normal(c) => {
                     let s = c.to_string_lossy();
+
+                    // Security: Reject NTFS Alternate Data Streams (ADS)
+                    if s.contains(':') {
+                        return Err(AetherError::PermissionDenied(format!(
+                            "Access Denied: Stream separator ':' is forbidden in component '{s}'"
+                        )));
+                    }
+
+                    // Security: Reject trailing dots and spaces (Windows silent path truncation)
+                    if s.ends_with('.') || s.ends_with(' ') {
+                        return Err(AetherError::PermissionDenied(format!(
+                            "Access Denied: Trailing dot or space in component '{s}' is forbidden"
+                        )));
+                    }
+
                     let upper = s.to_ascii_uppercase();
                     let stem = Path::new(&*s)
                         .file_stem()
@@ -219,6 +261,47 @@ mod tests {
         // 4. Windows reserved device name is rejected
         let dev = FilesystemEngine::resolve_contained_path(&temp_dir, "CON.txt");
         assert!(dev.is_err());
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_resolve_contained_path_advanced_attacks() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_fs_adv_{}", uuid::Uuid::new_v4().simple()));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        // 1. Alternate Data Streams (ADS) rejected
+        let ads = FilesystemEngine::resolve_contained_path(&temp_dir, "test.txt:hidden_stream");
+        assert!(ads.is_err());
+        assert!(ads.unwrap_err().to_string().contains("Stream separator"));
+
+        let ads_data = FilesystemEngine::resolve_contained_path(&temp_dir, "test.txt::$DATA");
+        assert!(ads_data.is_err());
+
+        // 2. Trailing dots and spaces rejected (prevents Windows silent truncation)
+        let dot_bypass = FilesystemEngine::resolve_contained_path(&temp_dir, "secret.rs.");
+        assert!(dot_bypass.is_err());
+
+        let space_bypass = FilesystemEngine::resolve_contained_path(&temp_dir, "secret.rs ");
+        assert!(space_bypass.is_err());
+
+        // 3. UNC network paths rejected
+        let unc_bs =
+            FilesystemEngine::resolve_contained_path(&temp_dir, r"\\malicious\share\evil.exe");
+        assert!(unc_bs.is_err());
+
+        let unc_fs =
+            FilesystemEngine::resolve_contained_path(&temp_dir, "//malicious/share/evil.exe");
+        assert!(unc_fs.is_err());
+
+        // 4. Extended device namespaces rejected
+        let ext_ns = FilesystemEngine::resolve_contained_path(&temp_dir, r"\??\C:\Windows\cmd.exe");
+        assert!(ext_ns.is_err());
+
+        // 5. Null byte injection rejected
+        let null_byte = FilesystemEngine::resolve_contained_path(&temp_dir, "photo.png\0.exe");
+        assert!(null_byte.is_err());
 
         let _ = fs::remove_dir_all(temp_dir);
     }

@@ -253,6 +253,7 @@ async fn send_ipc_request(
     let envelope = IpcEnvelope {
         id: format!("cli-{}", uuid::Uuid::new_v4().simple()),
         session_token: get_session_token(),
+        peer_id: None,
         payload: IpcPayload::Request(req),
     };
 

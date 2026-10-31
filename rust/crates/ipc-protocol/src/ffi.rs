@@ -98,6 +98,7 @@ pub unsafe extern "C" fn aether_format_envelope(
     let envelope = IpcEnvelope {
         id: format!("ios-{}", uuid::Uuid::new_v4().simple()),
         session_token: token_opt,
+        peer_id: None,
         payload: IpcPayload::Request(req),
     };
 

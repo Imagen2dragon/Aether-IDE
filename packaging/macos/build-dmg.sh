@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 OUTPUT_DIR="${ROOT_DIR}/dist/installers"
 APP_BUNDLE="${OUTPUT_DIR}/AetherIDE.app"
-DMG_PATH="${OUTPUT_DIR}/AetherIDE-v0.1.0-alpha-arm64.dmg"
+DMG_PATH="${OUTPUT_DIR}/AetherIDE-v0.1.0-beta.1-arm64.dmg"
 DMG_STAGE="${BUILD_CACHE_DIR:-/tmp}/dmg-staging"
 
 echo "============================================================"

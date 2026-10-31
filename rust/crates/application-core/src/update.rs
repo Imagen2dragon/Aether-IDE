@@ -13,11 +13,83 @@ pub struct AetherUpdateManifest {
     pub signature_base64: String,
     pub min_os_version: Option<String>,
     pub published_at: DateTime<Utc>,
+    #[serde(default)]
+    pub target_os: Option<String>,
+    #[serde(default)]
+    pub target_arch: Option<String>,
 }
 
 pub struct UpdateVerifier;
 
 impl UpdateVerifier {
+    /// Returns the canonical message string that is digitally signed by the release authority.
+    pub fn canonical_manifest_payload(manifest: &AetherUpdateManifest) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}",
+            manifest.version,
+            manifest.channel,
+            manifest.download_url,
+            manifest.sha256_checksum,
+            manifest.target_os.as_deref().unwrap_or("any"),
+            manifest.target_arch.as_deref().unwrap_or("any"),
+        )
+    }
+
+    /// Verifies the cryptographic Ed25519 signature of the update manifest against
+    /// an authoritative root public key, preventing payload tampering or unauthorized releases.
+    pub fn verify_manifest_signature(
+        manifest: &AetherUpdateManifest,
+        trusted_root_pubkey_base64: &str,
+    ) -> Result<()> {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine;
+        use ring::signature::{UnparsedPublicKey, ED25519};
+
+        let pubkey_bytes = BASE64
+            .decode(trusted_root_pubkey_base64.trim())
+            .map_err(|e| AetherError::Internal(format!("Invalid root public key base64: {e}")))?;
+
+        let sig_bytes = BASE64
+            .decode(manifest.signature_base64.trim())
+            .map_err(|e| {
+                AetherError::PermissionDenied(format!("Invalid signature base64 in manifest: {e}"))
+            })?;
+
+        let canonical_payload = Self::canonical_manifest_payload(manifest);
+        let peer_public_key = UnparsedPublicKey::new(&ED25519, &pubkey_bytes);
+
+        peer_public_key
+            .verify(canonical_payload.as_bytes(), &sig_bytes)
+            .map_err(|_| {
+                AetherError::PermissionDenied(
+                    "Cryptographic signature verification failed: signature does not match trusted root public key".into(),
+                )
+            })?;
+
+        // Platform architecture and OS binding validation
+        if let Some(ref target_os) = manifest.target_os {
+            if target_os != "any" && target_os != std::env::consts::OS {
+                return Err(AetherError::PermissionDenied(format!(
+                    "Platform mismatch: update manifest is targeted for OS '{}', but current system is '{}'",
+                    target_os,
+                    std::env::consts::OS
+                )));
+            }
+        }
+
+        if let Some(ref target_arch) = manifest.target_arch {
+            if target_arch != "any" && target_arch != std::env::consts::ARCH {
+                return Err(AetherError::PermissionDenied(format!(
+                    "Architecture mismatch: update manifest is targeted for arch '{}', but current system is '{}'",
+                    target_arch,
+                    std::env::consts::ARCH
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Parses a semantic version string (e.g. "0.2.0" or "v0.1.0-alpha") into (major, minor, patch).
     pub fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
         let clean = v.trim().trim_start_matches('v');
@@ -220,6 +292,8 @@ mod tests {
             signature_base64: "c2lnbmF0dXJl".into(),
             min_os_version: Some("10.0.19041".into()),
             published_at: Utc::now(),
+            target_os: None,
+            target_arch: None,
         };
 
         // Upgrade from 0.1.0 to 0.2.0 -> Succeeds
@@ -274,6 +348,8 @@ mod tests {
             signature_base64: "dGVzdC1zaWc=".into(),
             min_os_version: None,
             published_at: Utc::now(),
+            target_os: None,
+            target_arch: None,
         };
 
         // 3. Stage the verified update
@@ -297,5 +373,69 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_dir_all(&temp_base);
+    }
+
+    #[test]
+    fn test_update_manifest_digital_signature_and_platform_binding() {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine;
+        use ring::rand::SystemRandom;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let rng = SystemRandom::new();
+        let pkcs8_bytes = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let keypair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref()).unwrap();
+        let root_pubkey_b64 = BASE64.encode(keypair.public_key().as_ref());
+
+        let mut manifest = AetherUpdateManifest {
+            version: "0.2.0".into(),
+            channel: "beta".into(),
+            release_notes: "Sprint 08 Hardened Manifest".into(),
+            download_url: "https://releases.aetheride.dev/v0.2.0/aetheride-windows-x64.zip".into(),
+            sha256_checksum: "a".repeat(64),
+            signature_base64: String::new(),
+            min_os_version: None,
+            published_at: Utc::now(),
+            target_os: Some(std::env::consts::OS.to_string()),
+            target_arch: Some(std::env::consts::ARCH.to_string()),
+        };
+
+        // 1. Sign canonical payload
+        let canonical = UpdateVerifier::canonical_manifest_payload(&manifest);
+        let sig = keypair.sign(canonical.as_bytes());
+        manifest.signature_base64 = BASE64.encode(sig.as_ref());
+
+        // 2. Successful verification
+        assert!(UpdateVerifier::verify_manifest_signature(&manifest, &root_pubkey_b64).is_ok());
+
+        // 3. Tampered payload is rejected
+        let mut tampered = manifest.clone();
+        tampered.download_url = "https://evil.com/malware.exe".into();
+        assert!(UpdateVerifier::verify_manifest_signature(&tampered, &root_pubkey_b64).is_err());
+
+        // 4. Untrusted / wrong root public key is rejected
+        let wrong_pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let wrong_keypair = Ed25519KeyPair::from_pkcs8(wrong_pkcs8.as_ref()).unwrap();
+        let wrong_pubkey_b64 = BASE64.encode(wrong_keypair.public_key().as_ref());
+        assert!(UpdateVerifier::verify_manifest_signature(&manifest, &wrong_pubkey_b64).is_err());
+
+        // 5. Mismatched OS is rejected
+        let mut bad_os = manifest.clone();
+        bad_os.target_os = Some("nonexistent_os".into());
+        let bad_os_canonical = UpdateVerifier::canonical_manifest_payload(&bad_os);
+        let bad_os_sig = keypair.sign(bad_os_canonical.as_bytes());
+        bad_os.signature_base64 = BASE64.encode(bad_os_sig.as_ref());
+        let err = UpdateVerifier::verify_manifest_signature(&bad_os, &root_pubkey_b64).unwrap_err();
+        assert!(err.to_string().contains("Platform mismatch"));
+
+        // 6. Mismatched Arch is rejected
+        let mut bad_arch = manifest.clone();
+        bad_arch.target_arch = Some("mips64".into());
+        let bad_arch_canonical = UpdateVerifier::canonical_manifest_payload(&bad_arch);
+        let bad_arch_sig = keypair.sign(bad_arch_canonical.as_bytes());
+        bad_arch.signature_base64 = BASE64.encode(bad_arch_sig.as_ref());
+        let err =
+            UpdateVerifier::verify_manifest_signature(&bad_arch, &root_pubkey_b64).unwrap_err();
+        assert!(err.to_string().contains("Architecture mismatch"));
     }
 }

@@ -63,19 +63,43 @@
   - Client-supplied `role` parameter in `CrdtApplyUpdate` is strictly ignored by the backend.
   - `aether-daemon` verifies permissions directly against `RoleRegistry`, defaulting unregistered peers to least-privilege `Viewer`.
 
-### 3.7 Staged Auto-Updater & Rollback Protection (Sprint 07)
-- **Threat:** Downgrade attacks or corrupted update payloads breaking desktop installations.
+### 3.7 Staged Auto-Updater, Cryptographic Manifest Signatures & Platform Binding (Sprint 08)
+- **Threat:** Downgrade attacks, corrupted update payloads, fake update manifests, or cross-platform payload confusion attacks.
 - **Mitigation:**
-  - Strict semantic version comparison ensures target version strictly exceeds current installed version.
-  - SHA-256 checksum and Ed25519 digital signature validation before staging.
+  - Strict semantic version comparison ensures target version strictly exceeds current installed version (anti-downgrade).
+  - SHA-256 payload checksum verification before staging.
+  - Authoritative root Ed25519 digital signature validation over canonical manifest payloads.
+  - OS (`target_os`) and architecture (`target_arch`) validation preventing mismatched binary execution.
   - Atomic swap with automatic `.rollback_bak` recovery upon installation failure.
+
+### 3.8 Stateful Session Token Lifecycle & Brute-Force Rate Limiting (Sprint 08)
+- **Threat:** Replay of leaked session tokens or brute-force timing attacks against local loopback ports.
+- **Mitigation:**
+  - `security-core::TokenStore` implements a 24-hour default session TTL.
+  - Token rotation preserves a 5-minute grace period for in-flight requests.
+  - Automatic brute-force lockout: after 5 consecutive failed authentication attempts, further attempts are blocked with progressive delays.
+
+### 3.9 Advanced Filesystem Evasion Prevention (Sprint 08)
+- **Threat:** Attackers attempting NTFS Alternate Data Streams (`:`), Windows silent truncation (`.` and trailing spaces), UNC path joins (`\\server\share`), or extended device namespaces (`\??\`).
+- **Mitigation:**
+  - Strict input rejection of null bytes, UNC prefixes, and device namespace prefixes.
+  - Component rejection of stream separators (`:`) and trailing spaces/dots.
+  - Case-insensitive device name checking on both full name and file stem (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`).
+
+### 3.10 Daemon IPC RBAC Enforcement with Default-Deny (Sprint 08)
+- **Threat:** Low-privilege collaborative peers or unauthenticated clients executing system commands or spawning processes.
+- **Mitigation:**
+  - `handle_ipc_envelope` enforces `can_write()` on `RunCommand`, `TerminalSpawn`, `TerminalWrite`, and agent creation/step execution.
+  - `handle_ipc_envelope` enforces `can_admin()` on `RegisterPeerRole` and `RevokePeerRole`.
+  - Untrusted clients default to `DeviceRole::Viewer` (least privilege / default-deny).
 
 ---
 
 ## 4. Secret Redaction Engine
-AetherIDE includes a native Rust secret scanner (`security-core::redact_secrets`) that intercepts all stdout/stderr logs, diff views, and outgoing LLM payloads, replacing detected secrets with `[REDACTED_SECRET_<HASH>]`:
-- OpenAI keys (`sk-[A-Za-z0-9]{48}`)
-- Anthropic keys (`sk-ant-[A-Za-z0-9\-_]{80,}`)
-- GitHub tokens (`ghp_[A-Za-z0-9]{36}`, `github_pat_[A-Za-z0-9_]{82}`)
+AetherIDE includes a native Rust secret scanner (`security-core::redact_secrets`) that intercepts all stdout/stderr logs, diff views, and outgoing LLM payloads, replacing detected secrets with `[REDACTED_<TYPE>]`:
+- OpenAI keys (`sk-[A-Za-z0-9]{32,}`)
+- Anthropic keys (`sk-ant-[A-Za-z0-9\-_]{32,}`)
+- GitHub tokens (`(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}`)
 - AWS Access Keys (`AKIA[0-9A-Z]{16}`)
-- Generic Private Keys (`-----BEGIN (RSA|EC|OPENSSH) PRIVATE KEY-----`)
+- Generic Private Keys (`-----BEGIN [A-Z ]+ PRIVATE KEY-----`)
+- JSON Web Tokens (`eyJ...`)

@@ -54,6 +54,16 @@ pub struct AetherConfig {
     pub autonomy_mode: AutonomyMode,
     pub max_parallel_agents: usize,
     pub index_excluded_patterns: Vec<String>,
+    #[serde(default)]
+    pub low_resource_mode: bool,
+}
+
+impl AetherConfig {
+    /// Configures the runtime for constrained environments (e.g. CI runners or low-RAM devices).
+    pub fn enable_low_resource_mode(&mut self) {
+        self.low_resource_mode = true;
+        self.max_parallel_agents = 1;
+    }
 }
 
 impl Default for AetherConfig {
@@ -77,6 +87,7 @@ impl Default for AetherConfig {
                 ".gradle".into(),
                 "Pods".into(),
             ],
+            low_resource_mode: false,
         }
     }
 }
@@ -103,9 +114,14 @@ mod tests {
 
     #[test]
     fn test_default_config() {
-        let config = AetherConfig::default();
+        let mut config = AetherConfig::default();
         assert_eq!(config.autonomy_mode, AutonomyMode::Assist);
         assert_eq!(config.max_parallel_agents, 4);
+        assert!(!config.low_resource_mode);
         assert!(!config.index_excluded_patterns.is_empty());
+
+        config.enable_low_resource_mode();
+        assert!(config.low_resource_mode);
+        assert_eq!(config.max_parallel_agents, 1);
     }
 }

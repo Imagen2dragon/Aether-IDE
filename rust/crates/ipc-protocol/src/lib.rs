@@ -10,8 +10,26 @@ pub const DEFAULT_WEBSOCKET_PORT: u16 = 44888;
 pub struct IpcEnvelope {
     pub id: String,
     pub session_token: Option<String>,
+    #[serde(default)]
+    pub peer_id: Option<String>,
     #[serde(flatten)]
     pub payload: IpcPayload,
+}
+
+impl IpcEnvelope {
+    pub fn new(id: impl Into<String>, session_token: Option<String>, payload: IpcPayload) -> Self {
+        Self {
+            id: id.into(),
+            session_token,
+            peer_id: None,
+            payload,
+        }
+    }
+
+    pub fn with_peer_id(mut self, peer_id: impl Into<String>) -> Self {
+        self.peer_id = Some(peer_id.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,6 +385,7 @@ mod tests {
         let envelope = IpcEnvelope {
             id: "msg-123".to_string(),
             session_token: Some("token-abc".to_string()),
+            peer_id: None,
             payload: IpcPayload::Request(IpcRequest::Ping),
         };
 
