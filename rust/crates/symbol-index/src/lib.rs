@@ -37,4 +37,8 @@ impl SymbolIndex {
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SymbolRecord>> {
         self.db.search_symbols_fts(query, limit)
     }
+
+    pub fn remove_file_symbols(&self, file_path: &str) -> Result<usize> {
+        self.db.delete_file_symbols(file_path)
+    }
 }

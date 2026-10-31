@@ -165,6 +165,17 @@ impl DatabaseEngine {
         Ok(id)
     }
 
+    pub fn delete_file_symbols(&self, file_path: &str) -> Result<usize> {
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "DELETE FROM symbols WHERE file_path = ?1",
+                params![file_path],
+            )
+            .map_err(|e| AetherError::Database(e.to_string()))?;
+        Ok(rows)
+    }
+
     pub fn search_symbols_fts(&self, query: &str, limit: usize) -> Result<Vec<SymbolRecord>> {
         let conn = self.conn.lock();
         let formatted_query = format!("{}*", query.replace('"', "\"\""));

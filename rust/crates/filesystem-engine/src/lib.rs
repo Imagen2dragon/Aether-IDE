@@ -170,6 +170,19 @@ pub fn sanitize_relative_path(user_path: &str) -> Result<PathBuf> {
     Ok(normalized)
 }
 
+/// Comprehensive report produced by capability-anchored workspace directory scanning.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceScanReport {
+    pub discovered_files: Vec<PathBuf>,
+    pub directories_scanned: usize,
+    pub files_discovered: usize,
+    pub skipped_by_policy: usize,
+    pub skipped_symlinks: usize,
+    pub permission_errors: Vec<PathBuf>,
+    pub transient_errors: Vec<PathBuf>,
+    pub is_complete: bool,
+}
+
 /// Capability-based workspace directory handle.
 /// All file and directory operations are anchored directly to the opened directory capability (`Dir`).
 /// Enforces genuine handle-level capability boundaries across Windows, Linux, and macOS.
@@ -345,16 +358,29 @@ impl WorkspaceCapability {
         &self,
         exclude_patterns: &[String],
     ) -> Result<Vec<PathBuf>> {
-        let mut results = Vec::new();
-        self.walk_dir_cap_relative(&PathBuf::new(), exclude_patterns, &mut results)?;
-        Ok(results)
+        let report = self.scan_workspace_detailed(exclude_patterns)?;
+        Ok(report.discovered_files)
     }
 
-    fn walk_dir_cap_relative(
+    /// Performs an audited workspace scan returning a comprehensive report detailing discovered files,
+    /// skipped symlinks, policy exclusions, unreadable directories, and scan completeness.
+    pub fn scan_workspace_detailed(
+        &self,
+        exclude_patterns: &[String],
+    ) -> Result<WorkspaceScanReport> {
+        let mut report = WorkspaceScanReport {
+            is_complete: true,
+            ..Default::default()
+        };
+        self.walk_dir_cap_relative_detailed(&PathBuf::new(), exclude_patterns, &mut report)?;
+        Ok(report)
+    }
+
+    fn walk_dir_cap_relative_detailed(
         &self,
         current_rel: &Path,
         exclude_patterns: &[String],
-        results: &mut Vec<PathBuf>,
+        report: &mut WorkspaceScanReport,
     ) -> Result<()> {
         let read_dir_result = if current_rel.as_os_str().is_empty() {
             self.dir.read_dir(".")
@@ -364,10 +390,29 @@ impl WorkspaceCapability {
 
         let entries = match read_dir_result {
             Ok(e) => e,
-            Err(_) => return Ok(()),
+            Err(e) => {
+                report.is_complete = false;
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    report.permission_errors.push(current_rel.to_path_buf());
+                } else {
+                    report.transient_errors.push(current_rel.to_path_buf());
+                }
+                return Ok(());
+            }
         };
 
-        for entry in entries.flatten() {
+        report.directories_scanned += 1;
+
+        for entry_res in entries {
+            let entry = match entry_res {
+                Ok(e) => e,
+                Err(_) => {
+                    report.is_complete = false;
+                    report.transient_errors.push(current_rel.to_path_buf());
+                    continue;
+                }
+            };
+
             let file_name = entry.file_name();
             let file_name_str = file_name.to_string_lossy();
 
@@ -375,6 +420,7 @@ impl WorkspaceCapability {
                 .iter()
                 .any(|pattern| file_name_str == *pattern || file_name_str.starts_with('.'))
             {
+                report.skipped_by_policy += 1;
                 continue;
             }
 
@@ -386,18 +432,24 @@ impl WorkspaceCapability {
 
             let meta = match self.dir.symlink_metadata(&entry_rel) {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(_) => {
+                    report.is_complete = false;
+                    report.transient_errors.push(entry_rel);
+                    continue;
+                }
             };
 
             // By capability policy, skip symbolic links and reparse points
             if meta.is_symlink() {
+                report.skipped_symlinks += 1;
                 continue;
             }
 
             if meta.is_dir() {
-                let _ = self.walk_dir_cap_relative(&entry_rel, exclude_patterns, results);
+                let _ = self.walk_dir_cap_relative_detailed(&entry_rel, exclude_patterns, report);
             } else if meta.is_file() {
-                results.push(entry_rel);
+                report.files_discovered += 1;
+                report.discovered_files.push(entry_rel);
             }
         }
 
@@ -772,5 +824,41 @@ mod tests {
 
         let _ = fs::remove_dir_all(temp_dir);
         let _ = fs::remove_dir_all(outside_dir);
+    }
+
+    #[test]
+    fn test_detailed_scan_report_metrics() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_fs_detailed_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(temp_dir.join("src"));
+        let _ = fs::create_dir_all(temp_dir.join(".git"));
+        let _ = fs::write(temp_dir.join("src/lib.rs"), "pub fn test() {}");
+        let _ = fs::write(temp_dir.join("src/main.rs"), "fn main() {}");
+        let _ = fs::write(temp_dir.join(".git/config"), "secret");
+
+        let cap = WorkspaceCapability::open(&temp_dir).expect("Capability open failed");
+        let report = cap
+            .scan_workspace_detailed(&[".git".into()])
+            .expect("Scan failed");
+
+        assert_eq!(report.files_discovered, 2);
+        assert!(report
+            .discovered_files
+            .iter()
+            .any(|f| f.ends_with("lib.rs")));
+        assert!(report
+            .discovered_files
+            .iter()
+            .any(|f| f.ends_with("main.rs")));
+        assert!(!report
+            .discovered_files
+            .iter()
+            .any(|f| f.to_string_lossy().contains(".git")));
+        assert!(report.is_complete);
+        assert_eq!(report.permission_errors.len(), 0);
+
+        let _ = fs::remove_dir_all(temp_dir);
     }
 }

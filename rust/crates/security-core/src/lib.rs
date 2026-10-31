@@ -95,130 +95,191 @@ pub trait CredentialStore: Send + Sync {
     fn delete(&self, key: &str) -> Result<(), String>;
 }
 
+/// Overwrites a byte slice in memory with zeroes to minimize plaintext secret lifetime.
+pub fn secure_zero_memory(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+enum KeyringRequest {
+    Store {
+        key: String,
+        secret: String,
+        response: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+    Retrieve {
+        key: String,
+        response: std::sync::mpsc::Sender<Result<Option<String>, String>>,
+    },
+    Delete {
+        key: String,
+        response: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+}
+
 /// OS-native keyring store (macOS Keychain, Linux Secret Service via DBus, Windows Credential Manager).
+/// Uses a dedicated bounded worker queue with deterministic timeout semantics and serialized execution per store.
 pub struct OsKeyringStore {
     service_name: String,
+    tx: std::sync::mpsc::SyncSender<KeyringRequest>,
 }
 
 impl OsKeyringStore {
     pub fn new(service_name: impl Into<String>) -> Self {
+        let service = service_name.into();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<KeyringRequest>(32);
+        let worker_service = service.clone();
+
+        std::thread::Builder::new()
+            .name("aether-keyring-worker".to_string())
+            .spawn(move || {
+                while let Ok(req) = rx.recv() {
+                    match req {
+                        KeyringRequest::Store {
+                            key,
+                            secret,
+                            response,
+                        } => {
+                            let res = (|| {
+                                let entry =
+                                    keyring::Entry::new(&worker_service, &key).map_err(|e| {
+                                        format!(
+                                            "Failed to initialize OS keyring entry for '{}': {}",
+                                            key, e
+                                        )
+                                    })?;
+                                entry.set_password(&secret).map_err(|e| {
+                                    format!(
+                                        "Failed to store secret in OS keyring for '{}': {}",
+                                        key, e
+                                    )
+                                })
+                            })();
+                            let _ = response.send(res);
+                        }
+                        KeyringRequest::Retrieve { key, response } => {
+                            let res = (|| {
+                                let entry =
+                                    keyring::Entry::new(&worker_service, &key).map_err(|e| {
+                                        format!(
+                                            "Failed to initialize OS keyring entry for '{}': {}",
+                                            key, e
+                                        )
+                                    })?;
+                                match entry.get_password() {
+                                    Ok(pwd) => Ok(Some(pwd)),
+                                    Err(keyring::Error::NoEntry) => Ok(None),
+                                    Err(e) => Err(format!(
+                                        "Failed to retrieve secret from OS keyring for '{}': {}",
+                                        key, e
+                                    )),
+                                }
+                            })();
+                            let _ = response.send(res);
+                        }
+                        KeyringRequest::Delete { key, response } => {
+                            let res = (|| {
+                                let entry =
+                                    keyring::Entry::new(&worker_service, &key).map_err(|e| {
+                                        format!(
+                                            "Failed to initialize OS keyring entry for '{}': {}",
+                                            key, e
+                                        )
+                                    })?;
+                                match entry.delete_credential() {
+                                    Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
+                                    Err(e) => Err(format!(
+                                        "Failed to delete secret from OS keyring for '{}': {}",
+                                        key, e
+                                    )),
+                                }
+                            })();
+                            let _ = response.send(res);
+                        }
+                    }
+                }
+            })
+            .expect("Failed to spawn keyring worker thread");
+
         Self {
-            service_name: service_name.into(),
+            service_name: service,
+            tx,
         }
+    }
+
+    pub fn service_name(&self) -> &str {
+        &self.service_name
     }
 }
 
 impl CredentialStore for OsKeyringStore {
     fn store(&self, key: &str, secret: &str) -> Result<(), String> {
-        let service = self.service_name.clone();
-        let key_str = key.to_string();
-        let secret_str = secret.to_string();
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel();
+        let req = KeyringRequest::Store {
+            key: key.to_string(),
+            secret: secret.to_string(),
+            response: resp_tx,
+        };
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let entry = match keyring::Entry::new(&service, &key_str) {
-                Ok(e) => e,
-                Err(e) => {
-                    let _ = tx.send(Err(format!(
-                        "Failed to initialize OS keyring entry for '{}': {}",
-                        key_str, e
-                    )));
-                    return;
-                }
-            };
-            let res = entry.set_password(&secret_str).map_err(|e| {
-                format!(
-                    "Failed to store secret in OS keyring for '{}': {}",
-                    key_str, e
-                )
-            });
-            let _ = tx.send(res);
-        });
+        if self.tx.try_send(req).is_err() {
+            return Err(format!(
+                "OS credential service unavailable: worker queue saturated or blocked for '{}'",
+                key
+            ));
+        }
 
-        match rx.recv_timeout(Duration::from_secs(3)) {
-            Ok(res) => {
-                let _ = handle.join();
-                res
-            }
+        match resp_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(res) => res,
             Err(_) => Err(format!(
-                "OS credential service unavailable: operation timed out for '{}'",
+                "OS credential service unavailable: operation timed out for '{}' (outcome unknown)",
                 key
             )),
         }
     }
 
     fn retrieve(&self, key: &str) -> Result<Option<String>, String> {
-        let service = self.service_name.clone();
-        let key_str = key.to_string();
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel();
+        let req = KeyringRequest::Retrieve {
+            key: key.to_string(),
+            response: resp_tx,
+        };
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let entry = match keyring::Entry::new(&service, &key_str) {
-                Ok(e) => e,
-                Err(e) => {
-                    let _ = tx.send(Err(format!(
-                        "Failed to initialize OS keyring entry for '{}': {}",
-                        key_str, e
-                    )));
-                    return;
-                }
-            };
-            let res = match entry.get_password() {
-                Ok(pwd) => Ok(Some(pwd)),
-                Err(keyring::Error::NoEntry) => Ok(None),
-                Err(e) => Err(format!(
-                    "Failed to retrieve secret from OS keyring for '{}': {}",
-                    key_str, e
-                )),
-            };
-            let _ = tx.send(res);
-        });
+        if self.tx.try_send(req).is_err() {
+            return Err(format!(
+                "OS credential service unavailable: worker queue saturated or blocked for '{}'",
+                key
+            ));
+        }
 
-        match rx.recv_timeout(Duration::from_secs(3)) {
-            Ok(res) => {
-                let _ = handle.join();
-                res
-            }
+        match resp_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(res) => res,
             Err(_) => Err(format!(
-                "OS credential service unavailable: operation timed out for '{}'",
+                "OS credential service unavailable: operation timed out for '{}' (outcome unknown)",
                 key
             )),
         }
     }
 
     fn delete(&self, key: &str) -> Result<(), String> {
-        let service = self.service_name.clone();
-        let key_str = key.to_string();
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel();
+        let req = KeyringRequest::Delete {
+            key: key.to_string(),
+            response: resp_tx,
+        };
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let entry = match keyring::Entry::new(&service, &key_str) {
-                Ok(e) => e,
-                Err(e) => {
-                    let _ = tx.send(Err(format!(
-                        "Failed to initialize OS keyring entry for '{}': {}",
-                        key_str, e
-                    )));
-                    return;
-                }
-            };
-            let res = match entry.delete_credential() {
-                Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
-                Err(e) => Err(format!(
-                    "Failed to delete secret from OS keyring for '{}': {}",
-                    key_str, e
-                )),
-            };
-            let _ = tx.send(res);
-        });
+        if self.tx.try_send(req).is_err() {
+            return Err(format!(
+                "OS credential service unavailable: worker queue saturated or blocked for '{}'",
+                key
+            ));
+        }
 
-        match rx.recv_timeout(Duration::from_secs(3)) {
-            Ok(res) => {
-                let _ = handle.join();
-                res
-            }
+        match resp_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(res) => res,
             Err(_) => Err(format!(
-                "OS credential service unavailable: operation timed out for '{}'",
+                "OS credential service unavailable: operation timed out for '{}' (outcome unknown)",
                 key
             )),
         }
@@ -273,6 +334,8 @@ pub fn dpapi_encrypt(plaintext: &[u8]) -> Result<Vec<u8>, String> {
             &mut data_out,
         )
     };
+
+    secure_zero_memory(&mut in_bytes);
 
     if res == 0 || data_out.pbData.is_null() {
         return Err("CryptProtectData failed to protect credential".into());
@@ -334,6 +397,8 @@ pub fn dpapi_decrypt(ciphertext: &[u8]) -> Result<Vec<u8>, String> {
         )
     };
 
+    secure_zero_memory(&mut enc_bytes);
+
     if res == 0 || data_out.pbData.is_null() {
         return Err("CryptUnprotectData failed (access denied or corrupted credential)".into());
     }
@@ -376,7 +441,9 @@ impl Default for WindowsDpapiStore {
 #[cfg(windows)]
 impl CredentialStore for WindowsDpapiStore {
     fn store(&self, key: &str, secret: &str) -> Result<(), String> {
-        let encrypted = dpapi_encrypt(secret.as_bytes())?;
+        let mut secret_bytes = secret.as_bytes().to_vec();
+        let encrypted = dpapi_encrypt(&secret_bytes)?;
+        secure_zero_memory(&mut secret_bytes);
         std::fs::create_dir_all(&self.vault_dir)
             .map_err(|e| format!("Failed to create DPAPI vault directory: {}", e))?;
         let target_file = self.vault_dir.join(format!("{}.dat", key));
@@ -392,9 +459,10 @@ impl CredentialStore for WindowsDpapiStore {
         }
         let encrypted = std::fs::read(&target_file)
             .map_err(|e| format!("Failed to read DPAPI vault record: {}", e))?;
-        let decrypted = dpapi_decrypt(&encrypted)?;
-        let secret = String::from_utf8(decrypted)
+        let mut decrypted = dpapi_decrypt(&encrypted)?;
+        let secret = String::from_utf8(decrypted.clone())
             .map_err(|e| format!("DPAPI payload is not valid UTF-8: {}", e))?;
+        secure_zero_memory(&mut decrypted);
         Ok(Some(secret))
     }
 
@@ -1271,5 +1339,19 @@ mod tests {
             recovered, secret,
             "Legacy user-bound token must be successfully migrated"
         );
+    }
+
+    #[test]
+    fn test_secure_zero_memory() {
+        let mut buffer = vec![0xAAu8; 64];
+        assert!(buffer.iter().all(|&b| b == 0xAA));
+        secure_zero_memory(&mut buffer);
+        assert!(buffer.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_os_keyring_store_metadata() {
+        let store = OsKeyringStore::new("AetherIDETestService");
+        assert_eq!(store.service_name(), "AetherIDETestService");
     }
 }
