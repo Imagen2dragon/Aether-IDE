@@ -1,4 +1,6 @@
-use application_core::{AetherError, Result};
+#[cfg(windows)]
+use application_core::AetherError;
+use application_core::Result;
 
 /// Common abstraction for operating-system pseudoterminal backends.
 /// Windows: ConPTY (CreatePseudoConsole / Win32 Job Objects)

@@ -55,6 +55,7 @@ sha2 = "0.10"
 ring = "0.17"
 yrs = "0.22"
 base64 = "0.22"
+cap-std = "4.0"
 
 # Local workspace crate dependencies
 application-core = { path = "crates/application-core" }

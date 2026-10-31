@@ -4,6 +4,8 @@ use parking_lot::Mutex;
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+#[cfg(unix)]
+use tracing::info;
 
 /// Unix (Linux & macOS) Pseudoterminal Session.
 /// Uses POSIX openpty on Unix targets to bridge master/slave FDs,
@@ -35,7 +37,7 @@ impl UnixPtySession {
     pub fn spawn_unix(
         id: u32,
         shell: &str,
-        cwd: Option<&std::path::Path>,
+        _cwd: Option<&std::path::Path>,
         cols: u16,
         rows: u16,
     ) -> Result<Self> {

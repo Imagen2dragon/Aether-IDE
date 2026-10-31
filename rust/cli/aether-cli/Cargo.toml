@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 application-core.workspace = true
+security-core.workspace = true
 ipc-protocol.workspace = true
 diagnostics.workspace = true
 tokio.workspace = true

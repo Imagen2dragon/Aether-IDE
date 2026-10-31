@@ -15,6 +15,7 @@ use std::time::Duration;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -117,14 +118,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_file = data_dir.join("desktop_bootstrap.json");
     let (session_token, peer_id) = if let Ok(data) = std::fs::read_to_string(&bootstrap_file) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-            (
-                v.get("session_token")
-                    .and_then(|t| t.as_str())
-                    .map(|s| s.trim().to_string()),
-                v.get("owner_peer_id")
-                    .and_then(|p| p.as_str())
-                    .map(|s| s.trim().to_string()),
-            )
+            let token = v
+                .get("protected_token")
+                .and_then(|t| t.as_str())
+                .and_then(|pt| security_core::unprotect_credential(pt).ok())
+                .or_else(|| {
+                    // Fallback for legacy test objects only if protected_token not present
+                    v.get("session_token")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.trim().to_string())
+                });
+            let peer = v
+                .get("owner_peer_id")
+                .and_then(|p| p.as_str())
+                .map(|s| s.trim().to_string());
+            (token, peer)
         } else {
             (None, None)
         }

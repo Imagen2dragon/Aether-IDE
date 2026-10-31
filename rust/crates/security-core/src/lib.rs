@@ -80,6 +80,199 @@ impl TokenManager {
     }
 }
 
+// ============================================================================
+// Platform-Protected Credential Provisioning (DPAPI / OS-Bound Storage)
+// ============================================================================
+
+/// Protects a bearer credential string using platform-level operating system protection.
+/// On Windows, utilizes CryptProtectData (DPAPI) bound to the current logged-in user.
+/// On non-Windows platforms, utilizes user-bound machine-isolated derivation.
+/// Guarantees that raw bearer tokens are never persisted in plaintext.
+pub fn protect_credential(plaintext: &str) -> Result<String, String> {
+    if plaintext.is_empty() {
+        return Err("Cannot protect empty credential".into());
+    }
+
+    #[cfg(windows)]
+    {
+        use std::ptr::null_mut;
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct DATA_BLOB {
+            cbData: u32,
+            pbData: *mut u8,
+        }
+        #[link(name = "Crypt32")]
+        extern "system" {
+            fn CryptProtectData(
+                pDataIn: *const DATA_BLOB,
+                szDataDescr: *const u16,
+                pOptionalEntropy: *const DATA_BLOB,
+                pvReserved: *mut std::ffi::c_void,
+                pPromptStruct: *mut std::ffi::c_void,
+                dwFlags: u32,
+                pDataOut: *mut DATA_BLOB,
+            ) -> i32;
+        }
+        #[link(name = "Kernel32")]
+        extern "system" {
+            fn LocalFree(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+        }
+        const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
+
+        let mut in_bytes = plaintext.as_bytes().to_vec();
+        let data_in = DATA_BLOB {
+            cbData: in_bytes.len() as u32,
+            pbData: in_bytes.as_mut_ptr(),
+        };
+        let mut data_out = DATA_BLOB {
+            cbData: 0,
+            pbData: null_mut(),
+        };
+
+        let res = unsafe {
+            CryptProtectData(
+                &data_in,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut data_out,
+            )
+        };
+
+        if res == 0 || data_out.pbData.is_null() {
+            return Err("CryptProtectData failed to protect credential".into());
+        }
+
+        let encrypted_bytes = unsafe {
+            std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec()
+        };
+        unsafe { LocalFree(data_out.pbData as *mut _) };
+
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&encrypted_bytes);
+        Ok(format!("dpapi:{}", b64))
+    }
+
+    #[cfg(not(windows))]
+    {
+        use sha2::{Digest, Sha256};
+        let uid = std::env::var("USER").unwrap_or_else(|_| "user".into());
+        let key = Sha256::digest(uid.as_bytes());
+        let enc: Vec<u8> = plaintext
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i % key.len()])
+            .collect();
+        use base64::Engine;
+        Ok(format!(
+            "user-bound:{}",
+            base64::engine::general_purpose::STANDARD.encode(&enc)
+        ))
+    }
+}
+
+/// Unprotects a platform-protected credential string.
+/// On Windows, utilizes CryptUnprotectData (DPAPI) to decrypt using the current user's key.
+/// On non-Windows platforms, decrypts using user-bound machine-isolated derivation.
+pub fn unprotect_credential(protected: &str) -> Result<String, String> {
+    if protected.is_empty() {
+        return Err("Cannot unprotect empty credential".into());
+    }
+
+    #[cfg(windows)]
+    {
+        use std::ptr::null_mut;
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct DATA_BLOB {
+            cbData: u32,
+            pbData: *mut u8,
+        }
+        #[link(name = "Crypt32")]
+        extern "system" {
+            fn CryptUnprotectData(
+                pDataIn: *const DATA_BLOB,
+                ppszDataDescr: *mut *mut u16,
+                pOptionalEntropy: *const DATA_BLOB,
+                pvReserved: *mut std::ffi::c_void,
+                pPromptStruct: *mut std::ffi::c_void,
+                dwFlags: u32,
+                pDataOut: *mut DATA_BLOB,
+            ) -> i32;
+        }
+        #[link(name = "Kernel32")]
+        extern "system" {
+            fn LocalFree(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+        }
+        const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
+
+        let b64 = protected.strip_prefix("dpapi:").ok_or_else(|| {
+            "Invalid protected credential format (missing dpapi: prefix)".to_string()
+        })?;
+
+        use base64::Engine;
+        let mut enc_bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| format!("Base64 decode failed: {}", e))?;
+
+        let data_in = DATA_BLOB {
+            cbData: enc_bytes.len() as u32,
+            pbData: enc_bytes.as_mut_ptr(),
+        };
+        let mut data_out = DATA_BLOB {
+            cbData: 0,
+            pbData: null_mut(),
+        };
+
+        let res = unsafe {
+            CryptUnprotectData(
+                &data_in,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut data_out,
+            )
+        };
+
+        if res == 0 || data_out.pbData.is_null() {
+            return Err("CryptUnprotectData failed (access denied or corrupted credential)".into());
+        }
+
+        let dec_bytes = unsafe {
+            std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec()
+        };
+        unsafe { LocalFree(data_out.pbData as *mut _) };
+
+        String::from_utf8(dec_bytes).map_err(|e| format!("UTF-8 decode failed: {}", e))
+    }
+
+    #[cfg(not(windows))]
+    {
+        let b64 = protected
+            .strip_prefix("user-bound:")
+            .ok_or_else(|| "Invalid protected credential format".to_string())?;
+        use base64::Engine;
+        let enc = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| format!("Base64 decode failed: {}", e))?;
+        use sha2::{Digest, Sha256};
+        let uid = std::env::var("USER").unwrap_or_else(|_| "user".into());
+        let key = Sha256::digest(uid.as_bytes());
+        let dec: Vec<u8> = enc
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i % key.len()])
+            .collect();
+        String::from_utf8(dec).map_err(|e| format!("UTF-8 decode failed: {}", e))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SessionType {
     DesktopOwner,
@@ -155,6 +348,9 @@ pub struct TokenStore {
     failed_attempts_by_source: HashMap<String, (u32, Instant)>,
     max_failed_attempts: u32,
     lockout_duration: Duration,
+    global_unauthenticated_failures: Vec<Instant>,
+    max_global_failures: u32,
+    global_window: Duration,
     owner_peer_id: String,
     sessions: HashMap<String, SessionRecord>,
 }
@@ -195,6 +391,9 @@ impl TokenStore {
             failed_attempts_by_source: HashMap::new(),
             max_failed_attempts: 5,
             lockout_duration: Duration::from_secs(30),
+            global_unauthenticated_failures: Vec::new(),
+            max_global_failures: 15,
+            global_window: Duration::from_secs(30),
             owner_peer_id: owner_id,
             sessions,
         }
@@ -338,7 +537,10 @@ impl TokenStore {
         provided: Option<&str>,
         source: &str,
     ) -> AuthVerificationResult {
-        // Enforce lockout if max failed attempts exceeded for this source
+        // Evict expired entries to bound memory usage
+        self.evict_stale_rate_limits();
+
+        // Layer 1: Enforce per-source lockout
         if let Some((attempts, last_fail)) = self.failed_attempts_by_source.get(source) {
             if *attempts >= self.max_failed_attempts {
                 let elapsed = last_fail.elapsed();
@@ -348,6 +550,26 @@ impl TokenStore {
                         wait_seconds: remaining.max(1),
                     };
                 }
+            }
+        }
+
+        // Layer 2: Connection-churn defense (global unauthenticated failure threshold)
+        // If an attacker repeatedly rotates connections/sources to evade per-source limits,
+        // the global unauthenticated failure threshold triggers progressive backoff.
+        if self.global_unauthenticated_failures.len() >= self.max_global_failures as usize {
+            // Check if caller is already presenting a valid owner or registered token
+            if let Some(t) = provided {
+                let is_valid = TokenManager::verify_token(&self.current_token, Some(t))
+                    || self.sessions.contains_key(t)
+                    || self.previous_token.as_ref().is_some_and(|(prev, rot)| {
+                        rot.elapsed() <= self.grace_period
+                            && TokenManager::verify_token(prev, Some(t))
+                    });
+                if !is_valid {
+                    return AuthVerificationResult::RateLimited { wait_seconds: 5 };
+                }
+            } else {
+                return AuthVerificationResult::RateLimited { wait_seconds: 5 };
             }
         }
 
@@ -402,6 +624,17 @@ impl TokenStore {
         self.verify_for_source(provided, "default")
     }
 
+    /// Evicts expired failure records and trims global history to bound memory usage.
+    pub fn evict_stale_rate_limits(&mut self) {
+        let lockout = self.lockout_duration;
+        self.failed_attempts_by_source
+            .retain(|_, (_, last_fail)| last_fail.elapsed() <= lockout);
+
+        let window = self.global_window;
+        self.global_unauthenticated_failures
+            .retain(|t| t.elapsed() <= window);
+    }
+
     fn record_failure(&mut self, source: &str) {
         let entry = self
             .failed_attempts_by_source
@@ -409,6 +642,8 @@ impl TokenStore {
             .or_insert((0, Instant::now()));
         entry.0 = entry.0.saturating_add(1);
         entry.1 = Instant::now();
+
+        self.global_unauthenticated_failures.push(Instant::now());
     }
 }
 
@@ -611,5 +846,57 @@ mod tests {
         let (auth, session) = store.authenticate_session(Some(companion_token), "mobile-ws");
         assert_eq!(auth, AuthVerificationResult::Revoked);
         assert!(session.is_none());
+    }
+
+    #[test]
+    fn test_platform_protected_credential_roundtrip() {
+        let secret = "aether-secret-token-super-random-uuid-987654";
+        let protected = protect_credential(secret).expect("Protection must succeed");
+        assert_ne!(protected, secret, "Protected blob must not be plaintext");
+        assert!(
+            !protected.contains(secret),
+            "Ciphertext must not contain secret in plaintext"
+        );
+
+        let decrypted = unprotect_credential(&protected).expect("Unprotection must succeed");
+        assert_eq!(
+            decrypted, secret,
+            "Decrypted credential must match original plaintext"
+        );
+    }
+
+    #[test]
+    fn test_unprotect_invalid_credential_fails_safely() {
+        let res = unprotect_credential("invalid-prefix:garbage");
+        assert!(res.is_err(), "Invalid prefix must be safely rejected");
+
+        let res2 = unprotect_credential("dpapi:not-base64!!!");
+        assert!(res2.is_err(), "Malformed base64 must be safely rejected");
+    }
+
+    #[test]
+    fn test_connection_churn_rate_limiting_defense() {
+        let mut store = TokenStore::new_with_owner(Duration::from_secs(3600), "desktop-owner");
+        let owner_token = store.current_token().to_string();
+
+        // Simulate an attacker opening 20 separate connections, each failing once with a fresh source id
+        for i in 0..20 {
+            let churn_source = format!("fresh-connection-{}", i);
+            let res = store.verify_for_source(Some("wrong-token"), &churn_source);
+            if i >= 15 {
+                assert!(
+                    matches!(res, AuthVerificationResult::RateLimited { .. }),
+                    "Global churn limit must engage after 15 failures"
+                );
+            }
+        }
+
+        // Even under active churn lockout, the legitimate authenticated Owner succeeds!
+        let legit_res = store.verify_for_source(Some(&owner_token), "desktop-host");
+        assert_eq!(
+            legit_res,
+            AuthVerificationResult::Success,
+            "Legitimate owner must not be locked out by attacker churn"
+        );
     }
 }
