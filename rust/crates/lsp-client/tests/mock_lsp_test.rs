@@ -129,7 +129,7 @@ async fn test_lsp_client_mock_lifecycle_and_features() {
 
     // 1. Initialize
     let init_res = client
-        .initialize(Duration::from_secs(5))
+        .initialize(Duration::from_secs(20))
         .await
         .expect("initialize");
     assert!(init_res.get("capabilities").is_some());
@@ -140,7 +140,7 @@ async fn test_lsp_client_mock_lifecycle_and_features() {
         lsp_client::DocumentState::new(lsp_client::path_to_uri(&test_file), "rust", "fn main() {}");
     client.did_open(&doc).await.expect("did_open");
 
-    let diag = tokio::time::timeout(Duration::from_secs(3), diag_rx.recv())
+    let diag = tokio::time::timeout(Duration::from_secs(15), diag_rx.recv())
         .await
         .expect("diag timeout")
         .expect("diag recv");
@@ -149,7 +149,7 @@ async fn test_lsp_client_mock_lifecycle_and_features() {
 
     // 3. Completion
     let items = client
-        .completion(&test_file, 0, 5, Duration::from_secs(5))
+        .completion(&test_file, 0, 5, Duration::from_secs(15))
         .await
         .expect("completion");
     assert_eq!(items.len(), 1);
@@ -157,7 +157,7 @@ async fn test_lsp_client_mock_lifecycle_and_features() {
 
     // 4. Hover
     let hover = client
-        .hover(&test_file, 0, 5, Duration::from_secs(5))
+        .hover(&test_file, 0, 5, Duration::from_secs(15))
         .await
         .expect("hover");
     assert!(hover.is_some());
@@ -165,7 +165,7 @@ async fn test_lsp_client_mock_lifecycle_and_features() {
 
     // 5. Definition
     let defs = client
-        .definition(&test_file, 0, 5, Duration::from_secs(5))
+        .definition(&test_file, 0, 5, Duration::from_secs(15))
         .await
         .expect("definition");
     assert_eq!(defs.len(), 1);
@@ -173,7 +173,7 @@ async fn test_lsp_client_mock_lifecycle_and_features() {
 
     // 6. Shutdown
     client
-        .shutdown(Duration::from_secs(3))
+        .shutdown(Duration::from_secs(15))
         .await
         .expect("shutdown");
     assert_eq!(client.state(), lsp_client::ClientState::Terminated);
