@@ -315,7 +315,15 @@ mod tests {
 
     #[test]
     fn test_resolve_shell_command() {
-        assert!(resolve_shell_command("powershell").contains("powershell.exe"));
-        assert_eq!(resolve_shell_command("cmd"), "cmd.exe");
+        #[cfg(windows)]
+        {
+            assert!(resolve_shell_command("powershell").contains("powershell.exe"));
+            assert_eq!(resolve_shell_command("cmd"), "cmd.exe");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(resolve_shell_command("bash"), "/bin/bash");
+            assert_eq!(resolve_shell_command("zsh"), "/bin/zsh");
+        }
     }
 }
