@@ -120,10 +120,10 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
       - name: Install Desktop Dependencies
         run: |
-          npm --prefix apps/desktop install
+          npm --prefix apps/desktop install --ignore-scripts
       - name: Build Desktop Workbench
         run: |
           npm --prefix apps/desktop run build
