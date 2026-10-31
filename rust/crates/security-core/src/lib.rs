@@ -110,35 +110,116 @@ impl OsKeyringStore {
 
 impl CredentialStore for OsKeyringStore {
     fn store(&self, key: &str, secret: &str) -> Result<(), String> {
-        let entry = keyring::Entry::new(&self.service_name, key)
-            .map_err(|e| format!("Failed to initialize OS keyring entry for '{}': {}", key, e))?;
-        entry
-            .set_password(secret)
-            .map_err(|e| format!("Failed to store secret in OS keyring for '{}': {}", key, e))?;
-        Ok(())
+        let service = self.service_name.clone();
+        let key_str = key.to_string();
+        let secret_str = secret.to_string();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let entry = match keyring::Entry::new(&service, &key_str) {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = tx.send(Err(format!(
+                        "Failed to initialize OS keyring entry for '{}': {}",
+                        key_str, e
+                    )));
+                    return;
+                }
+            };
+            let res = entry.set_password(&secret_str).map_err(|e| {
+                format!(
+                    "Failed to store secret in OS keyring for '{}': {}",
+                    key_str, e
+                )
+            });
+            let _ = tx.send(res);
+        });
+
+        match rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(res) => {
+                let _ = handle.join();
+                res
+            }
+            Err(_) => Err(format!(
+                "OS credential service unavailable: operation timed out for '{}'",
+                key
+            )),
+        }
     }
 
     fn retrieve(&self, key: &str) -> Result<Option<String>, String> {
-        let entry = keyring::Entry::new(&self.service_name, key)
-            .map_err(|e| format!("Failed to initialize OS keyring entry for '{}': {}", key, e))?;
-        match entry.get_password() {
-            Ok(pwd) => Ok(Some(pwd)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(format!(
-                "Failed to retrieve secret from OS keyring for '{}': {}",
-                key, e
+        let service = self.service_name.clone();
+        let key_str = key.to_string();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let entry = match keyring::Entry::new(&service, &key_str) {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = tx.send(Err(format!(
+                        "Failed to initialize OS keyring entry for '{}': {}",
+                        key_str, e
+                    )));
+                    return;
+                }
+            };
+            let res = match entry.get_password() {
+                Ok(pwd) => Ok(Some(pwd)),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(e) => Err(format!(
+                    "Failed to retrieve secret from OS keyring for '{}': {}",
+                    key_str, e
+                )),
+            };
+            let _ = tx.send(res);
+        });
+
+        match rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(res) => {
+                let _ = handle.join();
+                res
+            }
+            Err(_) => Err(format!(
+                "OS credential service unavailable: operation timed out for '{}'",
+                key
             )),
         }
     }
 
     fn delete(&self, key: &str) -> Result<(), String> {
-        let entry = keyring::Entry::new(&self.service_name, key)
-            .map_err(|e| format!("Failed to initialize OS keyring entry for '{}': {}", key, e))?;
-        match entry.delete_credential() {
-            Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(format!(
-                "Failed to delete secret from OS keyring for '{}': {}",
-                key, e
+        let service = self.service_name.clone();
+        let key_str = key.to_string();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let entry = match keyring::Entry::new(&service, &key_str) {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = tx.send(Err(format!(
+                        "Failed to initialize OS keyring entry for '{}': {}",
+                        key_str, e
+                    )));
+                    return;
+                }
+            };
+            let res = match entry.delete_credential() {
+                Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(e) => Err(format!(
+                    "Failed to delete secret from OS keyring for '{}': {}",
+                    key_str, e
+                )),
+            };
+            let _ = tx.send(res);
+        });
+
+        match rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(res) => {
+                let _ = handle.join();
+                res
+            }
+            Err(_) => Err(format!(
+                "OS credential service unavailable: operation timed out for '{}'",
+                key
             )),
         }
     }
