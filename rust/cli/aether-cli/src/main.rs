@@ -229,7 +229,7 @@ fn print_usage() {
     );
 }
 
-fn get_session_token() -> Option<String> {
+fn get_bootstrap_identity() -> (Option<String>, Option<String>) {
     let data_dir = if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
         std::path::PathBuf::from(appdata).join("AetherIDE")
     } else if let Ok(home) = std::env::var("HOME") {
@@ -237,10 +237,25 @@ fn get_session_token() -> Option<String> {
     } else {
         std::path::PathBuf::from(".").join(".aether")
     };
+    let bootstrap_path = data_dir.join("desktop_bootstrap.json");
+    if let Ok(content) = std::fs::read_to_string(&bootstrap_path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            let token = val
+                .get("session_token")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
+            let peer = val
+                .get("owner_peer_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
+            return (token, peer);
+        }
+    }
     let token_path = data_dir.join("daemon_session.token");
-    std::fs::read_to_string(token_path)
+    let token = std::fs::read_to_string(token_path)
         .ok()
-        .map(|s| s.trim().to_string())
+        .map(|s| s.trim().to_string());
+    (token, None)
 }
 
 async fn send_ipc_request(
@@ -250,10 +265,12 @@ async fn send_ipc_request(
         "Failed to connect to Aether daemon at 127.0.0.1:44888. Is 'aether-daemon' running?"
     })?;
 
+    let (session_token, peer_id) = get_bootstrap_identity();
+
     let envelope = IpcEnvelope {
         id: format!("cli-{}", uuid::Uuid::new_v4().simple()),
-        session_token: get_session_token(),
-        peer_id: None,
+        session_token,
+        peer_id,
         payload: IpcPayload::Request(req),
     };
 

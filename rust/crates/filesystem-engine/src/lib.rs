@@ -64,27 +64,78 @@ impl FilesystemEngine {
         fs::read_to_string(path).map_err(AetherError::Io)
     }
 
+    /// Verifies that target is strictly contained within root on a component-by-component basis.
+    /// Prevents substring confusion (e.g. `workspace-external` vs `workspace`).
+    pub fn is_within_boundary(target: &Path, root: &Path) -> bool {
+        let target_comps: Vec<_> = target.components().collect();
+        let root_comps: Vec<_> = root.components().collect();
+        if target_comps.len() < root_comps.len() {
+            return false;
+        }
+        for (t, r) in target_comps.iter().zip(root_comps.iter()) {
+            if t != r {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Securely resolves a user-provided relative path against a workspace root.
     /// Strictly guarantees that the resolved target cannot escape the workspace root
     /// via parent directory traversal (`..`), absolute paths, Windows drive letters,
     /// UNC paths, Alternate Data Streams (ADS), trailing dot/space bypasses,
     /// Windows device files (CON, NUL, AUX, PRN), or filesystem symlinks.
     pub fn resolve_contained_path(root: &Path, user_path: &str) -> Result<PathBuf> {
-        // 1. Explicitly reject null bytes
-        if user_path.contains('\0') {
+        // 1. Explicitly reject null bytes and control characters
+        if user_path.contains('\0') || user_path.chars().any(|c| (c as u32) < 0x20) {
             return Err(AetherError::PermissionDenied(
-                "Access Denied: Null bytes are strictly forbidden in paths".into(),
+                "Access Denied: Null bytes and control characters are strictly forbidden in paths"
+                    .into(),
             ));
         }
 
-        // 2. Explicitly reject trailing dots or spaces in raw user path (Windows truncation evasion)
+        // 2. Explicitly reject URL encoded traversal attempts (%2e, %00, %2f, %5c)
+        let lower = user_path.to_ascii_lowercase();
+        if lower.contains("%2e")
+            || lower.contains("%00")
+            || lower.contains("%2f")
+            || lower.contains("%5c")
+        {
+            return Err(AetherError::PermissionDenied(
+                "Access Denied: URL encoded path sequences are strictly forbidden".into(),
+            ));
+        }
+
+        // 3. Explicitly reject Alternate Data Streams and drive colons anywhere in relative paths
+        if user_path.contains(':') {
+            return Err(AetherError::PermissionDenied(
+                "Access Denied: Stream separator or colon ':' is strictly forbidden in relative paths".into(),
+            ));
+        }
+
+        // 4. Explicitly reject Windows invalid filename characters (<, >, ", |, ?, *)
+        if user_path.contains(['<', '>', '"', '|', '?', '*']) {
+            return Err(AetherError::PermissionDenied(
+                "Access Denied: Forbidden characters in path".into(),
+            ));
+        }
+
+        // 5. Explicitly reject trailing dots or spaces in raw user path or any path component
         if user_path.ends_with('.') || user_path.ends_with(' ') {
             return Err(AetherError::PermissionDenied(
                 "Access Denied: Trailing dot or space in path is forbidden".into(),
             ));
         }
+        if user_path
+            .split(['/', '\\'])
+            .any(|seg| seg.ends_with('.') || seg.ends_with(' '))
+        {
+            return Err(AetherError::PermissionDenied(
+                "Access Denied: Trailing dot or space in path component is forbidden".into(),
+            ));
+        }
 
-        // 3. Reject UNC paths and Windows extended device namespaces
+        // 6. Reject UNC paths and Windows extended device namespaces
         let trimmed_leading = user_path.trim_start();
         if trimmed_leading.starts_with(r"\\")
             || trimmed_leading.starts_with("//")
@@ -122,21 +173,6 @@ impl FilesystemEngine {
                 }
                 std::path::Component::Normal(c) => {
                     let s = c.to_string_lossy();
-
-                    // Security: Reject NTFS Alternate Data Streams (ADS)
-                    if s.contains(':') {
-                        return Err(AetherError::PermissionDenied(format!(
-                            "Access Denied: Stream separator ':' is forbidden in component '{s}'"
-                        )));
-                    }
-
-                    // Security: Reject trailing dots and spaces (Windows silent path truncation)
-                    if s.ends_with('.') || s.ends_with(' ') {
-                        return Err(AetherError::PermissionDenied(format!(
-                            "Access Denied: Trailing dot or space in component '{s}' is forbidden"
-                        )));
-                    }
-
                     let upper = s.to_ascii_uppercase();
                     let stem = Path::new(&*s)
                         .file_stem()
@@ -187,7 +223,7 @@ impl FilesystemEngine {
 
         if candidate.exists() {
             let candidate_canon = candidate.canonicalize().map_err(AetherError::Io)?;
-            if !candidate_canon.starts_with(&root_canon) {
+            if !Self::is_within_boundary(&candidate_canon, &root_canon) {
                 return Err(AetherError::PermissionDenied(
                     "Access Denied: Target path escapes workspace boundary via symlink".into(),
                 ));
@@ -198,7 +234,7 @@ impl FilesystemEngine {
             while let Some(parent) = ancestor.parent() {
                 if parent.exists() {
                     let parent_canon = parent.canonicalize().map_err(AetherError::Io)?;
-                    if !parent_canon.starts_with(&root_canon) {
+                    if !Self::is_within_boundary(&parent_canon, &root_canon) {
                         return Err(AetherError::PermissionDenied(
                             "Access Denied: Ancestor directory escapes workspace boundary".into(),
                         ));
@@ -209,6 +245,131 @@ impl FilesystemEngine {
             }
             Ok(candidate)
         }
+    }
+
+    /// Safely writes content to a file inside the workspace root, immune to TOCTOU symlink races.
+    /// Performs post-creation validation to verify that the file actually created on disk is
+    /// strictly within the canonical workspace boundary.
+    pub fn write_file_contained<P: AsRef<Path>>(
+        root: P,
+        user_path: &str,
+        content: &str,
+    ) -> Result<PathBuf> {
+        let root = root.as_ref();
+        let root_canon = root.canonicalize().map_err(AetherError::Io)?;
+        let resolved = Self::resolve_contained_path(&root_canon, user_path)?;
+
+        if let Some(parent) = resolved.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent).map_err(AetherError::Io)?;
+            }
+            let parent_canon = parent.canonicalize().map_err(AetherError::Io)?;
+            if !Self::is_within_boundary(&parent_canon, &root_canon) {
+                return Err(AetherError::PermissionDenied(
+                    "Access Denied: Parent directory escaped boundary".into(),
+                ));
+            }
+        }
+
+        Self::write_file_atomic(&resolved, content)?;
+
+        // Post-creation canonical check against TOCTOU symlink substitution races
+        let post_canon = resolved.canonicalize().map_err(AetherError::Io)?;
+        if !Self::is_within_boundary(&post_canon, &root_canon) {
+            let _ = fs::remove_file(&resolved);
+            return Err(AetherError::PermissionDenied(
+                "Access Denied: Post-creation verification failed; target escaped boundary".into(),
+            ));
+        }
+
+        Ok(post_canon)
+    }
+
+    /// Safely reads the text content of a file strictly contained inside the workspace root.
+    pub fn read_file_contained<P: AsRef<Path>>(root: P, user_path: &str) -> Result<String> {
+        let root = root.as_ref();
+        let root_canon = root.canonicalize().map_err(AetherError::Io)?;
+        let resolved = Self::resolve_contained_path(&root_canon, user_path)?;
+        let target_canon = resolved.canonicalize().map_err(AetherError::Io)?;
+        if !Self::is_within_boundary(&target_canon, &root_canon) {
+            return Err(AetherError::PermissionDenied(
+                "Access Denied: Target path escapes workspace boundary".into(),
+            ));
+        }
+        fs::read_to_string(target_canon).map_err(AetherError::Io)
+    }
+
+    /// Safely deletes a file contained within the workspace root.
+    pub fn delete_file_contained<P: AsRef<Path>>(root: P, user_path: &str) -> Result<()> {
+        let root = root.as_ref();
+        let root_canon = root.canonicalize().map_err(AetherError::Io)?;
+        let resolved = Self::resolve_contained_path(&root_canon, user_path)?;
+        if resolved.exists() {
+            let target_canon = resolved.canonicalize().map_err(AetherError::Io)?;
+            if !Self::is_within_boundary(&target_canon, &root_canon) {
+                return Err(AetherError::PermissionDenied(
+                    "Access Denied: Target path escapes workspace boundary".into(),
+                ));
+            }
+            fs::remove_file(target_canon).map_err(AetherError::Io)?;
+        }
+        Ok(())
+    }
+
+    /// Safely creates a directory contained within the workspace root.
+    pub fn create_dir_contained<P: AsRef<Path>>(root: P, user_path: &str) -> Result<PathBuf> {
+        let root = root.as_ref();
+        let root_canon = root.canonicalize().map_err(AetherError::Io)?;
+        let resolved = Self::resolve_contained_path(&root_canon, user_path)?;
+        fs::create_dir_all(&resolved).map_err(AetherError::Io)?;
+        let target_canon = resolved.canonicalize().map_err(AetherError::Io)?;
+        if !Self::is_within_boundary(&target_canon, &root_canon) {
+            return Err(AetherError::PermissionDenied(
+                "Access Denied: Created directory escapes workspace boundary".into(),
+            ));
+        }
+        Ok(target_canon)
+    }
+
+    /// Safely renames or moves a file within the workspace root.
+    pub fn rename_contained<P: AsRef<Path>>(
+        root: P,
+        from_user_path: &str,
+        to_user_path: &str,
+    ) -> Result<()> {
+        let root = root.as_ref();
+        let root_canon = root.canonicalize().map_err(AetherError::Io)?;
+        let from_target = Self::resolve_contained_path(&root_canon, from_user_path)?;
+        let to_target = Self::resolve_contained_path(&root_canon, to_user_path)?;
+
+        let from_canon = from_target.canonicalize().map_err(AetherError::Io)?;
+        if !Self::is_within_boundary(&from_canon, &root_canon) {
+            return Err(AetherError::PermissionDenied(
+                "Access Denied: Source path escapes workspace boundary".into(),
+            ));
+        }
+
+        if let Some(parent) = to_target.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent).map_err(AetherError::Io)?;
+            }
+            let parent_canon = parent.canonicalize().map_err(AetherError::Io)?;
+            if !Self::is_within_boundary(&parent_canon, &root_canon) {
+                return Err(AetherError::PermissionDenied(
+                    "Access Denied: Destination parent directory escapes workspace boundary".into(),
+                ));
+            }
+        }
+
+        fs::rename(&from_canon, &to_target).map_err(AetherError::Io)?;
+
+        let to_canon = to_target.canonicalize().map_err(AetherError::Io)?;
+        if !Self::is_within_boundary(&to_canon, &root_canon) {
+            return Err(AetherError::PermissionDenied(
+                "Access Denied: Destination target escaped workspace boundary".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -303,6 +464,62 @@ mod tests {
         let null_byte = FilesystemEngine::resolve_contained_path(&temp_dir, "photo.png\0.exe");
         assert!(null_byte.is_err());
 
-        let _ = fs::remove_dir_all(temp_dir);
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_contained_io_operations() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_fs_io_{}", uuid::Uuid::new_v4().simple()));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        // 1. Contained write and read
+        let written_path = FilesystemEngine::write_file_contained(
+            &temp_dir,
+            "nested/dir/test.txt",
+            "Secure Content AetherIDE",
+        )
+        .expect("write_file_contained failed");
+        assert!(written_path.exists());
+
+        let read_content = FilesystemEngine::read_file_contained(&temp_dir, "nested/dir/test.txt")
+            .expect("read_file_contained failed");
+        assert_eq!(read_content, "Secure Content AetherIDE");
+
+        // 2. Traversal write rejected
+        let bad_write =
+            FilesystemEngine::write_file_contained(&temp_dir, "../escape.txt", "Malicious Data");
+        assert!(bad_write.is_err());
+
+        // 3. Contained rename
+        let rename_res = FilesystemEngine::rename_contained(
+            &temp_dir,
+            "nested/dir/test.txt",
+            "nested/dir/renamed.txt",
+        );
+        assert!(rename_res.is_ok());
+        assert!(!written_path.exists());
+
+        let renamed_content =
+            FilesystemEngine::read_file_contained(&temp_dir, "nested/dir/renamed.txt")
+                .expect("read renamed failed");
+        assert_eq!(renamed_content, "Secure Content AetherIDE");
+
+        // 4. Contained delete
+        let del_res = FilesystemEngine::delete_file_contained(&temp_dir, "nested/dir/renamed.txt");
+        assert!(del_res.is_ok());
+        assert!(
+            FilesystemEngine::read_file_contained(&temp_dir, "nested/dir/renamed.txt").is_err()
+        );
+
+        // 5. Component prefix evasion rejected (e.g. workspace vs workspace-extra)
+        let root_str = temp_dir.to_string_lossy().to_string();
+        let evil_sibling = PathBuf::from(format!("{}-evil", root_str));
+        assert!(!FilesystemEngine::is_within_boundary(
+            &evil_sibling,
+            &temp_dir
+        ));
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

@@ -119,18 +119,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    let bootstrap_file = data_dir.join("desktop_bootstrap.json");
+    let (session_token, peer_id) = if let Ok(data) = std::fs::read_to_string(&bootstrap_file) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+            (
+                v.get("session_token")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.trim().to_string()),
+                v.get("owner_peer_id")
+                    .and_then(|p| p.as_str())
+                    .map(|s| s.trim().to_string()),
+            )
+        } else {
+            (None, None)
+        }
+    } else {
+        let token = std::fs::read_to_string(&token_file)
+            .ok()
+            .map(|s| s.trim().to_string());
+        (token, None)
+    };
+
     // Native Desktop Host execution via cross-platform DesktopHost trait
     #[cfg(windows)]
     {
         println!(" [✓] Initializing True Native Win32 + Microsoft WebView2 Embedded Host...");
-        let session_token = std::fs::read_to_string(&token_file)
-            .ok()
-            .map(|s| s.trim().to_string());
 
         let host_config = host::HostConfig {
             workbench_dir: workbench_dir.clone(),
             user_data_dir: data_dir.clone(),
-            session_token,
+            session_token: session_token.clone(),
+            peer_id: peer_id.clone(),
             daemon_port: 44888,
         };
         let host = win32_host::native::Win32WebView2Host::new(host_config);
@@ -151,13 +170,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     {
         use host::DesktopHost;
-        let session_token = std::fs::read_to_string(&token_file)
-            .ok()
-            .map(|s| s.trim().to_string());
         let host_config = host::HostConfig {
             workbench_dir: workbench_dir.clone(),
             user_data_dir: data_dir.clone(),
-            session_token,
+            session_token: session_token.clone(),
+            peer_id: peer_id.clone(),
             daemon_port: 44888,
         };
         let host = linux_host::LinuxGtkHost::new(host_config);
@@ -171,13 +188,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     {
         use host::DesktopHost;
-        let session_token = std::fs::read_to_string(&token_file)
-            .ok()
-            .map(|s| s.trim().to_string());
         let host_config = host::HostConfig {
             workbench_dir: workbench_dir.clone(),
             user_data_dir: data_dir.clone(),
-            session_token,
+            session_token: session_token.clone(),
+            peer_id: peer_id.clone(),
             daemon_port: 44888,
         };
         let host = macos_host::MacWkWebViewHost::new(host_config);
