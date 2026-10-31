@@ -5,9 +5,11 @@ use database_engine::{DatabaseEngine, ProofOfWorkRecord};
 use lsp_client::LspMultiplexer;
 use model_gateway::ModelGateway;
 use std::process::Command;
+#[cfg(windows)]
 use std::time::Duration;
 use symbol_index::SymbolIndex;
 use syntax_engine::{SupportedLanguage, SyntaxEngine};
+#[cfg(windows)]
 use terminal_manager::TerminalManager;
 use workspace_sync::{
     reassemble_chunks, slice_file, AeadChannel, FileChunk, PairingPayload, SyncRole,

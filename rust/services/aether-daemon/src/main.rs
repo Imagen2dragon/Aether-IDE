@@ -1,9 +1,10 @@
 use application_core::{AetherConfig, AutonomyMode, AETHER_VERSION};
 use database_engine::DatabaseEngine;
 use diagnostics::EnvironmentDoctor;
+#[cfg(windows)]
+use ipc_protocol::DEFAULT_NAMED_PIPE_PATH;
 use ipc_protocol::{
     decode_message, encode_message, IpcEnvelope, IpcPayload, IpcRequest, IpcResponse,
-    DEFAULT_NAMED_PIPE_PATH,
 };
 use model_gateway::{CompletionRequest, ModelGateway};
 use project_brain::ProjectBrain;
