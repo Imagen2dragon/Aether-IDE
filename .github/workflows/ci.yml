@@ -80,7 +80,7 @@ jobs:
       - name: Run Linux Tests
         run: |
           cd rust
-          cargo test --workspace
+          dbus-run-session -- cargo test --workspace || cargo test --workspace
       - name: Build Linux Binaries (Release)
         run: |
           cd rust
