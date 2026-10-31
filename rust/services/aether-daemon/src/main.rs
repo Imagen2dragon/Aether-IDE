@@ -8,7 +8,6 @@ use ipc_protocol::{
 use model_gateway::{CompletionRequest, ModelGateway};
 use project_brain::ProjectBrain;
 use project_indexer::ProjectIndexer;
-use security_core::TokenManager;
 use std::path::PathBuf;
 use std::sync::Arc;
 use symbol_index::SymbolIndex;
@@ -19,6 +18,8 @@ use tracing::{error, info};
 struct DaemonState {
     config: AetherConfig,
     session_token: String,
+    owner_peer_id: String,
+    token_store: parking_lot::Mutex<security_core::TokenStore>,
     db: DatabaseEngine,
     model_gateway: ModelGateway,
     agent_orchestrator: agent_orchestrator::AgentOrchestrator,
@@ -39,7 +40,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting AetherIDE Native Daemon v0.1.0-alpha");
 
     let config = AetherConfig::default();
-    let session_token = TokenManager::generate_session_token();
+    let token_store = security_core::TokenStore::new(std::time::Duration::from_secs(86400))
+        .with_lockout(10, std::time::Duration::from_secs(60));
+    let session_token = token_store.current_token().to_string();
+
+    let owner_peer_id = format!("owner-bootstrap-{}", uuid::Uuid::new_v4().simple());
 
     let db_path = config.data_dir.join("aether.db");
     let db = DatabaseEngine::open(&db_path)
@@ -59,9 +64,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let role_registry = Arc::new(workspace_sync::RoleRegistry::new());
     let swarm_coordinator = Arc::new(agent_orchestrator::SwarmCoordinator::new(&workspace_root));
 
+    // Zero-Trust Authorization: Register ONLY the dynamically generated owner_peer_id as Owner.
+    // Loopback, named-pipe, or generic local connections are NEVER automatically granted Owner.
+    role_registry.register_peer(&owner_peer_id, workspace_sync::DeviceRole::Owner);
+
     let state = Arc::new(DaemonState {
         config: config.clone(),
         session_token: session_token.clone(),
+        owner_peer_id: owner_peer_id.clone(),
+        token_store: parking_lot::Mutex::new(token_store),
         db,
         model_gateway,
         agent_orchestrator,
@@ -75,20 +86,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         swarm_coordinator,
     });
 
-    // Register local host and loopback identities with Owner privileges
-    state
-        .role_registry
-        .register_peer("local", workspace_sync::DeviceRole::Owner);
-    state
-        .role_registry
-        .register_peer("host", workspace_sync::DeviceRole::Owner);
-    state
-        .role_registry
-        .register_peer("windows-named-pipe", workspace_sync::DeviceRole::Owner);
-
-    // Write token file for UI workbench to authenticate
-    let token_file = config.data_dir.join("daemon_session.token");
+    // Write desktop bootstrap credentials (owner_peer_id + session_token)
     let _ = std::fs::create_dir_all(&config.data_dir);
+    let bootstrap_file = config.data_dir.join("desktop_bootstrap.json");
+    let bootstrap_payload = serde_json::json!({
+        "owner_peer_id": owner_peer_id,
+        "session_token": session_token,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+        "role": "Owner"
+    });
+    let _ = std::fs::write(
+        &bootstrap_file,
+        serde_json::to_string_pretty(&bootstrap_payload).unwrap_or_default(),
+    );
+    info!(
+        "Desktop bootstrap identity published to {:?}",
+        bootstrap_file
+    );
+
+    // Also write legacy token file for backward compatibility
+    let token_file = config.data_dir.join("daemon_session.token");
     let _ = std::fs::write(&token_file, &session_token);
     info!("Daemon session token published to {:?}", token_file);
 
@@ -186,33 +203,106 @@ async fn handle_ipc_envelope(
     envelope: IpcEnvelope,
     peer_info: &str,
 ) -> IpcEnvelope {
-    // 1. Verify Authentication Token (SEC-01 remediation)
-    if !TokenManager::verify_token(&state.session_token, envelope.session_token.as_deref()) {
-        tracing::warn!(
-            "SEC-01: Unauthorized IPC request rejected from {} (request id: {})",
-            peer_info,
-            envelope.id
-        );
-        return IpcEnvelope {
-            id: envelope.id,
-            session_token: None,
-            peer_id: envelope.peer_id,
-            payload: IpcPayload::Response(IpcResponse::unauthorized(
-                "Access denied: missing or invalid session token",
-            )),
-        };
+    // 1. Verify Authentication Token with per-source rate-limiting and revocation check
+    let auth_result = state
+        .token_store
+        .lock()
+        .verify_for_source(envelope.session_token.as_deref(), peer_info);
+    match auth_result {
+        security_core::AuthVerificationResult::Success => {}
+        security_core::AuthVerificationResult::Revoked => {
+            tracing::warn!(
+                "SEC-01: Revoked token IPC request rejected from {} (request id: {})",
+                peer_info,
+                envelope.id
+            );
+            return IpcEnvelope {
+                id: envelope.id,
+                session_token: None,
+                peer_id: envelope.peer_id,
+                payload: IpcPayload::Response(IpcResponse::unauthorized(
+                    "Access denied: session token has been revoked",
+                )),
+            };
+        }
+        security_core::AuthVerificationResult::RateLimited { wait_seconds } => {
+            tracing::warn!(
+                "SEC-01: Rate-limited IPC request rejected from {} (request id: {}, retry after {}s)",
+                peer_info,
+                envelope.id,
+                wait_seconds
+            );
+            return IpcEnvelope {
+                id: envelope.id,
+                session_token: None,
+                peer_id: envelope.peer_id,
+                payload: IpcPayload::Response(IpcResponse::unauthorized(format!(
+                    "Access denied: source temporarily rate-limited; retry after {} seconds",
+                    wait_seconds
+                ))),
+            };
+        }
+        security_core::AuthVerificationResult::Expired => {
+            tracing::warn!(
+                "SEC-01: Expired token IPC request rejected from {} (request id: {})",
+                peer_info,
+                envelope.id
+            );
+            return IpcEnvelope {
+                id: envelope.id,
+                session_token: None,
+                peer_id: envelope.peer_id,
+                payload: IpcPayload::Response(IpcResponse::unauthorized(
+                    "Access denied: session token has expired",
+                )),
+            };
+        }
+        security_core::AuthVerificationResult::InvalidToken => {
+            tracing::warn!(
+                "SEC-01: Unauthorized IPC request rejected from {} (request id: {})",
+                peer_info,
+                envelope.id
+            );
+            return IpcEnvelope {
+                id: envelope.id,
+                session_token: None,
+                peer_id: envelope.peer_id,
+                payload: IpcPayload::Response(IpcResponse::unauthorized(
+                    "Access denied: missing or invalid session token",
+                )),
+            };
+        }
     }
 
-    let caller_peer = envelope.peer_id.clone().unwrap_or_else(|| {
-        if peer_info == "windows-named-pipe"
-            || peer_info.starts_with("127.0.0.1:")
-            || peer_info == "local"
-        {
-            "local".to_string()
-        } else {
-            peer_info.to_string()
+    // 2. Resolve caller peer identity with zero-trust default-deny
+    let caller_peer = match &envelope.peer_id {
+        Some(peer) if !peer.trim().is_empty() => {
+            // Anti-spoofing check: If claiming the desktop owner identity, verify that
+            // the provided token strictly matches the master session token.
+            if peer == &state.owner_peer_id
+                && envelope.session_token.as_deref() != Some(&state.session_token)
+            {
+                tracing::warn!(
+                    "SEC-01: Impersonation attempt detected from {} claiming owner peer {} without master token",
+                    peer_info,
+                    peer
+                );
+                return IpcEnvelope {
+                    id: envelope.id,
+                    session_token: None,
+                    peer_id: envelope.peer_id,
+                    payload: IpcPayload::Response(IpcResponse::unauthorized(
+                        "Access denied: owner identity verification failed",
+                    )),
+                };
+            }
+            peer.clone()
         }
-    });
+        _ => {
+            // Unidentified connections receive an isolated peer ID that defaults to Viewer role
+            format!("unidentified-{}", peer_info)
+        }
+    };
     let caller_role = state.role_registry.get_role(&caller_peer);
 
     let req = match envelope.payload {
@@ -820,6 +910,22 @@ async fn handle_ipc_envelope(
             }
         }
 
+        IpcRequest::RevokeSessionToken { token } => {
+            if !caller_role.can_admin() {
+                IpcResponse::unauthorized(format!(
+                    "Peer '{}' with role {:?} is not authorized to revoke session tokens",
+                    caller_peer, caller_role
+                ))
+            } else {
+                state.token_store.lock().revoke_token(&token);
+                info!("Session token revoked by peer '{}'", caller_peer);
+                IpcResponse::ok(serde_json::json!({
+                    "revoked": true,
+                    "token_prefix": if token.len() >= 8 { &token[..8] } else { &token }
+                }))
+            }
+        }
+
         IpcRequest::CrdtApplyUpdate {
             doc_id,
             update_base64,
@@ -1011,7 +1117,6 @@ mod tests {
 
     fn create_test_state() -> Arc<DaemonState> {
         let config = AetherConfig::default();
-        let session_token = TokenManager::generate_session_token();
         let db = DatabaseEngine::open_in_memory().unwrap();
         let symbol_index = SymbolIndex::new(db.clone());
         let indexer = ProjectIndexer::new(symbol_index);
@@ -1024,16 +1129,19 @@ mod tests {
         let terminal_manager = Arc::new(terminal_manager::TerminalManager::new());
         let crdt_manager = Arc::new(workspace_sync::CrdtManager::new());
         let awareness_tracker = Arc::new(workspace_sync::AwarenessTracker::new());
+        let token_store = security_core::TokenStore::new(std::time::Duration::from_secs(86400));
+        let session_token = token_store.current_token().to_string();
+        let owner_peer_id = format!("owner-bootstrap-{}", uuid::Uuid::new_v4().simple());
         let role_registry = Arc::new(workspace_sync::RoleRegistry::new());
-        role_registry.register_peer("local", workspace_sync::DeviceRole::Owner);
-        role_registry.register_peer("host", workspace_sync::DeviceRole::Owner);
-        role_registry.register_peer("windows-named-pipe", workspace_sync::DeviceRole::Owner);
+        role_registry.register_peer(&owner_peer_id, workspace_sync::DeviceRole::Owner);
         let swarm_coordinator =
             Arc::new(agent_orchestrator::SwarmCoordinator::new(&workspace_root));
 
         Arc::new(DaemonState {
             config,
             session_token,
+            owner_peer_id,
+            token_store: parking_lot::Mutex::new(token_store),
             db,
             model_gateway,
             agent_orchestrator,
@@ -1174,7 +1282,7 @@ mod tests {
         let spawn_envelope = IpcEnvelope {
             id: "test-term-spawn-6".into(),
             session_token: Some(state.session_token.clone()),
-            peer_id: None,
+            peer_id: Some(state.owner_peer_id.clone()),
             payload: IpcPayload::Request(IpcRequest::TerminalSpawn {
                 shell: Some("cmd".into()),
                 cwd: None,
@@ -1201,7 +1309,7 @@ mod tests {
         let close_envelope = IpcEnvelope {
             id: "test-term-close-7".into(),
             session_token: Some(state.session_token.clone()),
-            peer_id: None,
+            peer_id: Some(state.owner_peer_id.clone()),
             payload: IpcPayload::Request(IpcRequest::TerminalClose { session_id }),
         };
 
@@ -1442,7 +1550,7 @@ mod tests {
         let envelope_register = IpcEnvelope {
             id: "test-reg-1".into(),
             session_token: Some(state.session_token.clone()),
-            peer_id: None,
+            peer_id: Some(state.owner_peer_id.clone()),
             payload: IpcPayload::Request(IpcRequest::RegisterPeerRole {
                 peer_id: "peer-bob".into(),
                 role: "Editor".into(),
@@ -1482,7 +1590,7 @@ mod tests {
         let envelope_revoke = IpcEnvelope {
             id: "test-rev-1".into(),
             session_token: Some(state.session_token.clone()),
-            peer_id: None,
+            peer_id: Some(state.owner_peer_id.clone()),
             payload: IpcPayload::Request(IpcRequest::RevokePeerRole {
                 peer_id: "peer-bob".into(),
             }),
@@ -1640,11 +1748,33 @@ mod tests {
             panic!("Expected response");
         }
 
-        // 6. Default local host peer (peer_id: None on loopback) has Owner role -> RegisterPeerRole accepted
-        let env_owner_admin = IpcEnvelope {
-            id: "rbac-6".into(),
+        // 6a. Unidentified local loopback peer (peer_id: None) receives Viewer role -> RegisterPeerRole rejected
+        let env_unidentified = IpcEnvelope {
+            id: "rbac-6a".into(),
             session_token: Some(state.session_token.clone()),
             peer_id: None,
+            payload: IpcPayload::Request(IpcRequest::RegisterPeerRole {
+                peer_id: "peer-guest".into(),
+                role: "Viewer".into(),
+            }),
+        };
+        let resp_unid = handle_ipc_envelope(&state, env_unidentified, "127.0.0.1:9999").await;
+        if let IpcPayload::Response(r) = resp_unid.payload {
+            assert!(!r.success);
+            assert_eq!(r.status_code, Some(401));
+            assert!(r
+                .error
+                .unwrap()
+                .contains("not authorized to register peer roles"));
+        } else {
+            panic!("Expected response");
+        }
+
+        // 6b. Provisioned desktop owner identity (with owner_peer_id) -> RegisterPeerRole accepted
+        let env_owner_admin = IpcEnvelope {
+            id: "rbac-6b".into(),
+            session_token: Some(state.session_token.clone()),
+            peer_id: Some(state.owner_peer_id.clone()),
             payload: IpcPayload::Request(IpcRequest::RegisterPeerRole {
                 peer_id: "peer-guest".into(),
                 role: "Viewer".into(),
@@ -1655,6 +1785,380 @@ mod tests {
             assert!(r.success);
         } else {
             panic!("Expected response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_daemon_authorization_10_cases() {
+        let state = create_test_state();
+
+        // Register explicit roles for test peers
+        state
+            .role_registry
+            .register_peer("peer-viewer", workspace_sync::DeviceRole::Viewer);
+        state
+            .role_registry
+            .register_peer("peer-reviewer", workspace_sync::DeviceRole::Reviewer);
+        state
+            .role_registry
+            .register_peer("peer-editor", workspace_sync::DeviceRole::Editor);
+
+        // Case 1: Unauthenticated loopback (session_token: None) -> 401
+        let env_c1 = IpcEnvelope {
+            id: "c1".into(),
+            session_token: None,
+            peer_id: None,
+            payload: IpcPayload::Request(IpcRequest::Ping),
+        };
+        let resp_c1 = handle_ipc_envelope(&state, env_c1, "127.0.0.1:44888").await;
+        if let IpcPayload::Response(r) = resp_c1.payload {
+            assert!(!r.success);
+            assert_eq!(r.status_code, Some(401));
+            assert!(r.error.unwrap().contains("401 Unauthorized"));
+        } else {
+            panic!("Expected response payload");
+        }
+
+        // Case 2: Invalid token -> 401
+        let env_c2 = IpcEnvelope {
+            id: "c2".into(),
+            session_token: Some("malicious-forged-token-99999".into()),
+            peer_id: None,
+            payload: IpcPayload::Request(IpcRequest::Ping),
+        };
+        let resp_c2 = handle_ipc_envelope(&state, env_c2, "127.0.0.1:44888").await;
+        if let IpcPayload::Response(r) = resp_c2.payload {
+            assert!(!r.success);
+            assert_eq!(r.status_code, Some(401));
+            assert!(r
+                .error
+                .unwrap()
+                .contains("missing or invalid session token"));
+        } else {
+            panic!("Expected response payload");
+        }
+
+        // Case 3: Expired token -> 401
+        let expired_token_store =
+            security_core::TokenStore::new(std::time::Duration::from_millis(10));
+        let expired_token = expired_token_store.current_token().to_string();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let expired_state = Arc::new(DaemonState {
+            config: AetherConfig::default(),
+            session_token: expired_token.clone(),
+            owner_peer_id: "owner-expired".into(),
+            token_store: parking_lot::Mutex::new(expired_token_store),
+            db: DatabaseEngine::open_in_memory().unwrap(),
+            model_gateway: ModelGateway::new(),
+            agent_orchestrator: agent_orchestrator::AgentOrchestrator::new(
+                ModelGateway::new(),
+                DatabaseEngine::open_in_memory().unwrap(),
+            ),
+            project_brain: parking_lot::Mutex::new(ProjectBrain::new(
+                DatabaseEngine::open_in_memory().unwrap(),
+            )),
+            indexer: ProjectIndexer::new(SymbolIndex::new(
+                DatabaseEngine::open_in_memory().unwrap(),
+            )),
+            lsp_multiplexer: Arc::new(lsp_client::LspMultiplexer::new(std::path::PathBuf::from(
+                ".",
+            ))),
+            terminal_manager: Arc::new(terminal_manager::TerminalManager::new()),
+            crdt_manager: Arc::new(workspace_sync::CrdtManager::new()),
+            awareness_tracker: Arc::new(workspace_sync::AwarenessTracker::new()),
+            role_registry: Arc::new(workspace_sync::RoleRegistry::new()),
+            swarm_coordinator: Arc::new(agent_orchestrator::SwarmCoordinator::new(
+                std::path::Path::new("."),
+            )),
+        });
+        let env_c3 = IpcEnvelope {
+            id: "c3".into(),
+            session_token: Some(expired_token),
+            peer_id: None,
+            payload: IpcPayload::Request(IpcRequest::Ping),
+        };
+        let resp_c3 = handle_ipc_envelope(&expired_state, env_c3, "127.0.0.1:44888").await;
+        if let IpcPayload::Response(r) = resp_c3.payload {
+            assert!(!r.success);
+            assert_eq!(r.status_code, Some(401));
+            assert!(r.error.unwrap().contains("expired"));
+        } else {
+            panic!("Expected response payload");
+        }
+
+        // Case 4: Revoked token -> 401
+        let revoked_token_store =
+            security_core::TokenStore::new(std::time::Duration::from_secs(3600));
+        let token_to_revoke = revoked_token_store.current_token().to_string();
+        let revoked_state = Arc::new(DaemonState {
+            config: AetherConfig::default(),
+            session_token: token_to_revoke.clone(),
+            owner_peer_id: "owner-revoked".into(),
+            token_store: parking_lot::Mutex::new(revoked_token_store),
+            db: DatabaseEngine::open_in_memory().unwrap(),
+            model_gateway: ModelGateway::new(),
+            agent_orchestrator: agent_orchestrator::AgentOrchestrator::new(
+                ModelGateway::new(),
+                DatabaseEngine::open_in_memory().unwrap(),
+            ),
+            project_brain: parking_lot::Mutex::new(ProjectBrain::new(
+                DatabaseEngine::open_in_memory().unwrap(),
+            )),
+            indexer: ProjectIndexer::new(SymbolIndex::new(
+                DatabaseEngine::open_in_memory().unwrap(),
+            )),
+            lsp_multiplexer: Arc::new(lsp_client::LspMultiplexer::new(std::path::PathBuf::from(
+                ".",
+            ))),
+            terminal_manager: Arc::new(terminal_manager::TerminalManager::new()),
+            crdt_manager: Arc::new(workspace_sync::CrdtManager::new()),
+            awareness_tracker: Arc::new(workspace_sync::AwarenessTracker::new()),
+            role_registry: Arc::new(workspace_sync::RoleRegistry::new()),
+            swarm_coordinator: Arc::new(agent_orchestrator::SwarmCoordinator::new(
+                std::path::Path::new("."),
+            )),
+        });
+        revoked_state
+            .token_store
+            .lock()
+            .revoke_token(&token_to_revoke);
+
+        let env_c4 = IpcEnvelope {
+            id: "c4".into(),
+            session_token: Some(token_to_revoke),
+            peer_id: None,
+            payload: IpcPayload::Request(IpcRequest::Ping),
+        };
+        let resp_c4 = handle_ipc_envelope(&revoked_state, env_c4, "127.0.0.1:44888").await;
+        if let IpcPayload::Response(r) = resp_c4.payload {
+            assert!(!r.success);
+            assert_eq!(r.status_code, Some(401));
+            assert!(r.error.unwrap().contains("revoked"));
+        } else {
+            panic!("Expected response payload");
+        }
+
+        // Case 5: Viewer attempting terminal execution (RunCommand, TerminalSpawn) -> 401
+        let env_c5a = IpcEnvelope {
+            id: "c5a".into(),
+            session_token: Some(state.session_token.clone()),
+            peer_id: Some("peer-viewer".into()),
+            payload: IpcPayload::Request(IpcRequest::RunCommand {
+                command: "whoami".into(),
+                cwd: None,
+                timeout_secs: Some(5),
+            }),
+        };
+        let resp_c5a = handle_ipc_envelope(&state, env_c5a, "127.0.0.1:44888").await;
+        if let IpcPayload::Response(r) = resp_c5a.payload {
+            assert!(!r.success);
+            assert_eq!(r.status_code, Some(401));
+            assert!(r
+                .error
+                .unwrap()
+                .contains("not authorized to execute commands"));
+        } else {
+            panic!("Expected response payload");
+        }
+
+        let env_c5b = IpcEnvelope {
+            id: "c5b".into(),
+            session_token: Some(state.session_token.clone()),
+            peer_id: Some("peer-viewer".into()),
+            payload: IpcPayload::Request(IpcRequest::TerminalSpawn {
+                shell: None,
+                cwd: None,
+                cols: None,
+                rows: None,
+            }),
+        };
+        let resp_c5b = handle_ipc_envelope(&state, env_c5b, "127.0.0.1:44888").await;
+        if let IpcPayload::Response(r) = resp_c5b.payload {
+            assert!(!r.success);
+            assert_eq!(r.status_code, Some(401));
+            assert!(r
+                .error
+                .unwrap()
+                .contains("not authorized to spawn terminals"));
+        } else {
+            panic!("Expected response payload");
+        }
+
+        // Case 6: Reviewer attempting RegisterPeerRole -> 401
+        let env_c6 = IpcEnvelope {
+            id: "c6".into(),
+            session_token: Some(state.session_token.clone()),
+            peer_id: Some("peer-reviewer".into()),
+            payload: IpcPayload::Request(IpcRequest::RegisterPeerRole {
+                peer_id: "peer-malicious".into(),
+                role: "Admin".into(),
+            }),
+        };
+        let resp_c6 = handle_ipc_envelope(&state, env_c6, "127.0.0.1:44888").await;
+        if let IpcPayload::Response(r) = resp_c6.payload {
+            assert!(!r.success);
+            assert_eq!(r.status_code, Some(401));
+            assert!(r
+                .error
+                .unwrap()
+                .contains("not authorized to register peer roles"));
+        } else {
+            panic!("Expected response payload");
+        }
+
+        // Case 7: Client injecting role: Owner in payload -> Backend overrides with assigned role (Viewer)
+        let env_c7 = IpcEnvelope {
+            id: "c7".into(),
+            session_token: Some(state.session_token.clone()),
+            peer_id: Some("peer-viewer".into()),
+            payload: IpcPayload::Request(IpcRequest::CrdtApplyUpdate {
+                doc_id: "doc-vault-sec".into(),
+                update_base64: "AAA=".into(),
+                peer_id: "peer-viewer".into(),
+                role: "Owner".into(), // Injected spoofed role in payload
+            }),
+        };
+        let resp_c7 = handle_ipc_envelope(&state, env_c7, "127.0.0.1:44888").await;
+        if let IpcPayload::Response(r) = resp_c7.payload {
+            assert!(!r.success);
+            assert!(r
+                .error
+                .unwrap()
+                .contains("is not authorized to mutate CRDT document"));
+        } else {
+            panic!("Expected response payload");
+        }
+
+        // Case 8: Local process claiming another peer ID without authorization -> Assigned Viewer
+        let env_c8 = IpcEnvelope {
+            id: "c8".into(),
+            session_token: Some(state.session_token.clone()),
+            peer_id: Some("arbitrary-unregistered-peer".into()),
+            payload: IpcPayload::Request(IpcRequest::RunCommand {
+                command: "id".into(),
+                cwd: None,
+                timeout_secs: Some(5),
+            }),
+        };
+        let resp_c8 = handle_ipc_envelope(&state, env_c8, "127.0.0.1:44888").await;
+        if let IpcPayload::Response(r) = resp_c8.payload {
+            assert!(!r.success);
+            assert_eq!(r.status_code, Some(401));
+            assert!(r
+                .error
+                .unwrap()
+                .contains("not authorized to execute commands"));
+        } else {
+            panic!("Expected response payload");
+        }
+
+        // Case 9: Local process connecting without bootstrap identity (peer_id: None) -> Receives Viewer, cannot write/admin
+        let env_c9 = IpcEnvelope {
+            id: "c9".into(),
+            session_token: Some(state.session_token.clone()),
+            peer_id: None,
+            payload: IpcPayload::Request(IpcRequest::RegisterPeerRole {
+                peer_id: "infiltrator".into(),
+                role: "Owner".into(),
+            }),
+        };
+        let resp_c9 = handle_ipc_envelope(&state, env_c9, "127.0.0.1:44888").await;
+        if let IpcPayload::Response(r) = resp_c9.payload {
+            assert!(!r.success);
+            assert_eq!(r.status_code, Some(401));
+            assert!(r
+                .error
+                .unwrap()
+                .contains("not authorized to register peer roles"));
+        } else {
+            panic!("Expected response payload");
+        }
+
+        // Case 10: Session attempting privileged action after revocation -> 401
+        // Step 1: Owner revokes an active session token via IPC
+        let live_token_store = security_core::TokenStore::new(std::time::Duration::from_secs(3600));
+        let victim_token = live_token_store.current_token().to_string();
+        let target_state = Arc::new(DaemonState {
+            config: AetherConfig::default(),
+            session_token: victim_token.clone(),
+            owner_peer_id: "owner-admin-1".into(),
+            token_store: parking_lot::Mutex::new(live_token_store),
+            db: DatabaseEngine::open_in_memory().unwrap(),
+            model_gateway: ModelGateway::new(),
+            agent_orchestrator: agent_orchestrator::AgentOrchestrator::new(
+                ModelGateway::new(),
+                DatabaseEngine::open_in_memory().unwrap(),
+            ),
+            project_brain: parking_lot::Mutex::new(ProjectBrain::new(
+                DatabaseEngine::open_in_memory().unwrap(),
+            )),
+            indexer: ProjectIndexer::new(SymbolIndex::new(
+                DatabaseEngine::open_in_memory().unwrap(),
+            )),
+            lsp_multiplexer: Arc::new(lsp_client::LspMultiplexer::new(std::path::PathBuf::from(
+                ".",
+            ))),
+            terminal_manager: Arc::new(terminal_manager::TerminalManager::new()),
+            crdt_manager: Arc::new(workspace_sync::CrdtManager::new()),
+            awareness_tracker: Arc::new(workspace_sync::AwarenessTracker::new()),
+            role_registry: Arc::new(workspace_sync::RoleRegistry::new()),
+            swarm_coordinator: Arc::new(agent_orchestrator::SwarmCoordinator::new(
+                std::path::Path::new("."),
+            )),
+        });
+        target_state
+            .role_registry
+            .register_peer("owner-admin-1", workspace_sync::DeviceRole::Owner);
+
+        // Before revocation: Ping succeeds
+        let env_before = IpcEnvelope {
+            id: "c10-pre".into(),
+            session_token: Some(victim_token.clone()),
+            peer_id: Some("owner-admin-1".into()),
+            payload: IpcPayload::Request(IpcRequest::Ping),
+        };
+        let resp_before = handle_ipc_envelope(&target_state, env_before, "127.0.0.1:44888").await;
+        if let IpcPayload::Response(r) = resp_before.payload {
+            assert!(r.success);
+        } else {
+            panic!("Expected response payload");
+        }
+
+        // Revoke token via RevokeSessionToken IPC request
+        let env_revoke = IpcEnvelope {
+            id: "c10-revoke".into(),
+            session_token: Some(victim_token.clone()),
+            peer_id: Some("owner-admin-1".into()),
+            payload: IpcPayload::Request(IpcRequest::RevokeSessionToken {
+                token: victim_token.clone(),
+            }),
+        };
+        let resp_revoke = handle_ipc_envelope(&target_state, env_revoke, "127.0.0.1:44888").await;
+        if let IpcPayload::Response(r) = resp_revoke.payload {
+            assert!(r.success);
+            assert_eq!(r.data.unwrap()["revoked"], true);
+        } else {
+            panic!("Expected response payload");
+        }
+
+        // After revocation: privileged action and ping are blocked with 401
+        let env_after = IpcEnvelope {
+            id: "c10-post".into(),
+            session_token: Some(victim_token),
+            peer_id: Some("owner-admin-1".into()),
+            payload: IpcPayload::Request(IpcRequest::RunCommand {
+                command: "echo fail".into(),
+                cwd: None,
+                timeout_secs: Some(5),
+            }),
+        };
+        let resp_after = handle_ipc_envelope(&target_state, env_after, "127.0.0.1:44888").await;
+        if let IpcPayload::Response(r) = resp_after.payload {
+            assert!(!r.success);
+            assert_eq!(r.status_code, Some(401));
+            assert!(r.error.unwrap().contains("revoked"));
+        } else {
+            panic!("Expected response payload");
         }
     }
 }

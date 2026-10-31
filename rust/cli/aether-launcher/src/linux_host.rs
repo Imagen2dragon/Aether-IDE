@@ -45,6 +45,7 @@ mod tests {
             workbench_dir: PathBuf::from("."),
             user_data_dir: PathBuf::from("."),
             session_token: None,
+            peer_id: None,
             daemon_port: 44888,
         });
         assert_eq!(host.platform_name(), "Linux (GTK3 / WebKitGTK)");

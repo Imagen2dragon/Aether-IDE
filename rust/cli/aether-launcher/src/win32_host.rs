@@ -219,6 +219,7 @@ pub mod native {
 
             // Wire Secure Message Bridge
             let token_opt = self.config.session_token.clone();
+            let peer_opt = self.config.peer_id.clone();
             let port = self.config.daemon_port;
             let workbench_path = self.config.workbench_dir.clone();
 
@@ -226,7 +227,14 @@ pub mod native {
                 move |wv: Option<ICoreWebView2>,
                       args: Option<ICoreWebView2WebMessageReceivedEventArgs>| {
                     if let (Some(wv), Some(args)) = (wv, args) {
-                        handle_web_message(&wv, &args, token_opt.as_deref(), port, &workbench_path);
+                        handle_web_message(
+                            &wv,
+                            &args,
+                            token_opt.as_deref(),
+                            peer_opt.as_deref(),
+                            port,
+                            &workbench_path,
+                        );
                     }
                     Ok(())
                 },
@@ -305,6 +313,7 @@ pub mod native {
         webview: &ICoreWebView2,
         args: &ICoreWebView2WebMessageReceivedEventArgs,
         session_token: Option<&str>,
+        peer_id: Option<&str>,
         daemon_port: u16,
         workbench_dir: &Path,
     ) {
@@ -430,7 +439,14 @@ pub mod native {
             } else if action == "FileWrite" {
                 handle_file_write(&req_id, &params, workbench_dir)
             } else {
-                dispatch_ipc(&req_id, &action, &params, session_token, daemon_port)
+                dispatch_ipc(
+                    &req_id,
+                    &action,
+                    &params,
+                    session_token,
+                    peer_id,
+                    daemon_port,
+                )
             };
 
             let reply_hstring = HSTRING::from(&reply.to_string());
@@ -542,6 +558,7 @@ pub mod native {
         action: &str,
         params: &serde_json::Value,
         session_token: Option<&str>,
+        peer_id: Option<&str>,
         daemon_port: u16,
     ) -> serde_json::Value {
         let ipc_req = match action {
@@ -816,7 +833,7 @@ pub mod native {
             }
         };
 
-        match send_daemon_ipc(ipc_req, session_token, daemon_port) {
+        match send_daemon_ipc(ipc_req, session_token, peer_id, daemon_port) {
             Ok(data) => serde_json::json!({
                 "id": req_id,
                 "action": action,
@@ -835,6 +852,7 @@ pub mod native {
     fn send_daemon_ipc(
         req: IpcRequest,
         session_token: Option<&str>,
+        peer_id: Option<&str>,
         daemon_port: u16,
     ) -> std::result::Result<serde_json::Value, String> {
         let mut stream = TcpStream::connect(format!("127.0.0.1:{}", daemon_port))
@@ -846,7 +864,7 @@ pub mod native {
         let envelope = IpcEnvelope {
             id: format!("wb-{}", uuid::Uuid::new_v4().simple()),
             session_token: session_token.map(|s| s.to_string()),
-            peer_id: None,
+            peer_id: peer_id.map(|s| s.to_string()),
             payload: IpcPayload::Request(req),
         };
 
@@ -881,10 +899,12 @@ pub mod native {
                 workbench_dir: PathBuf::from("workbench"),
                 user_data_dir: PathBuf::from("user_data"),
                 session_token: Some("secret-token-123".to_string()),
+                peer_id: Some("owner-bootstrap-test".to_string()),
                 daemon_port: 44888,
             };
             assert_eq!(config.daemon_port, 44888);
             assert_eq!(config.session_token.as_deref(), Some("secret-token-123"));
+            assert_eq!(config.peer_id.as_deref(), Some("owner-bootstrap-test"));
         }
 
         #[test]

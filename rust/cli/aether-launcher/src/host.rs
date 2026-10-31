@@ -5,6 +5,7 @@ pub struct HostConfig {
     pub workbench_dir: PathBuf,
     pub user_data_dir: PathBuf,
     pub session_token: Option<String>,
+    pub peer_id: Option<String>,
     pub daemon_port: u16,
 }
 

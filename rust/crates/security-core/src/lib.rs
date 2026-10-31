@@ -1,5 +1,6 @@
 use regex::Regex;
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -84,20 +85,21 @@ pub enum AuthVerificationResult {
     Success,
     InvalidToken,
     Expired,
+    Revoked,
     RateLimited { wait_seconds: u64 },
 }
 
 /// Robust session token store with time-to-live (TTL), rotation with grace period,
-/// and rate-limiting against brute force / timing analysis attacks.
+/// token revocation, and per-source rate-limiting against brute force attacks.
 pub struct TokenStore {
     current_token: String,
     created_at: Instant,
     ttl: Duration,
     previous_token: Option<(String, Instant)>,
     grace_period: Duration,
-    failed_attempts: u32,
+    revoked_tokens: HashSet<String>,
+    failed_attempts_by_source: HashMap<String, (u32, Instant)>,
     max_failed_attempts: u32,
-    last_failed_attempt: Option<Instant>,
     lockout_duration: Duration,
 }
 
@@ -115,9 +117,9 @@ impl TokenStore {
             ttl,
             previous_token: None,
             grace_period: Duration::from_secs(300), // 5-minute rotation grace period
-            failed_attempts: 0,
+            revoked_tokens: HashSet::new(),
+            failed_attempts_by_source: HashMap::new(),
             max_failed_attempts: 5,
-            last_failed_attempt: None,
             lockout_duration: Duration::from_secs(30),
         }
     }
@@ -137,7 +139,23 @@ impl TokenStore {
     }
 
     pub fn failed_attempts(&self) -> u32 {
-        self.failed_attempts
+        self.failed_attempts_for_source("default")
+    }
+
+    pub fn failed_attempts_for_source(&self, source: &str) -> u32 {
+        self.failed_attempts_by_source
+            .get(source)
+            .map(|(count, _)| *count)
+            .unwrap_or(0)
+    }
+
+    /// Revokes a session token immediately.
+    pub fn revoke_token(&mut self, token: impl Into<String>) {
+        self.revoked_tokens.insert(token.into());
+    }
+
+    pub fn is_revoked(&self, token: &str) -> bool {
+        self.revoked_tokens.contains(token)
     }
 
     /// Rotates the active session token, preserving the old token for the grace period.
@@ -145,25 +163,24 @@ impl TokenStore {
         self.previous_token = Some((self.current_token.clone(), Instant::now()));
         self.current_token = TokenManager::generate_session_token();
         self.created_at = Instant::now();
-        self.failed_attempts = 0;
         self.current_token.clone()
     }
 
-    /// Authenticates a token request with constant-time comparison, expiry enforcement,
-    /// and automatic brute-force lockout.
-    pub fn verify(&mut self, provided: Option<&str>) -> AuthVerificationResult {
-        // Enforce lockout if max failed attempts exceeded
-        if self.failed_attempts >= self.max_failed_attempts {
-            if let Some(last_fail) = self.last_failed_attempt {
+    /// Authenticates a token request for a specific client source.
+    pub fn verify_for_source(
+        &mut self,
+        provided: Option<&str>,
+        source: &str,
+    ) -> AuthVerificationResult {
+        // Enforce lockout if max failed attempts exceeded for this source
+        if let Some((attempts, last_fail)) = self.failed_attempts_by_source.get(source) {
+            if *attempts >= self.max_failed_attempts {
                 let elapsed = last_fail.elapsed();
                 if elapsed < self.lockout_duration {
                     let remaining = self.lockout_duration.saturating_sub(elapsed).as_secs();
                     return AuthVerificationResult::RateLimited {
                         wait_seconds: remaining.max(1),
                     };
-                } else {
-                    // Lockout window expired, reset failed counter
-                    self.failed_attempts = 0;
                 }
             }
         }
@@ -171,17 +188,23 @@ impl TokenStore {
         let token = match provided {
             Some(t) => t,
             None => {
-                self.record_failure();
+                self.record_failure(source);
                 return AuthVerificationResult::InvalidToken;
             }
         };
+
+        // Reject explicitly revoked tokens
+        if self.is_revoked(token) {
+            self.record_failure(source);
+            return AuthVerificationResult::Revoked;
+        }
 
         // Check active token
         if TokenManager::verify_token(&self.current_token, Some(token)) {
             if self.is_expired() {
                 return AuthVerificationResult::Expired;
             }
-            self.failed_attempts = 0;
+            self.failed_attempts_by_source.remove(source);
             return AuthVerificationResult::Success;
         }
 
@@ -190,18 +213,27 @@ impl TokenStore {
             if rotated_at.elapsed() <= self.grace_period
                 && TokenManager::verify_token(prev, Some(token))
             {
-                self.failed_attempts = 0;
+                self.failed_attempts_by_source.remove(source);
                 return AuthVerificationResult::Success;
             }
         }
 
-        self.record_failure();
+        self.record_failure(source);
         AuthVerificationResult::InvalidToken
     }
 
-    fn record_failure(&mut self) {
-        self.failed_attempts = self.failed_attempts.saturating_add(1);
-        self.last_failed_attempt = Some(Instant::now());
+    /// Default verification method for backwards compatibility.
+    pub fn verify(&mut self, provided: Option<&str>) -> AuthVerificationResult {
+        self.verify_for_source(provided, "default")
+    }
+
+    fn record_failure(&mut self, source: &str) {
+        let entry = self
+            .failed_attempts_by_source
+            .entry(source.to_string())
+            .or_insert((0, Instant::now()));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = Instant::now();
     }
 }
 
@@ -285,6 +317,53 @@ mod tests {
         assert_eq!(
             expired_store.verify(Some(&exp_tok)),
             AuthVerificationResult::Expired
+        );
+    }
+
+    #[test]
+    fn test_token_store_revocation() {
+        let mut store = TokenStore::new(Duration::from_secs(3600));
+        let token = store.current_token().to_string();
+
+        assert_eq!(store.verify(Some(&token)), AuthVerificationResult::Success);
+
+        // Revoke token
+        store.revoke_token(&token);
+        assert!(store.is_revoked(&token));
+        assert_eq!(store.verify(Some(&token)), AuthVerificationResult::Revoked);
+    }
+
+    #[test]
+    fn test_token_store_per_source_isolation() {
+        let mut store =
+            TokenStore::new(Duration::from_secs(3600)).with_lockout(3, Duration::from_millis(200));
+
+        let valid_token = store.current_token().to_string();
+
+        // Attacker repeatedly fails from "attacker-source"
+        assert_eq!(
+            store.verify_for_source(Some("bad-1"), "attacker-source"),
+            AuthVerificationResult::InvalidToken
+        );
+        assert_eq!(
+            store.verify_for_source(Some("bad-2"), "attacker-source"),
+            AuthVerificationResult::InvalidToken
+        );
+        assert_eq!(
+            store.verify_for_source(Some("bad-3"), "attacker-source"),
+            AuthVerificationResult::InvalidToken
+        );
+
+        // "attacker-source" is now locked out
+        match store.verify_for_source(Some(&valid_token), "attacker-source") {
+            AuthVerificationResult::RateLimited { wait_seconds: _ } => {}
+            other => panic!("Expected RateLimited for attacker, got {:?}", other),
+        }
+
+        // Legitimate client from "desktop-host" is NOT locked out!
+        assert_eq!(
+            store.verify_for_source(Some(&valid_token), "desktop-host"),
+            AuthVerificationResult::Success
         );
     }
 }

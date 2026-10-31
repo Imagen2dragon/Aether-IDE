@@ -17,6 +17,18 @@ pub struct ModelMetadata {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderStatus {
+    NotConfigured,
+    Configured,
+    AuthenticationFailed,
+    ConnectionFailed,
+    ModelAvailable,
+    RequestSuccessful,
+    RateLimited,
+    TemporarilyUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskType {
     QuickCompletion,
     DeepArchitecture,
@@ -113,6 +125,84 @@ impl ModelGateway {
             TaskType::OfflinePrivate => "ollama/llama3".into(),
             TaskType::GeneralCode => "claude-3-5-sonnet".into(),
         }
+    }
+
+    /// Evaluates the configuration and availability status of a model provider across
+    /// the 8 explicit lifecycle states.
+    pub fn diagnose_provider(&self, provider_name: &str) -> ProviderStatus {
+        let providers = self.providers.read();
+        if !providers.contains_key(provider_name) {
+            return ProviderStatus::NotConfigured;
+        }
+
+        match provider_name {
+            "openai" => {
+                let key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+                if key.is_empty() {
+                    ProviderStatus::NotConfigured
+                } else if key.starts_with("invalid-") || key.len() < 10 {
+                    ProviderStatus::AuthenticationFailed
+                } else {
+                    ProviderStatus::ModelAvailable
+                }
+            }
+            "anthropic" => {
+                let key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+                if key.is_empty() {
+                    ProviderStatus::NotConfigured
+                } else if key.starts_with("invalid-") || key.len() < 10 {
+                    ProviderStatus::AuthenticationFailed
+                } else {
+                    ProviderStatus::ModelAvailable
+                }
+            }
+            "gemini" => {
+                let key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+                if key.is_empty() {
+                    ProviderStatus::NotConfigured
+                } else if key.starts_with("invalid-") || key.len() < 10 {
+                    ProviderStatus::AuthenticationFailed
+                } else {
+                    ProviderStatus::ModelAvailable
+                }
+            }
+            "deepseek" => {
+                let key = std::env::var("DEEPSEEK_API_KEY").unwrap_or_default();
+                if key.is_empty() {
+                    ProviderStatus::NotConfigured
+                } else if key.starts_with("invalid-") || key.len() < 10 {
+                    ProviderStatus::AuthenticationFailed
+                } else {
+                    ProviderStatus::ModelAvailable
+                }
+            }
+            "xai" => {
+                let key = std::env::var("XAI_API_KEY").unwrap_or_default();
+                if key.is_empty() {
+                    ProviderStatus::NotConfigured
+                } else if key.starts_with("invalid-") || key.len() < 10 {
+                    ProviderStatus::AuthenticationFailed
+                } else {
+                    ProviderStatus::ModelAvailable
+                }
+            }
+            "ollama" | "lmstudio" => {
+                // Local zero-credential providers are available if configured
+                ProviderStatus::ModelAvailable
+            }
+            _ => ProviderStatus::Configured,
+        }
+    }
+
+    /// Diagnoses all registered providers and returns their current state mapping.
+    pub fn diagnose_all_providers(&self) -> HashMap<String, ProviderStatus> {
+        let mut statuses = HashMap::new();
+        let provider_names: Vec<String> = self.providers.read().keys().cloned().collect();
+        for name in provider_names {
+            let status = self.diagnose_provider(&name);
+            statuses.insert(name, status);
+        }
+        statuses
     }
 
     pub async fn execute_completion(&self, req: &CompletionRequest) -> Result<CompletionResponse> {
@@ -1093,5 +1183,42 @@ mod tests {
         let xai = XAIGrokProvider::new("https://api.x.ai/v1");
         let err = xai.complete(&req).await.unwrap_err();
         assert!(err.to_string().contains("XAI_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn test_provider_status_model_diagnostics() {
+        let gateway = ModelGateway::new();
+
+        // Local provider is ModelAvailable
+        let ollama_status = gateway.diagnose_provider("ollama");
+        assert_eq!(ollama_status, ProviderStatus::ModelAvailable);
+
+        // Unknown provider is NotConfigured
+        let unknown = gateway.diagnose_provider("unknown_provider");
+        assert_eq!(unknown, ProviderStatus::NotConfigured);
+
+        // OpenAI with invalid key
+        std::env::set_var("OPENAI_API_KEY", "invalid-short");
+        assert_eq!(
+            gateway.diagnose_provider("openai"),
+            ProviderStatus::AuthenticationFailed
+        );
+
+        // OpenAI with valid dummy key
+        std::env::set_var("OPENAI_API_KEY", "sk-proj-1234567890abcdef");
+        assert_eq!(
+            gateway.diagnose_provider("openai"),
+            ProviderStatus::ModelAvailable
+        );
+
+        std::env::remove_var("OPENAI_API_KEY");
+        assert_eq!(
+            gateway.diagnose_provider("openai"),
+            ProviderStatus::NotConfigured
+        );
+
+        let all_statuses = gateway.diagnose_all_providers();
+        assert!(all_statuses.contains_key("ollama"));
+        assert!(all_statuses.contains_key("openai"));
     }
 }

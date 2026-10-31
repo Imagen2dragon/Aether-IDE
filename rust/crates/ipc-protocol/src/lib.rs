@@ -227,6 +227,9 @@ pub enum IpcRequest {
     RevokePeerRole {
         peer_id: String,
     },
+    RevokeSessionToken {
+        token: String,
+    },
     SwarmAddTask {
         task_id: String,
         title: String,
