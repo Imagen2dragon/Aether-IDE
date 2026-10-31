@@ -29,7 +29,7 @@ if (-not $TargetDir) {
 $RELEASE_BIN_DIR = Join-Path $TargetDir "release"
 $STAGE_DIR = Join-Path $OutputDir "windows-x64"
 $ZIP_PACKAGE = Join-Path $OutputDir "AetherIDE-v$Version-windows-x64.zip"
-$INSTALLER_EXE = Join-Path $OutputDir "AetherIDE-v$Version-windows-x64-setup.exe"
+$INSTALLER_EXE = Join-Path $OutputDir "AetherIDE-Setup-$Version-x64.exe"
 
 $PackagingResults = [System.Collections.Generic.List[PSObject]]::new()
 
@@ -155,6 +155,7 @@ if ($PackageType -in @("installer", "all")) {
     Write-Host "`n[5/5] Checking Inno Setup Compiler..." -ForegroundColor Yellow
     $isccCandidates = @(
         "iscc",
+        (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"),
         "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
         "C:\Program Files\Inno Setup 6\ISCC.exe"
     )
@@ -223,3 +224,4 @@ $hasFailures = $PackagingResults | Where-Object { $_.Status -eq "FAILED" }
 if ($hasFailures) {
     throw "Packaging completed with failures in required targets."
 }
+

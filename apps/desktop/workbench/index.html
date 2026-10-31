@@ -1216,13 +1216,8 @@
     </div>
   </div>
 
-  <!-- Locally Bundled Scripts (Zero CDN Dependencies) -->
+  <!-- Locally Bundled Core Loader (Zero CDN Dependencies) -->
   <script src="./vs/loader.js"></script>
-  <script src="./xterm/xterm.js"></script>
-  <script src="./xterm/addon-fit.js"></script>
-  <script src="./xterm/addon-search.js"></script>
-  <script src="./xterm/addon-web-links.js"></script>
-  <script src="./cytoscape/cytoscape.min.js"></script>
 
   <script>
     // =========================================================================
@@ -1239,6 +1234,71 @@
     let terminalSessions = new Map(); // id -> { id, term, fitAddon, searchAddon, pollTimer, offset, container }
     let activeTerminalId = null;
     let nextLocalTermId = 1;
+
+    // =========================================================================
+    // DYNAMIC LAZY-LOADING INFRASTRUCTURE (Gate 2 & Gate 4)
+    // =========================================================================
+    function loadScript(src, cb) {
+      const s = document.createElement('script');
+      s.src = src;
+      s.onload = cb;
+      s.onerror = (e) => { console.error('Failed to load local script:', src, e); if (cb) cb(); };
+      document.head.appendChild(s);
+    }
+
+    function loadScriptsSequentially(srcs, cb) {
+      let i = 0;
+      function next() {
+        if (i >= srcs.length) return cb ? cb() : undefined;
+        loadScript(srcs[i++], next);
+      }
+      next();
+    }
+
+    let xtermLoaded = false;
+    let xtermLoading = false;
+    let xtermCallbacks = [];
+    function ensureXtermLoaded(cb) {
+      if (xtermLoaded || window.Terminal) {
+        xtermLoaded = true;
+        return cb ? cb() : undefined;
+      }
+      if (cb) xtermCallbacks.push(cb);
+      if (xtermLoading) return;
+      xtermLoading = true;
+      loadScriptsSequentially([
+        './xterm/xterm.js',
+        './xterm/addon-fit.js',
+        './xterm/addon-search.js',
+        './xterm/addon-web-links.js'
+      ], () => {
+        xtermLoaded = true;
+        xtermLoading = false;
+        while (xtermCallbacks.length > 0) {
+          try { (xtermCallbacks.shift())(); } catch (e) { console.error(e); }
+        }
+      });
+    }
+
+    let cytoscapeLoaded = false;
+    let cytoscapeLoading = false;
+    let cytoscapeCallbacks = [];
+    function ensureCytoscapeLoaded(cb) {
+      if (cytoscapeLoaded || window.cytoscape) {
+        cytoscapeLoaded = true;
+        return cb ? cb() : undefined;
+      }
+      if (cb) cytoscapeCallbacks.push(cb);
+      if (cytoscapeLoading) return;
+      cytoscapeLoading = true;
+      loadScript('./cytoscape/cytoscape.min.js', () => {
+        cytoscapeLoaded = true;
+        cytoscapeLoading = false;
+        while (cytoscapeCallbacks.length > 0) {
+          try { (cytoscapeCallbacks.shift())(); } catch (e) { console.error(e); }
+        }
+      });
+    }
 
     // Cytoscape Instance
     let cyInstance = null;
@@ -1540,14 +1600,8 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
       openFile('rust/crates/terminal-manager/src/conpty.rs', 'rust');
       initIpcBridge();
 
-      // Initialize primary Terminal Session & Project Brain
-      setTimeout(() => {
-        spawnNewTerminalSession();
-        initProjectBrain();
-        populatePersonas();
-        refreshMemoryNotes();
-        setupMobileMockup();
-      }, 100);
+      // Performance optimization (Gates 2, 4): Defer non-editor subsystems until tab activation
+      console.log('[PERF] monaco_editor_ready', performance.now());
     }
 
     function registerLspProviders() {
@@ -1689,16 +1743,18 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
     // ADVANCED INTERACTIVE TERMINAL STUDIO (XTERM.JS & CONPTY)
     // =========================================================================
     async function spawnNewTerminalSession(shellType) {
-      const shell = shellType || document.getElementById('term-shell-select').value || 'powershell';
-      const resp = await callIpc('TerminalSpawn', {
-        shell: shell,
-        cols: 80,
-        rows: 24,
-        cwd: null
-      });
+      ensureXtermLoaded(async () => {
+        const shell = shellType || document.getElementById('term-shell-select').value || 'powershell';
+        const resp = await callIpc('TerminalSpawn', {
+          shell: shell,
+          cols: 80,
+          rows: 24,
+          cwd: null
+        });
 
-      const sessionId = resp && resp.session_id ? resp.session_id : nextLocalTermId++;
-      createTerminalUI(sessionId, shell);
+        const sessionId = resp && resp.session_id ? resp.session_id : nextLocalTermId++;
+        createTerminalUI(sessionId, shell);
+      });
     }
 
     function createTerminalUI(sessionId, shell) {
@@ -1891,8 +1947,9 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
     // LIVING PROJECT BRAIN & CYTOSCAPE GRAPH
     // =========================================================================
     async function initProjectBrain() {
-      const container = document.getElementById('brain-canvas');
-      if (!container || !window.cytoscape) return;
+      ensureCytoscapeLoaded(() => {
+        const container = document.getElementById('brain-canvas');
+        if (!container || !window.cytoscape) return;
 
       const elements = [
         // Crates
@@ -2010,6 +2067,7 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
             ${d.path ? `<button class="btn btn-small" onclick="jumpToMonaco('${d.path}', ${d.line || 1})">Open in Monaco (Ln ${d.line || 1})</button>` : ''}
           </div>
         `;
+      });
       });
     }
 
@@ -2327,12 +2385,31 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
         setTimeout(() => editor.layout(), 50);
       }
       if (tabId === 'terminal') {
-        if (activeTerminalId && terminalSessions.has(activeTerminalId)) {
-          setTimeout(() => terminalSessions.get(activeTerminalId).fitAddon.fit(), 50);
+        ensureXtermLoaded(() => {
+          if (terminalSessions.size === 0) {
+            spawnNewTerminalSession();
+          }
+          if (activeTerminalId && terminalSessions.has(activeTerminalId)) {
+            setTimeout(() => terminalSessions.get(activeTerminalId).fitAddon.fit(), 50);
+          }
+        });
+      }
+      if (tabId === 'brain') {
+        ensureCytoscapeLoaded(() => {
+          if (!cyInstance) {
+            initProjectBrain();
+          }
+          setTimeout(() => fitGraphView(), 50);
+        });
+      }
+      if (tabId === 'agents') {
+        if (document.querySelectorAll('.persona-card').length === 0) {
+          populatePersonas();
+          refreshMemoryNotes();
         }
       }
-      if (tabId === 'brain' && cyInstance) {
-        setTimeout(() => fitGraphView(), 50);
+      if (tabId === 'mobile') {
+        setupMobileMockup();
       }
     }
 
