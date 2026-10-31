@@ -126,9 +126,15 @@ fn scan_directory(
             continue;
         }
 
-        if path.is_dir() {
+        let ft = entry.file_type()?;
+        // By security policy, skip symbolic links and reparse points during manifest generation
+        if ft.is_symlink() {
+            continue;
+        }
+
+        if ft.is_dir() {
             scan_directory(root, &path, ignore_patterns, entries)?;
-        } else if path.is_file() {
+        } else if ft.is_file() {
             let relative = path
                 .strip_prefix(root)
                 .map_err(|e| io::Error::other(e.to_string()))?

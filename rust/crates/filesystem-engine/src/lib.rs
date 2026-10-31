@@ -214,6 +214,12 @@ impl WorkspaceCapability {
         self.dir.read_to_string(&rel).map_err(AetherError::Io)
     }
 
+    /// Reads text file by relative Path anchored strictly to the workspace directory capability.
+    pub fn read_file_to_string(&self, rel_path: &Path) -> Result<String> {
+        let rel_str = rel_path.to_string_lossy();
+        self.read_file(&rel_str)
+    }
+
     /// Reads binary bytes strictly anchored to the workspace directory capability.
     pub fn read_file_bytes(&self, user_path: &str) -> Result<Vec<u8>> {
         let rel = sanitize_relative_path(user_path)?;
@@ -228,6 +234,12 @@ impl WorkspaceCapability {
         let mut buf = Vec::new();
         f.read_to_end(&mut buf).map_err(AetherError::Io)?;
         Ok(buf)
+    }
+
+    /// Reads binary bytes by relative Path anchored strictly to the workspace directory capability.
+    pub fn read_file_to_bytes(&self, rel_path: &Path) -> Result<Vec<u8>> {
+        let rel_str = rel_path.to_string_lossy();
+        self.read_file_bytes(&rel_str)
     }
 
     /// Writes content to a file inside the capability using atomic handle-level operations.
@@ -325,6 +337,71 @@ impl WorkspaceCapability {
         let mut results = Vec::new();
         self.walk_dir_cap(&PathBuf::new(), exclude_patterns, &mut results)?;
         Ok(results)
+    }
+
+    /// Recursively scans workspace files anchored to directory capability, returning paths relative to workspace root.
+    /// Skips all symbolic links, junctions, and reparse points by capability policy.
+    pub fn scan_workspace_relative_files(
+        &self,
+        exclude_patterns: &[String],
+    ) -> Result<Vec<PathBuf>> {
+        let mut results = Vec::new();
+        self.walk_dir_cap_relative(&PathBuf::new(), exclude_patterns, &mut results)?;
+        Ok(results)
+    }
+
+    fn walk_dir_cap_relative(
+        &self,
+        current_rel: &Path,
+        exclude_patterns: &[String],
+        results: &mut Vec<PathBuf>,
+    ) -> Result<()> {
+        let read_dir_result = if current_rel.as_os_str().is_empty() {
+            self.dir.read_dir(".")
+        } else {
+            self.dir.read_dir(current_rel)
+        };
+
+        let entries = match read_dir_result {
+            Ok(e) => e,
+            Err(_) => return Ok(()),
+        };
+
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_string_lossy();
+
+            if exclude_patterns
+                .iter()
+                .any(|pattern| file_name_str == *pattern || file_name_str.starts_with('.'))
+            {
+                continue;
+            }
+
+            let entry_rel = if current_rel.as_os_str().is_empty() {
+                PathBuf::from(&file_name)
+            } else {
+                current_rel.join(&file_name)
+            };
+
+            let meta = match self.dir.symlink_metadata(&entry_rel) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            // By capability policy, skip symbolic links and reparse points
+            if meta.is_symlink() {
+                continue;
+            }
+
+            if meta.is_dir() {
+                let _ = self.walk_dir_cap_relative(&entry_rel, exclude_patterns, results);
+            } else if meta.is_file() {
+                results.push(entry_rel);
+            }
+        }
+
+        Ok(())
     }
 
     fn walk_dir_cap(

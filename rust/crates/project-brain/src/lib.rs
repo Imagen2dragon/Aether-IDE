@@ -72,9 +72,45 @@ impl ProjectBrain {
 
     pub fn scan_workspace(&mut self, root: &Path) -> usize {
         let mut count = 0;
-        let mut file_paths = Vec::new();
 
-        self.collect_source_files(root, root, &mut file_paths);
+        let cap = match filesystem_engine::WorkspaceCapability::open(root) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(
+                    "ProjectBrain failed to open workspace capability at {:?}: {}",
+                    root,
+                    e
+                );
+                return 0;
+            }
+        };
+
+        let exclude_patterns = vec![
+            "target".into(),
+            "node_modules".into(),
+            "dist".into(),
+            "vs".into(),
+            "build".into(),
+            "DerivedData".into(),
+        ];
+
+        let rel_files = match cap.scan_workspace_relative_files(&exclude_patterns) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("ProjectBrain failed scanning files: {}", e);
+                return 0;
+            }
+        };
+
+        let mut file_paths = Vec::new();
+        for rel in rel_files {
+            if let Some(ext) = rel.extension().and_then(|e| e.to_str()) {
+                if matches!(ext, "rs" | "ts" | "tsx" | "js" | "jsx" | "json" | "toml") {
+                    let rel_str = rel.to_string_lossy().replace('\\', "/");
+                    file_paths.push(rel_str);
+                }
+            }
+        }
 
         for rel_str in &file_paths {
             let label = Path::new(rel_str)
@@ -116,10 +152,10 @@ impl ProjectBrain {
             count += 1;
         }
 
-        // Establish inferred dependencies across files
+        // Establish inferred dependencies across files strictly anchored to capability
         for i in 0..file_paths.len() {
-            let full_source = root.join(&file_paths[i]);
-            if let Ok(content) = std::fs::read_to_string(&full_source) {
+            let rel_p = Path::new(&file_paths[i]);
+            if let Ok(content) = cap.read_file_to_string(rel_p) {
                 for (j, path_j) in file_paths.iter().enumerate() {
                     if i != j {
                         let stem = Path::new(path_j)
@@ -145,42 +181,6 @@ impl ProjectBrain {
         }
 
         count
-    }
-
-    fn collect_source_files(&self, base_root: &Path, current_dir: &Path, acc: &mut Vec<String>) {
-        let entries = match std::fs::read_dir(current_dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-            if name.starts_with('.')
-                || name == "target"
-                || name == "node_modules"
-                || name == "dist"
-                || name == "vs"
-                || name == "build"
-                || name == "DerivedData"
-            {
-                continue;
-            }
-
-            if path.is_dir() {
-                self.collect_source_files(base_root, &path, acc);
-            } else if path.is_file() {
-                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if matches!(ext, "rs" | "ts" | "tsx" | "js" | "jsx" | "json" | "toml") {
-                        if let Ok(rel) = path.strip_prefix(base_root) {
-                            let rel_str = rel.to_string_lossy().replace('\\', "/");
-                            acc.push(rel_str);
-                        }
-                    }
-                }
-            }
-        }
     }
 
     pub fn save_memory_note(&self, note: &ProjectMemoryNote) -> Result<()> {
@@ -309,5 +309,76 @@ mod tests {
         let deleted = brain.delete_memory_note("mem-arch-01").unwrap();
         assert!(deleted);
         assert_eq!(brain.get_memory_notes().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_adversarial_brain_sentinel_isolation() {
+        let ws =
+            std::env::temp_dir().join(format!("aether_brain_ws_{}", uuid::Uuid::new_v4().simple()));
+        let outside_dir = std::env::temp_dir().join(format!(
+            "aether_brain_outside_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+
+        // Confidential outside sentinel file
+        let outside_file = outside_dir.join("outside_secret.rs");
+        std::fs::write(&outside_file, "pub fn confidential_token() {}\n").unwrap();
+
+        // Valid inside workspace files
+        let src_dir = ws.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let legit_file = src_dir.join("app.rs");
+        std::fs::write(&legit_file, "pub fn run_app() {}\n").unwrap();
+
+        // Adversary creates symlink pointing to outside confidential directory
+        let symlink_path = ws.join("adversarial_brain_symlink");
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &symlink_path.to_string_lossy(),
+                    &outside_dir.to_string_lossy(),
+                ])
+                .output();
+        }
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&outside_dir, &symlink_path);
+        }
+
+        let db = DatabaseEngine::open_in_memory().unwrap();
+        let mut brain = ProjectBrain::new(db);
+
+        let count = brain.scan_workspace(&ws);
+        assert_eq!(count, 1, "Only legitimate internal file should be indexed");
+
+        let graph = brain.get_graph();
+        // 1. Ensure outside sentinel is NOT in nodes
+        for node in &graph.nodes {
+            assert!(
+                !node.id.contains("outside"),
+                "Outside file leaked into brain nodes: {}",
+                node.id
+            );
+            assert!(
+                !node.id.contains("adversarial"),
+                "Adversarial symlink entered brain nodes: {}",
+                node.id
+            );
+        }
+
+        // 2. Ensure only app.rs is present
+        assert_eq!(graph.nodes.len(), 1);
+        assert_eq!(graph.nodes[0].id, "src/app.rs");
+
+        #[cfg(windows)]
+        let _ = std::fs::remove_dir(&symlink_path);
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&outside_dir);
     }
 }

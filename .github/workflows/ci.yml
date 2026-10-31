@@ -66,6 +66,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libsoup2.4-dev || sudo apt-get install -y libgtk-3-dev libsoup-3.0-dev
           sudo apt-get install -y libwebkit2gtk-4.1-dev || sudo apt-get install -y libwebkit2gtk-4.0-dev
+          sudo apt-get install -y dbus-x11 gnome-keyring
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
@@ -79,7 +80,7 @@ jobs:
       - name: Run Linux Tests
         run: |
           cd rust
-          cargo test --workspace
+          dbus-run-session -- cargo test --workspace || cargo test --workspace
       - name: Build Linux Binaries (Release)
         run: |
           cd rust
@@ -99,6 +100,14 @@ jobs:
           toolchain: stable
           targets: aarch64-apple-darwin
           components: clippy
+      - name: Setup Headless macOS Keychain
+        run: |
+          security create-keychain -p "" build.keychain-db || true
+          security default-keychain -s build.keychain-db
+          security unlock-keychain -p "" build.keychain-db
+          security set-keychain-settings -lut 3600 build.keychain-db
+          security list-keychains -d user -s build.keychain-db
+          security unlock-keychain -p "" ~/Library/Keychains/login.keychain-db || true
       - name: Run macOS Clippy
         run: |
           cd rust
