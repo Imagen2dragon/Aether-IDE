@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
 # AetherIDE macOS Packaging Script
 # Generates .app bundle, portable tarball, and DMG disk image for Apple Silicon (ARM64)
+# Explicitly tracks artifact generation outcomes and eliminates silent skips
 
 set -euo pipefail
 
 VERSION="${1:-0.1.0-beta.2}"
+PKG_TYPE="${2:-all}" # portable, dmg, all
+REQUIRE_ALL=false
+
+for arg in "$@"; do
+    if [ "$arg" = "--require-all" ]; then
+        REQUIRE_ALL=true
+    fi
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IDE_ROOT="$(dirname "$SCRIPT_DIR")"
 OUTPUT_DIR="${OUTPUT_DIR:-$IDE_ROOT/dist}"
@@ -15,11 +25,24 @@ RELEASE_BIN_DIR="$TARGET_DIR/release"
 
 echo "============================================================"
 echo " Packaging AetherIDE macOS ARM64 Release ($VERSION)"
+echo " Package Type Scope: $PKG_TYPE"
 echo " Output Directory: $OUTPUT_DIR"
 echo " Target Directory: $TARGET_DIR"
 echo "============================================================"
 
 mkdir -p "$OUTPUT_DIR"
+
+declare -a STATUS_FORMAT
+declare -a STATUS_PATH
+declare -a STATUS_OUTCOME
+declare -a STATUS_DETAILS
+
+record_status() {
+    STATUS_FORMAT+=("$1")
+    STATUS_PATH+=("$2")
+    STATUS_OUTCOME+=("$3")
+    STATUS_DETAILS+=("$4")
+}
 
 # 1. Verify binaries
 for bin in aether-daemon aether-cli AetherIDE; do
@@ -81,27 +104,71 @@ EOF
 
 # 3. Create Tarball Package
 TAR_PACKAGE="$OUTPUT_DIR/AetherIDE-v$VERSION-macos-arm64.tar.gz"
-tar -czf "$TAR_PACKAGE" -C "$OUTPUT_DIR/macos-arm64" AetherIDE.app
-shasum -a 256 "$TAR_PACKAGE" | awk '{print $1 "  " $2}' > "$TAR_PACKAGE.sha256"
-echo "Created macOS Tarball: $TAR_PACKAGE"
+if [ "$PKG_TYPE" = "portable" ] || [ "$PKG_TYPE" = "all" ]; then
+    echo -e "\n[1/2] Creating macOS Tarball..."
+    tar -czf "$TAR_PACKAGE" -C "$OUTPUT_DIR/macos-arm64" AetherIDE.app
+    if [ -f "$TAR_PACKAGE" ]; then
+        if command -v shasum &> /dev/null; then
+            HASH=$(shasum -a 256 "$TAR_PACKAGE" | awk '{print $1}')
+        else
+            HASH=$(sha256sum "$TAR_PACKAGE" | awk '{print $1}')
+        fi
+        echo "$HASH  $(basename "$TAR_PACKAGE")" > "$TAR_PACKAGE.sha256"
+        SIZE=$(stat -c%s "$TAR_PACKAGE" 2>/dev/null || stat -f%z "$TAR_PACKAGE")
+        record_status "macOS Tarball" "$TAR_PACKAGE" "BUILT" "Size: $SIZE bytes, SHA256: $HASH"
+    else
+        record_status "macOS Tarball" "$TAR_PACKAGE" "FAILED" "Failed to produce tarball"
+    fi
+else
+    record_status "macOS Tarball" "$TAR_PACKAGE" "NOT_REQUESTED" "Skipped by scope parameter"
+fi
 
 # 4. Create DMG if hdiutil is present
 DMG_PACKAGE="$OUTPUT_DIR/AetherIDE-v$VERSION-macos-arm64.dmg"
-if command -v hdiutil &> /dev/null; then
-    echo "Creating macOS DMG with hdiutil..."
-    DMG_STAGE="$OUTPUT_DIR/macos-arm64/dmg-stage"
-    rm -rf "$DMG_STAGE"
-    mkdir -p "$DMG_STAGE"
-    cp -r "$APP_BUNDLE" "$DMG_STAGE/"
-    ln -s /Applications "$DMG_STAGE/Applications"
-    
-    rm -f "$DMG_PACKAGE"
-    hdiutil create -volname "AetherIDE" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG_PACKAGE"
-    rm -rf "$DMG_STAGE"
-    shasum -a 256 "$DMG_PACKAGE" > "$DMG_PACKAGE.sha256"
-    echo "Created macOS DMG: $DMG_PACKAGE"
+if [ "$PKG_TYPE" = "dmg" ] || [ "$PKG_TYPE" = "all" ]; then
+    echo -e "\n[2/2] Checking DMG Creation Tools..."
+    if command -v hdiutil &> /dev/null; then
+        echo "Creating macOS DMG with hdiutil..."
+        DMG_STAGE="$OUTPUT_DIR/macos-arm64/dmg-stage"
+        rm -rf "$DMG_STAGE"
+        mkdir -p "$DMG_STAGE"
+        cp -r "$APP_BUNDLE" "$DMG_STAGE/"
+        ln -s /Applications "$DMG_STAGE/Applications"
+        
+        rm -f "$DMG_PACKAGE"
+        hdiutil create -volname "AetherIDE" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG_PACKAGE"
+        rm -rf "$DMG_STAGE"
+        if [ -f "$DMG_PACKAGE" ]; then
+            HASH=$(shasum -a 256 "$DMG_PACKAGE" | awk '{print $1}')
+            echo "$HASH  $(basename "$DMG_PACKAGE")" > "$DMG_PACKAGE.sha256"
+            SIZE=$(stat -c%s "$DMG_PACKAGE" 2>/dev/null || stat -f%z "$DMG_PACKAGE")
+            record_status "Apple DMG" "$DMG_PACKAGE" "BUILT" "Size: $SIZE bytes, SHA256: $HASH"
+        else
+            record_status "Apple DMG" "$DMG_PACKAGE" "FAILED" "hdiutil completed without output file"
+        fi
+    else
+        MSG="hdiutil not available in non-macOS environment. Staged .app bundle preserved at $APP_BUNDLE"
+        if [ "$REQUIRE_ALL" = true ] || [ "$PKG_TYPE" = "dmg" ]; then
+            record_status "Apple DMG" "$DMG_PACKAGE" "BLOCKED" "$MSG"
+            if [ "$REQUIRE_ALL" = true ]; then
+                echo "ERROR: $MSG (--require-all specified)"
+                exit 1
+            fi
+        else
+            record_status "Apple DMG" "$DMG_PACKAGE" "BLOCKED" "$MSG"
+        fi
+    fi
+else
+    record_status "Apple DMG" "$DMG_PACKAGE" "NOT_REQUESTED" "Skipped by scope parameter"
 fi
 
+# 5. Summary Matrix Table
 echo "============================================================"
-echo " macOS Packaging Complete!"
+echo " macOS Release Packaging Status Summary"
+echo "============================================================"
+printf "%-18s | %-12s | %s\n" "Format" "Outcome" "Details"
+echo "------------------------------------------------------------"
+for i in "${!STATUS_FORMAT[@]}"; do
+    printf "%-18s | %-12s | %s\n" "${STATUS_FORMAT[$i]}" "${STATUS_OUTCOME[$i]}" "${STATUS_DETAILS[$i]}"
+done
 echo "============================================================"
