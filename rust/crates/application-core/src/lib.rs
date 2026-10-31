@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
 
+pub const AETHER_VERSION: &str = "0.1.0-beta.2";
+pub const AETHER_RELEASE_CHANNEL: &str = "beta.2";
+
 #[derive(Error, Debug)]
 pub enum AetherError {
     #[error("I/O error: {0}")]

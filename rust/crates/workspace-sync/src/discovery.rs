@@ -17,7 +17,7 @@ impl SyncServiceInfo {
             instance_name: instance_name.to_string(),
             host: host.to_string(),
             port,
-            version: "0.1.0-alpha".to_string(),
+            version: application_core::AETHER_VERSION.to_string(),
             session_id: session_id.to_string(),
         }
     }
@@ -42,6 +42,6 @@ mod tests {
         let records = info.to_txt_records();
         assert!(records
             .iter()
-            .any(|(k, v)| k == "version" && v == "0.1.0-alpha"));
+            .any(|(k, v)| k == "version" && v == application_core::AETHER_VERSION));
     }
 }

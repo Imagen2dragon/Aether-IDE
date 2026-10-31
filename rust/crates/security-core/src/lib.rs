@@ -80,6 +80,60 @@ impl TokenManager {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SessionType {
+    DesktopOwner,
+    LocalDesktopClient,
+    RemoteCompanion,
+    Collaborator,
+}
+
+impl std::fmt::Display for SessionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DesktopOwner => write!(f, "DesktopOwner"),
+            Self::LocalDesktopClient => write!(f, "LocalDesktopClient"),
+            Self::RemoteCompanion => write!(f, "RemoteCompanion"),
+            Self::Collaborator => write!(f, "Collaborator"),
+        }
+    }
+}
+
+/// Server-controlled session record binding an authenticated token to a cryptographic identity and role.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionRecord {
+    pub session_token: String,
+    pub peer_id: String,
+    pub role: String,
+    pub session_type: SessionType,
+    #[serde(skip, default = "Instant::now")]
+    pub created_at: Instant,
+    pub ttl: Duration,
+}
+
+impl SessionRecord {
+    pub fn new(
+        session_token: impl Into<String>,
+        peer_id: impl Into<String>,
+        role: impl Into<String>,
+        session_type: SessionType,
+        ttl: Duration,
+    ) -> Self {
+        Self {
+            session_token: session_token.into(),
+            peer_id: peer_id.into(),
+            role: role.into(),
+            session_type,
+            created_at: Instant::now(),
+            ttl,
+        }
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.created_at.elapsed() > self.ttl
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthVerificationResult {
     Success,
@@ -90,7 +144,7 @@ pub enum AuthVerificationResult {
 }
 
 /// Robust session token store with time-to-live (TTL), rotation with grace period,
-/// token revocation, and per-source rate-limiting against brute force attacks.
+/// token revocation, per-source rate-limiting, and server-controlled session binding.
 pub struct TokenStore {
     current_token: String,
     created_at: Instant,
@@ -101,6 +155,8 @@ pub struct TokenStore {
     failed_attempts_by_source: HashMap<String, (u32, Instant)>,
     max_failed_attempts: u32,
     lockout_duration: Duration,
+    owner_peer_id: String,
+    sessions: HashMap<String, SessionRecord>,
 }
 
 impl Default for TokenStore {
@@ -111,8 +167,26 @@ impl Default for TokenStore {
 
 impl TokenStore {
     pub fn new(ttl: Duration) -> Self {
+        Self::new_with_owner(ttl, "owner-default")
+    }
+
+    pub fn new_with_owner(ttl: Duration, owner_peer_id: impl Into<String>) -> Self {
+        let current_token = TokenManager::generate_session_token();
+        let owner_id = owner_peer_id.into();
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            current_token.clone(),
+            SessionRecord::new(
+                &current_token,
+                &owner_id,
+                "Owner",
+                SessionType::DesktopOwner,
+                ttl,
+            ),
+        );
+
         Self {
-            current_token: TokenManager::generate_session_token(),
+            current_token,
             created_at: Instant::now(),
             ttl,
             previous_token: None,
@@ -121,6 +195,8 @@ impl TokenStore {
             failed_attempts_by_source: HashMap::new(),
             max_failed_attempts: 5,
             lockout_duration: Duration::from_secs(30),
+            owner_peer_id: owner_id,
+            sessions,
         }
     }
 
@@ -132,6 +208,10 @@ impl TokenStore {
 
     pub fn current_token(&self) -> &str {
         &self.current_token
+    }
+
+    pub fn owner_peer_id(&self) -> &str {
+        &self.owner_peer_id
     }
 
     pub fn is_expired(&self) -> bool {
@@ -149,21 +229,107 @@ impl TokenStore {
             .unwrap_or(0)
     }
 
-    /// Revokes a session token immediately.
+    /// Registers a server-controlled session record binding token to identity and role.
+    pub fn register_session(&mut self, session: SessionRecord) {
+        self.sessions.insert(session.session_token.clone(), session);
+    }
+
+    /// Retrieves an active session record by its token.
+    pub fn get_session(&self, token: &str) -> Option<&SessionRecord> {
+        self.sessions.get(token)
+    }
+
+    /// Revokes a session token immediately and purges its session record.
     pub fn revoke_token(&mut self, token: impl Into<String>) {
-        self.revoked_tokens.insert(token.into());
+        let t = token.into();
+        self.sessions.remove(&t);
+        self.revoked_tokens.insert(t);
+    }
+
+    /// Revokes all active sessions bound to a specific peer ID.
+    pub fn revoke_peer_sessions(&mut self, peer_id: &str) -> Vec<String> {
+        let mut revoked = Vec::new();
+        let tokens_to_revoke: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.peer_id == peer_id)
+            .map(|(t, _)| t.clone())
+            .collect();
+
+        for token in tokens_to_revoke {
+            self.revoke_token(&token);
+            revoked.push(token);
+        }
+        revoked
     }
 
     pub fn is_revoked(&self, token: &str) -> bool {
         self.revoked_tokens.contains(token)
     }
 
-    /// Rotates the active session token, preserving the old token for the grace period.
+    /// Rotates the active owner session token, preserving the old token for the grace period
+    /// and updating the authoritative server-side session registry.
     pub fn rotate_token(&mut self) -> String {
         self.previous_token = Some((self.current_token.clone(), Instant::now()));
         self.current_token = TokenManager::generate_session_token();
         self.created_at = Instant::now();
+
+        // Update server-side session registry with new active owner session
+        let new_owner_session = SessionRecord::new(
+            &self.current_token,
+            &self.owner_peer_id,
+            "Owner",
+            SessionType::DesktopOwner,
+            self.ttl,
+        );
+        self.sessions
+            .insert(self.current_token.clone(), new_owner_session);
+
         self.current_token.clone()
+    }
+
+    /// Authenticates a token request and returns the authoritative server-side SessionRecord.
+    pub fn authenticate_session(
+        &mut self,
+        provided: Option<&str>,
+        source: &str,
+    ) -> (AuthVerificationResult, Option<SessionRecord>) {
+        let verify_result = self.verify_for_source(provided, source);
+        if verify_result != AuthVerificationResult::Success {
+            return (verify_result, None);
+        }
+
+        let token = match provided {
+            Some(t) => t,
+            None => return (AuthVerificationResult::InvalidToken, None),
+        };
+
+        // First check explicit session registry
+        if let Some(session) = self.sessions.get(token) {
+            if session.is_expired() {
+                return (AuthVerificationResult::Expired, None);
+            }
+            return (AuthVerificationResult::Success, Some(session.clone()));
+        }
+
+        // Check if token matches active or grace-period owner token
+        let is_owner_match = TokenManager::verify_token(&self.current_token, Some(token))
+            || self.previous_token.as_ref().is_some_and(|(prev, rot)| {
+                rot.elapsed() <= self.grace_period && TokenManager::verify_token(prev, Some(token))
+            });
+
+        if is_owner_match {
+            let owner_record = SessionRecord::new(
+                token,
+                &self.owner_peer_id,
+                "Owner",
+                SessionType::DesktopOwner,
+                self.ttl,
+            );
+            return (AuthVerificationResult::Success, Some(owner_record));
+        }
+
+        (AuthVerificationResult::InvalidToken, None)
     }
 
     /// Authenticates a token request for a specific client source.
@@ -202,6 +368,15 @@ impl TokenStore {
         // Check active token
         if TokenManager::verify_token(&self.current_token, Some(token)) {
             if self.is_expired() {
+                return AuthVerificationResult::Expired;
+            }
+            self.failed_attempts_by_source.remove(source);
+            return AuthVerificationResult::Success;
+        }
+
+        // Check registered sessions
+        if let Some(session) = self.sessions.get(token) {
+            if session.is_expired() {
                 return AuthVerificationResult::Expired;
             }
             self.failed_attempts_by_source.remove(source);
@@ -365,5 +540,76 @@ mod tests {
             store.verify_for_source(Some(&valid_token), "desktop-host"),
             AuthVerificationResult::Success
         );
+    }
+
+    #[test]
+    fn test_server_controlled_session_binding() {
+        let mut store = TokenStore::new_with_owner(Duration::from_secs(3600), "desktop-owner-uuid");
+        let owner_token = store.current_token().to_string();
+
+        // Owner authenticates
+        let (auth, session) = store.authenticate_session(Some(&owner_token), "desktop-ui");
+        assert_eq!(auth, AuthVerificationResult::Success);
+        let session = session.expect("Owner session record must exist");
+        assert_eq!(session.peer_id, "desktop-owner-uuid");
+        assert_eq!(session.role, "Owner");
+        assert_eq!(session.session_type, SessionType::DesktopOwner);
+
+        // Register a distinct Collaborator session with Editor role
+        let editor_token = "collab-editor-token-123456";
+        let editor_session = SessionRecord::new(
+            editor_token,
+            "collab-alice",
+            "Editor",
+            SessionType::Collaborator,
+            Duration::from_secs(3600),
+        );
+        store.register_session(editor_session);
+
+        // Register a distinct Remote Companion session with Viewer role
+        let companion_token = "companion-viewer-token-654321";
+        let companion_session = SessionRecord::new(
+            companion_token,
+            "ipad-companion",
+            "Viewer",
+            SessionType::RemoteCompanion,
+            Duration::from_secs(3600),
+        );
+        store.register_session(companion_session);
+
+        // Authenticate Editor
+        let (auth, session) = store.authenticate_session(Some(editor_token), "collab-client");
+        assert_eq!(auth, AuthVerificationResult::Success);
+        let session = session.expect("Editor session record must exist");
+        assert_eq!(session.peer_id, "collab-alice");
+        assert_eq!(session.role, "Editor");
+        assert_eq!(session.session_type, SessionType::Collaborator);
+
+        // Authenticate Companion Viewer
+        let (auth, session) = store.authenticate_session(Some(companion_token), "mobile-ws");
+        assert_eq!(auth, AuthVerificationResult::Success);
+        let session = session.expect("Viewer session record must exist");
+        assert_eq!(session.peer_id, "ipad-companion");
+        assert_eq!(session.role, "Viewer");
+        assert_eq!(session.session_type, SessionType::RemoteCompanion);
+
+        // Rotate owner token preserves owner binding
+        let new_owner_tok = store.rotate_token();
+        let (auth, session) = store.authenticate_session(Some(&new_owner_tok), "desktop-ui");
+        assert_eq!(auth, AuthVerificationResult::Success);
+        let session = session.expect("Rotated owner session must exist");
+        assert_eq!(session.peer_id, "desktop-owner-uuid");
+        assert_eq!(session.role, "Owner");
+
+        // Grace period old owner token still resolves to Owner
+        let (auth, session) = store.authenticate_session(Some(&owner_token), "desktop-ui");
+        assert_eq!(auth, AuthVerificationResult::Success);
+        assert_eq!(session.unwrap().peer_id, "desktop-owner-uuid");
+
+        // Revoke companion session
+        store.revoke_token(companion_token);
+        let (auth, session) = store.authenticate_session(Some(companion_token), "mobile-ws");
+        assert_eq!(auth, AuthVerificationResult::Revoked);
+        assert!(session.is_none());
     }
 }

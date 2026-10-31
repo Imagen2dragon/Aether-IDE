@@ -35,7 +35,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             || args[0] == "agent"
             || args[0] == "mobile")
     {
-        let cli_path = exe_dir.join("bin").join("aether-cli.exe");
+        let cli_bin = if cfg!(windows) {
+            "aether-cli.exe"
+        } else {
+            "aether-cli"
+        };
+        let cli_path = exe_dir.join("bin").join(cli_bin);
         if cli_path.exists() {
             let status = Command::new(&cli_path).args(&args).status()?;
             std::process::exit(status.code().unwrap_or(0));
@@ -44,7 +49,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("============================================================");
     println!(" AetherIDE — Production AI-Native Software Engineering Studio");
-    println!(" Version: v0.1.0-alpha (Standalone Windows x64 Distribution)");
+    println!(
+        " Version: v{} (Desktop Distribution)",
+        application_core::AETHER_VERSION
+    );
     println!("============================================================\n");
 
     // 1. Ensure Daemon is Running
@@ -53,7 +61,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(" [✓] Aether Daemon: Active on 127.0.0.1:44888");
     } else {
         println!(" [*] Starting Aether Native Daemon in background...");
-        let daemon_path = exe_dir.join("bin").join("aether-daemon.exe");
+        let daemon_bin = if cfg!(windows) {
+            "aether-daemon.exe"
+        } else {
+            "aether-daemon"
+        };
+        let daemon_path = exe_dir.join("bin").join(daemon_bin);
         if !daemon_path.exists() {
             eprintln!("Error: aether-daemon binary not found at {:?}", daemon_path);
             return Err("Missing daemon binary".into());
@@ -92,32 +105,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 2. Read Session Token
+    // 2. Read Session Identity from desktop_bootstrap.json
     let data_dir = if let Ok(appdata) = env::var("LOCALAPPDATA") {
         PathBuf::from(appdata).join("AetherIDE")
+    } else if let Ok(home) = env::var("HOME") {
+        PathBuf::from(home).join(".aether")
     } else {
         PathBuf::from(".").join(".aether")
     };
-    let token_file = data_dir.join("daemon_session.token");
-    if let Ok(token) = std::fs::read_to_string(&token_file) {
-        println!(
-            " [✓] Daemon Session Token verified ({} chars)",
-            token.trim().len()
-        );
-    }
-
-    // 3. Launch Standalone Desktop Workbench
-    println!(" [*] Launching AetherIDE Standalone Desktop Workbench...");
-    let workbench_dir = exe_dir.join("workbench");
-    let workbench_html = workbench_dir.join("index.html");
-    let electron_exe = workbench_dir.join("electron.exe");
-    let electron_main = workbench_dir.join("dist").join("main.js");
-
-    if electron_exe.exists() && electron_main.exists() {
-        println!(" [✓] Launching bundled Electron runtime...");
-        Command::new(electron_exe).arg(electron_main).spawn()?;
-        return Ok(());
-    }
 
     let bootstrap_file = data_dir.join("desktop_bootstrap.json");
     let (session_token, peer_id) = if let Ok(data) = std::fs::read_to_string(&bootstrap_file) {
@@ -134,11 +129,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (None, None)
         }
     } else {
-        let token = std::fs::read_to_string(&token_file)
-            .ok()
-            .map(|s| s.trim().to_string());
-        (token, None)
+        (None, None)
     };
+
+    if let Some(token) = &session_token {
+        println!(
+            " [✓] Authenticated Desktop Owner Session Verified ({} chars, Peer: {})",
+            token.len(),
+            peer_id.as_deref().unwrap_or("unknown")
+        );
+    } else {
+        println!(" [!] No active session token found; daemon will enforce authorization.");
+    }
+
+    // 3. Launch Standalone Desktop Workbench
+    println!(" [*] Launching AetherIDE Standalone Desktop Workbench...");
+    let workbench_dir = exe_dir.join("workbench");
+    let workbench_html = workbench_dir.join("index.html");
+    let electron_exe = workbench_dir.join("electron.exe");
+    let electron_main = workbench_dir.join("dist").join("main.js");
+
+    let use_electron = args.iter().any(|a| a == "--electron");
+    if use_electron && electron_exe.exists() && electron_main.exists() {
+        println!(" [✓] Launching bundled Electron runtime (--electron requested)...");
+        Command::new(electron_exe).arg(electron_main).spawn()?;
+        return Ok(());
+    }
 
     // Native Desktop Host execution via cross-platform DesktopHost trait
     #[cfg(windows)]
@@ -160,9 +176,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(e) => {
                 eprintln!(
-                    "Warning: Native Win32 WebView2 Host failed ({:?}); attempting app-mode fallback...",
+                    "Warning: Native Win32 WebView2 Host failed ({:?}); attempting fallback...",
                     e
                 );
+                if electron_exe.exists() && electron_main.exists() {
+                    println!(" [✓] Attempting fallback to bundled Electron runtime...");
+                    if Command::new(&electron_exe)
+                        .arg(&electron_main)
+                        .spawn()
+                        .is_ok()
+                    {
+                        return Ok(());
+                    }
+                }
             }
         }
     }

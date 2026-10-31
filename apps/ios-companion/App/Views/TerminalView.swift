@@ -10,7 +10,7 @@ struct TerminalView: View {
     @State private var terminalLogs = [
         "Aether Remote Terminal Session #1 (PowerShell)",
         "Connected to Windows 11 Desktop (127.0.0.1:44888)",
-        "aether-daemon v0.1.0-alpha active",
+        "aether-daemon v0.1.0-beta.2 active",
         "$ cargo --version",
         "cargo 1.93.1 (083ac5135 2025-12-15)",
         "$ git status",

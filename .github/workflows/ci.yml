@@ -73,11 +73,11 @@ jobs:
       - name: Run Linux Tests
         run: |
           cd rust
-          cargo test --workspace --exclude aether-launcher
+          cargo test --workspace
       - name: Build Linux Binaries (Release)
         run: |
           cd rust
-          cargo build --workspace --exclude aether-launcher --release
+          cargo build --workspace --release
 
   macos-build:
     name: macOS ARM64 (Apple Silicon) Build & Test
@@ -98,8 +98,8 @@ jobs:
       - name: Run macOS Tests
         run: |
           cd rust
-          cargo test --workspace --exclude aether-launcher
+          cargo test --workspace
       - name: Build macOS Binaries (Release)
         run: |
           cd rust
-          cargo build --workspace --exclude aether-launcher --release
+          cargo build --workspace --release

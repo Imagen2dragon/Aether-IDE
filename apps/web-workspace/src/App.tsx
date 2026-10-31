@@ -24,7 +24,7 @@ export function App() {
       <header style={{ height: 44, background: '#070a12', borderBottom: '1px solid #1e293b', display: 'flex', alignItems: 'center', padding: '0 16px', justifyContent: 'space-between' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <span style={{ fontWeight: 800, letterSpacing: 1.2, color: '#38bdf8', fontSize: 16 }}>AETHER // IDE</span>
-          <span style={{ fontSize: 12, padding: '2px 8px', background: '#1e293b', borderRadius: 4, color: '#94a3b8' }}>v0.1.0-alpha Web</span>
+          <span style={{ fontSize: 12, padding: '2px 8px', background: '#1e293b', borderRadius: 4, color: '#94a3b8' }}>v0.1.0-beta.2 Web</span>
         </div>
         <div style={{ display: 'flex', gap: 16, fontSize: 13 }}>
           <button onClick={() => setActiveTab('editor')} style={{ background: 'none', border: 'none', color: activeTab === 'editor' ? '#38bdf8' : '#94a3b8', cursor: 'pointer', fontWeight: 600 }}>Editor</button>
@@ -67,7 +67,7 @@ export function App() {
                 <span style={{ color: '#38bdf8', borderBottom: '2px solid #38bdf8', paddingBottom: 2 }}>rust/services/aether-daemon/src/main.rs</span>
               </div>
               <div style={{ flex: 1, background: '#090d16', padding: 16, fontFamily: 'monospace', fontSize: 13, lineHeight: '20px', color: '#e2e8f0', whiteSpace: 'pre-wrap', border: '1px solid #1e293b', borderTop: 'none' }}>
-{`// AetherIDE Native Daemon v0.1.0-alpha
+{`// AetherIDE Native Daemon v0.1.0-beta.2
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().init();
