@@ -16,6 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
+#[allow(dead_code)]
 static PIPE_CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static TCP_CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -735,9 +736,11 @@ async fn handle_ipc_envelope(
                 }
                 #[cfg(not(windows))]
                 {
+                    let shell_name = shell.unwrap_or_else(|| "bash".to_string());
+                    let _ = (cols, rows);
                     let info = state.terminal_manager.create_session(
                         "Terminal",
-                        "bash",
+                        &shell_name,
                         cwd.map(PathBuf::from),
                     );
                     IpcResponse::ok(serde_json::to_value(info).unwrap())
