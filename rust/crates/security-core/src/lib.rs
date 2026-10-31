@@ -84,6 +84,7 @@ impl TokenManager {
 // Platform-Protected Credential Provisioning (DPAPI / OS-Bound Keyring Storage)
 // ============================================================================
 
+#[cfg(windows)]
 use std::path::PathBuf;
 use std::sync::Arc;
 
