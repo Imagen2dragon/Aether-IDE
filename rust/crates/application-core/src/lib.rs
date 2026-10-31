@@ -1,3 +1,7 @@
+pub mod update;
+
+pub use update::{AetherUpdateManifest, UpdateVerifier};
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;

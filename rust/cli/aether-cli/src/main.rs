@@ -84,6 +84,102 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
             println!("Agent Execution:\n{}", serde_json::to_string_pretty(&resp)?);
         }
+        "storage" => {
+            let sub = args.get(2).map(|s| s.as_str()).unwrap_or("status");
+            let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+            match sub {
+                "audit" | "report" | "status" => {
+                    let report = diagnostics::StorageAuditor::audit(&root);
+                    println!("╔════════════════════════════════════════════════════════════════╗");
+                    println!("║               AETHERIDE STORAGE AUDIT REPORT                   ║");
+                    println!("╠════════════════════════════════════════════════════════════════╣");
+                    println!(
+                        "║ In-Tree Build Output:   {:>8.2} GB ({})",
+                        report.in_tree_target_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                        report.in_tree_target_path
+                    );
+                    println!(
+                        "║ External Build Cache:   {:>8.2} GB ({})",
+                        report.external_cache_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                        report.external_cache_path
+                    );
+                    println!(
+                        "║ Node Modules Footprint: {:>8.2} MB",
+                        report.node_modules_bytes as f64 / (1024.0 * 1024.0)
+                    );
+                    println!(
+                        "║ Release Distribution:   {:>8.2} MB",
+                        report.dist_bytes as f64 / (1024.0 * 1024.0)
+                    );
+                    println!("╟────────────────────────────────────────────────────────────────╢");
+                    println!(
+                        "║ Total Consumed Storage: {:>8.2} GB (Budget: 6.00 GB, Warn: 8.00 GB)",
+                        report.total_consumed_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                    );
+                    println!(
+                        "║ Reclaimable Space:      {:>8.2} GB",
+                        report.reclaimable_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                    );
+                    println!("╟────────────────────────────────────────────────────────────────╢");
+                    println!("║ Active Cargo Cache:     {}", report.active_cache_dir);
+                    println!("╠════════════════════════════════════════════════════════════════╣");
+                    println!("║ Recommendations:");
+                    for rec in &report.recommendations {
+                        println!("║  • {}", rec);
+                    }
+                    println!("╚════════════════════════════════════════════════════════════════╝");
+                }
+                "clean" => {
+                    let is_apply = args.iter().any(|a| a == "--apply");
+                    let mut plan = diagnostics::StorageAuditor::plan_cleanup(&root);
+
+                    if !is_apply {
+                        println!("🔍 STORAGE CLEANUP PREVIEW (--dry-run)");
+                        println!("The following generated build artifacts are eligible for safe removal:");
+                        for item in &plan.items_to_remove {
+                            println!("  [REMOVABLE] {}", item);
+                        }
+                        println!(
+                            "\nTotal space to reclaim: {:.2} GB",
+                            plan.total_bytes_to_reclaim as f64 / (1024.0 * 1024.0 * 1024.0)
+                        );
+                        println!("Note: Source code, .git, and project databases are permanently protected.");
+                        println!("To execute cleanup, run: aether-cli storage clean --apply");
+                    } else {
+                        println!("⚡ EXECUTING STORAGE CLEANUP (--apply)...");
+                        match diagnostics::StorageAuditor::execute_cleanup(&mut plan) {
+                            Ok(reclaimed) => {
+                                println!(
+                                    "✅ Cleaned successfully! Reclaimed {:.2} GB.",
+                                    reclaimed as f64 / (1024.0 * 1024.0 * 1024.0)
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("❌ Cleanup error: {}", e);
+                            }
+                        }
+                    }
+                }
+                "configure" => {
+                    let ext = diagnostics::StorageAuditor::get_external_cache_base();
+                    println!("AetherIDE Storage Configuration:");
+                    println!("  Configured External Cache Base: {}", ext.display());
+                    println!(
+                        "  Active CARGO_TARGET_DIR: {}",
+                        diagnostics::StorageAuditor::get_active_cargo_target_dir().display()
+                    );
+                    println!("\nTo persist CARGO_TARGET_DIR for all builds in this shell:");
+                    println!(
+                        "  $env:CARGO_TARGET_DIR = \"{}\"",
+                        ext.join("aetheride").join("windows-x64").display()
+                    );
+                }
+                _ => {
+                    println!("Usage: aether-cli storage [audit|status|report|clean --dry-run|clean --apply|configure]");
+                }
+            }
+        }
         "mobile" => {
             let sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
             if sub == "create" {
@@ -124,6 +220,13 @@ fn print_usage() {
     println!("  aether-cli search <symbol>         # Search codebase symbols in SQLite FTS5 index");
     println!("  aether-cli agent <role> <prompt>   # Launch an autonomous agent task");
     println!("  aether-cli mobile create <name>    # Scaffold a production Expo/React Native app");
+    println!("  aether-cli storage audit           # Inspect build cache and storage breakdown");
+    println!(
+        "  aether-cli storage clean --dry-run # Preview safe cleanup of generated build outputs"
+    );
+    println!(
+        "  aether-cli storage clean --apply   # Reclaim storage and purge in-tree target caches"
+    );
 }
 
 fn get_session_token() -> Option<String> {

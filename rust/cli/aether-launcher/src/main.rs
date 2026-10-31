@@ -1,4 +1,9 @@
+pub mod host;
+pub mod linux_host;
+pub mod macos_host;
+#[cfg(windows)]
 mod webview2_runtime;
+#[cfg(windows)]
 mod win32_host;
 
 use std::env;
@@ -114,7 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Gate 3 (P0): Primary True Native HWND-Embedded WebView2 Host
+    // Native Desktop Host execution via cross-platform DesktopHost trait
     #[cfg(windows)]
     {
         println!(" [✓] Initializing True Native Win32 + Microsoft WebView2 Embedded Host...");
@@ -122,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok()
             .map(|s| s.trim().to_string());
 
-        let host_config = win32_host::native::HostConfig {
+        let host_config = host::HostConfig {
             workbench_dir: workbench_dir.clone(),
             user_data_dir: data_dir.clone(),
             session_token,
@@ -143,24 +148,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Fallback: Detect and launch external Microsoft WebView2 App Host
-    let webview2 = webview2_runtime::detect_webview2_runtime();
-    if webview2.is_available {
-        let ver = webview2.version.as_deref().unwrap_or("Evergreen");
-        println!(
-            " [✓] Starting Fallback Microsoft WebView2 App Host (version: {})...",
-            ver
-        );
-        match webview2_runtime::launch_webview2_host(&webview2, &workbench_html, &data_dir) {
-            Ok(_) => {
-                println!("\nAetherIDE Environment Ready. Press Ctrl+C or close window to exit.");
-                return Ok(());
-            }
-            Err(e) => {
-                eprintln!(
-                    "Warning: WebView2 fallback launch failed ({}); attempting default browser...",
-                    e
-                );
+    #[cfg(target_os = "linux")]
+    {
+        use host::DesktopHost;
+        let session_token = std::fs::read_to_string(&token_file)
+            .ok()
+            .map(|s| s.trim().to_string());
+        let host_config = host::HostConfig {
+            workbench_dir: workbench_dir.clone(),
+            user_data_dir: data_dir.clone(),
+            session_token,
+            daemon_port: 44888,
+        };
+        let host = linux_host::LinuxGtkHost::new(host_config);
+        if let Err(e) = host.run() {
+            eprintln!("Warning: Linux GTK host returned: {}", e);
+        } else {
+            return Ok(());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use host::DesktopHost;
+        let session_token = std::fs::read_to_string(&token_file)
+            .ok()
+            .map(|s| s.trim().to_string());
+        let host_config = host::HostConfig {
+            workbench_dir: workbench_dir.clone(),
+            user_data_dir: data_dir.clone(),
+            session_token,
+            daemon_port: 44888,
+        };
+        let host = macos_host::MacWkWebViewHost::new(host_config);
+        if let Err(e) = host.run() {
+            eprintln!("Warning: macOS WKWebView host returned: {}", e);
+        } else {
+            return Ok(());
+        }
+    }
+
+    // Fallback on Windows: Detect and launch external Microsoft WebView2 App Host
+    #[cfg(windows)]
+    {
+        let webview2 = webview2_runtime::detect_webview2_runtime();
+        if webview2.is_available {
+            let ver = webview2.version.as_deref().unwrap_or("Evergreen");
+            println!(
+                " [✓] Starting Fallback Microsoft WebView2 App Host (version: {})...",
+                ver
+            );
+            match webview2_runtime::launch_webview2_host(&webview2, &workbench_html, &data_dir) {
+                Ok(_) => {
+                    println!(
+                        "\nAetherIDE Environment Ready. Press Ctrl+C or close window to exit."
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: WebView2 fallback launch failed ({}); attempting default browser...",
+                        e
+                    );
+                }
             }
         }
     }

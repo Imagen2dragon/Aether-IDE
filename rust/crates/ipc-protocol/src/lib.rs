@@ -175,6 +175,64 @@ pub enum IpcRequest {
         local_manifest: serde_json::Value,
         remote_manifest: serde_json::Value,
     },
+    CrdtApplyUpdate {
+        doc_id: String,
+        update_base64: String,
+        peer_id: String,
+        role: String,
+    },
+    CrdtGetDoc {
+        doc_id: String,
+    },
+    CrdtGetStateVector {
+        doc_id: String,
+    },
+    CrdtGetDiff {
+        doc_id: String,
+        state_vector_base64: String,
+    },
+    UpdatePresence {
+        peer_id: String,
+        display_name: String,
+        user_color: String,
+        current_file: Option<String>,
+        line: Option<u32>,
+        col: Option<u32>,
+    },
+    GetPresence {
+        file_path: Option<String>,
+    },
+    SwarmAddTask {
+        task_id: String,
+        title: String,
+        description: String,
+        persona: String,
+        dependencies: Vec<String>,
+    },
+    SwarmListTasks,
+    SwarmGetReadyTasks,
+    SwarmSendMessage {
+        sender: String,
+        recipient: String,
+        task_id: String,
+        message_type: String,
+        payload: String,
+    },
+    SwarmGetMessages {
+        persona: Option<String>,
+        task_id: Option<String>,
+    },
+    ThreeWayMerge {
+        base: String,
+        ours: String,
+        theirs: String,
+    },
+    ApplyMergeResolution {
+        base: String,
+        ours: String,
+        theirs: String,
+        resolutions: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

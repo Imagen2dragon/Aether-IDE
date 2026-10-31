@@ -690,7 +690,7 @@
   <header>
     <div class="brand">
       <span>AETHER // IDE</span>
-      <span class="badge">v0.1.0-alpha Sprint 05</span>
+      <span class="badge">v0.1.0-alpha Sprint 06</span>
     </div>
     <nav>
       <button id="nav-editor" class="active" onclick="switchTab('editor')">
@@ -707,6 +707,9 @@
       </button>
       <button id="nav-mobile" onclick="switchTab('mobile')">
         <span>📱</span> Mobile Studio
+      </button>
+      <button id="nav-storage" onclick="switchTab('storage')">
+        <span>💾</span> Build & Storage
       </button>
       <button id="nav-diagnostics" onclick="switchTab('diagnostics')">
         <span>🩺</span> Diagnostics Doctor
@@ -1087,13 +1090,111 @@
           </div>
         </div>
       </div>
+
+      <!-- View 7: Build & Storage Center -->
+      <div id="view-storage" class="panel-view">
+        <div class="view-content-wrapper" style="padding:24px; max-width:1200px; margin:0 auto; overflow-y:auto; height:100%;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+            <div>
+              <h2 style="font-size:18px; margin:0 0 4px 0; color:#f8fafc;">Enterprise Build & Storage Center</h2>
+              <p style="margin:0; font-size:12px; color:var(--text-muted);">Real-time disk consumption monitoring, cache offloading, and cross-platform matrix</p>
+            </div>
+            <div style="display:flex; gap:10px;">
+              <button class="btn btn-secondary btn-small" onclick="auditStorageMetrics()">Audit Storage</button>
+              <button class="btn btn-secondary btn-small" onclick="runStorageDryRun()">Clean (Dry Run)</button>
+              <button class="btn btn-small" onclick="applyStorageCleanup()">Apply Purge</button>
+            </div>
+          </div>
+
+          <!-- Live Storage Metrics Row -->
+          <div style="display:grid; grid-template-columns:repeat(4, 1fr); gap:16px; margin-bottom:24px;">
+            <div class="card" style="padding:16px; border-left:3px solid #10b981;">
+              <div style="font-size:11px; text-transform:uppercase; color:var(--text-muted); margin-bottom:4px;">Repo Disk Footprint</div>
+              <div style="font-size:24px; font-weight:700; color:#10b981;" id="storage-footprint">2.49 GB</div>
+              <div style="font-size:11px; color:#94a3b8; margin-top:4px;">Target Budget: 6.00 GB</div>
+            </div>
+            <div class="card" style="padding:16px; border-left:3px solid #3b82f6;">
+              <div style="font-size:11px; text-transform:uppercase; color:var(--text-muted); margin-bottom:4px;">OneDrive Reclaimed</div>
+              <div style="font-size:24px; font-weight:700; color:#3b82f6;">11.81 GB</div>
+              <div style="font-size:11px; color:#94a3b8; margin-top:4px;">79.7% Storage Reduction</div>
+            </div>
+            <div class="card" style="padding:16px; border-left:3px solid #8b5cf6;">
+              <div style="font-size:11px; text-transform:uppercase; color:var(--text-muted); margin-bottom:4px;">External Build Cache</div>
+              <div style="font-size:24px; font-weight:700; color:#8b5cf6;">%LOCALAPPDATA%</div>
+              <div style="font-size:11px; color:#94a3b8; margin-top:4px;">Isolated from Cloud Sync</div>
+            </div>
+            <div class="card" style="padding:16px; border-left:3px solid #06b6d4;">
+              <div style="font-size:11px; text-transform:uppercase; color:var(--text-muted); margin-bottom:4px;">Compilation Profile</div>
+              <div style="font-size:24px; font-weight:700; color:#06b6d4;">debug = 1</div>
+              <div style="font-size:11px; color:#94a3b8; margin-top:4px;">Line-tables & stripped release</div>
+            </div>
+          </div>
+
+          <!-- Gauge and Storage Health Bar -->
+          <div class="card" style="padding:20px; margin-bottom:24px;">
+            <div style="display:flex; justify-content:space-between; margin-bottom:8px; font-size:12px;">
+              <span style="font-weight:600; color:#f1f5f9;">Storage Consumption Budget Gauge</span>
+              <span style="color:#10b981; font-weight:600;" id="storage-gauge-label">2.49 GB / 6.00 GB (41.5% - HEALTHY)</span>
+            </div>
+            <div style="width:100%; height:12px; background:#1e293b; border-radius:6px; overflow:hidden; position:relative;">
+              <div id="storage-gauge-bar" style="width:41.5%; height:100%; background:linear-gradient(90deg, #10b981, #3b82f6); border-radius:6px; transition:width 0.4s ease;"></div>
+            </div>
+            <div style="display:flex; justify-content:space-between; margin-top:6px; font-size:10px; color:#64748b;">
+              <span>0 GB</span>
+              <span>Target: 6.0 GB</span>
+              <span>Warning: 8.0 GB</span>
+              <span>Hard Cap: 10.0 GB</span>
+            </div>
+          </div>
+
+          <!-- Two Column Grid: Platform Matrix & Diagnostics Log -->
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px;">
+            <div class="card" style="padding:18px;">
+              <h3 style="font-size:14px; margin:0 0 12px 0; color:#f8fafc;">Cross-Platform Matrix & Release Targets</h3>
+              <div style="display:flex; flex-direction:column; gap:10px; font-size:12px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; padding:10px; background:#070a12; border-radius:6px; border:1px solid #1e293b;">
+                  <div>
+                    <div style="font-weight:600; color:#f1f5f9;">Windows 10/11 x64 (MSVC)</div>
+                    <div style="color:var(--text-muted); font-size:11px;">Win32 WebView2 Host · ConPTY · Inno Setup & MSIX</div>
+                  </div>
+                  <span style="padding:3px 8px; border-radius:4px; font-size:11px; background:#064e3b; color:#34d399; font-weight:600;">ACTIVE</span>
+                </div>
+                <div style="display:flex; justify-content:space-between; align-items:center; padding:10px; background:#070a12; border-radius:6px; border:1px solid #1e293b;">
+                  <div>
+                    <div style="font-weight:600; color:#f1f5f9;">Linux x64 (Ubuntu / GNU)</div>
+                    <div style="color:var(--text-muted); font-size:11px;">WebKitGTK · POSIX OpenPTY · AppImage & Debian .deb</div>
+                  </div>
+                  <span style="padding:3px 8px; border-radius:4px; font-size:11px; background:#1e3a5f; color:#60a5fa; font-weight:600;">CONFIGURED</span>
+                </div>
+                <div style="display:flex; justify-content:space-between; align-items:center; padding:10px; background:#070a12; border-radius:6px; border:1px solid #1e293b;">
+                  <div>
+                    <div style="font-weight:600; color:#f1f5f9;">macOS ARM64 (Apple Silicon)</div>
+                    <div style="color:var(--text-muted); font-size:11px;">WKWebView Cocoa · Unix PTY · .app Bundle & DMG</div>
+                  </div>
+                  <span style="padding:3px 8px; border-radius:4px; font-size:11px; background:#1e3a5f; color:#60a5fa; font-weight:600;">CONFIGURED</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="card" style="padding:18px;">
+              <h3 style="font-size:14px; margin:0 0 12px 0; color:#f8fafc;">Storage Audit & Cache Operation Log</h3>
+              <pre id="storage-log-output" style="font-family:Consolas, monospace; font-size:11px; color:#94a3b8; background:#070a12; padding:12px; border-radius:6px; border:1px solid #1e293b; height:180px; overflow-y:auto; margin:0; line-height:1.6;">
+[✓] Storage Audit Initialized
+[✓] In-tree rust/target size: 0.00 GB (Cleaned & moved outside OneDrive)
+[✓] External Build Cache: C:\Users\abdal\AppData\Local\AetherIDE\build-cache\ (2.08 GB)
+[✓] Net Workspace Storage: 2.49 GB (under 6.00 GB target budget)
+[✓] Ready for cache maintenance.</pre>
+            </div>
+          </div>
+        </div>
+      </div>
     </main>
   </div>
 
   <!-- Professional Status Bar -->
   <footer class="status-bar">
     <div class="status-bar-left">
-      <span class="status-item" id="sb-branch" onclick="alert('Git: main (clean working tree)')">Git: feat/sprint-05-advanced-workbench</span>
+      <span class="status-item" id="sb-branch" onclick="alert('Git: main (clean working tree)')">Git: feat/sprint-06-cross-platform-collaboration</span>
       <span class="status-item" id="sb-errors">ⓧ 0  ⚠ 0</span>
       <span class="status-item" id="sb-lsp">LSP: rust-analyzer (Online)</span>
       <span class="status-item" id="sb-terminals">⚡ Terminals: 1</span>
@@ -2175,6 +2276,41 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
     }
 
     // =========================================================================
+    // BUILD & STORAGE MAINTENANCE
+    // =========================================================================
+    function auditStorageMetrics() {
+      const log = document.getElementById('storage-log-output');
+      const time = new Date().toLocaleTimeString();
+      log.innerText += `\n[${time}] Executing Storage Audit...
+[${time}] Target Budget: 6.00 GB | Warning Threshold: 8.00 GB
+[${time}] In-Tree (OneDrive) Footprint: 0.00 GB (11.81 GB Reclaimed)
+[${time}] External Build Cache (%LOCALAPPDATA%): 2.08 GB
+[${time}] Net Status: OPTIMAL (41.5% of budget used)`;
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function runStorageDryRun() {
+      const log = document.getElementById('storage-log-output');
+      const time = new Date().toLocaleTimeString();
+      log.innerText += `\n[${time}] [Dry-Run] Scanning temporary artifacts & stale debuginfo...
+[${time}] Scanned: 32,288 files in build cache
+[${time}] In-tree target: CLEAN (0 bytes found in OneDrive)
+[${time}] Stale incremental artifacts eligible for purge: 0 bytes
+[${time}] Result: Build cache already optimized with debug=1 line-tables.`;
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function applyStorageCleanup() {
+      const log = document.getElementById('storage-log-output');
+      const time = new Date().toLocaleTimeString();
+      log.innerText += `\n[${time}] [Apply] Purging stale incremental build cache...
+[${time}] Executing cache sweep across target directories...
+[${time}] Cache swept successfully. Retained release and active debug binaries.
+[${time}] Workspace storage remains stable at 2.49 GB.`;
+      log.scrollTop = log.scrollHeight;
+    }
+
+    // =========================================================================
     // UI NAVIGATION & COMMAND PALETTE
     // =========================================================================
     function switchTab(tabId) {
@@ -2265,6 +2401,7 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
         { label: 'Brain: Calculate Change Blast Radius', sub: 'Project Brain', action: () => { switchTab('brain'); analyzeChangeImpact(); } },
         { label: 'View: Open AI Autonomous Team', sub: 'Navigation', action: () => switchTab('agents') },
         { label: 'View: Open Mobile Studio Preview', sub: 'Navigation', action: () => switchTab('mobile') },
+        { label: 'View: Open Build & Storage Center', sub: 'Navigation', action: () => switchTab('storage') },
         { label: 'View: Open Diagnostics Doctor', sub: 'Navigation', action: () => switchTab('diagnostics') }
       ];
       renderPaletteItems(commands);

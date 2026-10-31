@@ -1,5 +1,11 @@
+pub mod storage;
+
 use process_manager::ProcessManager;
 use serde::{Deserialize, Serialize};
+pub use storage::{
+    StorageAuditReport, StorageAuditor, StorageCleanupPlan, BUDGET_TARGET_BYTES,
+    WARNING_THRESHOLD_BYTES,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolchainStatus {

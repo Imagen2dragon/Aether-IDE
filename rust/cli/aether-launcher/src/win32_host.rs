@@ -3,7 +3,7 @@ pub mod native {
     use std::cell::RefCell;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpStream;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::mpsc;
     use tracing::{info, warn};
 
@@ -29,16 +29,21 @@ pub mod native {
         static HOST_CONFIG: RefCell<Option<HostConfig>> = const { RefCell::new(None) };
     }
 
-    #[derive(Clone)]
-    pub struct HostConfig {
-        pub workbench_dir: PathBuf,
-        pub user_data_dir: PathBuf,
-        pub session_token: Option<String>,
-        pub daemon_port: u16,
-    }
+    pub use crate::host::HostConfig;
 
     pub struct Win32WebView2Host {
         config: HostConfig,
+    }
+
+    impl crate::host::DesktopHost for Win32WebView2Host {
+        fn run(&self) -> std::result::Result<(), Box<dyn std::error::Error>> {
+            self.run()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+        }
+
+        fn platform_name(&self) -> &'static str {
+            "Windows (Win32 + Microsoft WebView2)"
+        }
     }
 
     impl Win32WebView2Host {
@@ -388,6 +393,22 @@ pub mod native {
                 "StartExpoServer",
                 "GetExpoStatus",
                 "DiscoverMobileDevices",
+                "CrdtApplyUpdate",
+                "CrdtGetDoc",
+                "CrdtGetStateVector",
+                "CrdtGetDiff",
+                "UpdatePresence",
+                "GetPresence",
+                "SyncGeneratePairing",
+                "SyncGetManifest",
+                "SyncDiffManifests",
+                "SwarmAddTask",
+                "SwarmListTasks",
+                "SwarmGetReadyTasks",
+                "SwarmSendMessage",
+                "SwarmGetMessages",
+                "ThreeWayMerge",
+                "ApplyMergeResolution",
             ];
 
             if !allowed_actions.contains(&action.as_str()) {
@@ -851,6 +872,7 @@ pub mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::path::PathBuf;
 
         #[test]
         fn test_host_config_defaults() {
@@ -947,6 +969,22 @@ pub mod native {
                 "StartExpoServer",
                 "GetExpoStatus",
                 "DiscoverMobileDevices",
+                "CrdtApplyUpdate",
+                "CrdtGetDoc",
+                "CrdtGetStateVector",
+                "CrdtGetDiff",
+                "UpdatePresence",
+                "GetPresence",
+                "SyncGeneratePairing",
+                "SyncGetManifest",
+                "SyncDiffManifests",
+                "SwarmAddTask",
+                "SwarmListTasks",
+                "SwarmGetReadyTasks",
+                "SwarmSendMessage",
+                "SwarmGetMessages",
+                "ThreeWayMerge",
+                "ApplyMergeResolution",
             ];
             assert!(allowed_actions.contains(&"LspCompletion"));
             assert!(allowed_actions.contains(&"FileWrite"));

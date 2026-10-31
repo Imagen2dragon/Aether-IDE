@@ -26,6 +26,9 @@ struct DaemonState {
     indexer: ProjectIndexer,
     lsp_multiplexer: Arc<lsp_client::LspMultiplexer>,
     terminal_manager: Arc<terminal_manager::TerminalManager>,
+    crdt_manager: Arc<workspace_sync::CrdtManager>,
+    awareness_tracker: Arc<workspace_sync::AwarenessTracker>,
+    swarm_coordinator: Arc<agent_orchestrator::SwarmCoordinator>,
 }
 
 #[tokio::main]
@@ -48,8 +51,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         agent_orchestrator::AgentOrchestrator::new(model_gateway.clone(), db.clone());
     let project_brain = parking_lot::Mutex::new(ProjectBrain::new(db.clone()));
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let lsp_multiplexer = Arc::new(lsp_client::LspMultiplexer::new(workspace_root));
+    let lsp_multiplexer = Arc::new(lsp_client::LspMultiplexer::new(workspace_root.clone()));
     let terminal_manager = Arc::new(terminal_manager::TerminalManager::new());
+    let crdt_manager = Arc::new(workspace_sync::CrdtManager::new());
+    let awareness_tracker = Arc::new(workspace_sync::AwarenessTracker::new());
+    let swarm_coordinator = Arc::new(agent_orchestrator::SwarmCoordinator::new(&workspace_root));
 
     let state = Arc::new(DaemonState {
         config: config.clone(),
@@ -61,6 +67,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         indexer,
         lsp_multiplexer,
         terminal_manager,
+        crdt_manager,
+        awareness_tracker,
+        swarm_coordinator,
     });
 
     // Write token file for UI workbench to authenticate
@@ -681,6 +690,180 @@ async fn handle_ipc_envelope(
             }
         }
 
+        IpcRequest::CrdtApplyUpdate {
+            doc_id,
+            update_base64,
+            peer_id: _,
+            role,
+        } => {
+            let parsed_role = workspace_sync::DeviceRole::parse(&role);
+            if !parsed_role.can_write() {
+                IpcResponse::err(format!(
+                    "Role {:?} is not authorized to mutate CRDT document",
+                    parsed_role
+                ))
+            } else {
+                let doc = state.crdt_manager.get_or_create(&doc_id);
+                match doc.apply_update_base64(&update_base64) {
+                    Ok(()) => IpcResponse::ok(serde_json::json!({
+                        "applied": true,
+                        "doc_id": doc_id,
+                        "text_length": doc.get_text().len(),
+                    })),
+                    Err(e) => IpcResponse::err(format!("Failed to apply CRDT update: {e}")),
+                }
+            }
+        }
+
+        IpcRequest::CrdtGetDoc { doc_id } => {
+            let doc = state.crdt_manager.get_or_create(&doc_id);
+            IpcResponse::ok(serde_json::json!({
+                "doc_id": doc_id,
+                "text": doc.get_text(),
+                "state_vector": doc.get_state_vector_base64(),
+            }))
+        }
+
+        IpcRequest::CrdtGetStateVector { doc_id } => {
+            let doc = state.crdt_manager.get_or_create(&doc_id);
+            IpcResponse::ok(serde_json::json!({
+                "doc_id": doc_id,
+                "state_vector": doc.get_state_vector_base64(),
+            }))
+        }
+
+        IpcRequest::CrdtGetDiff {
+            doc_id,
+            state_vector_base64,
+        } => {
+            let doc = state.crdt_manager.get_or_create(&doc_id);
+            match doc.get_diff_base64(&state_vector_base64) {
+                Ok(diff) => IpcResponse::ok(serde_json::json!({
+                    "doc_id": doc_id,
+                    "diff_base64": diff,
+                })),
+                Err(e) => IpcResponse::err(format!("Failed to compute diff: {e}")),
+            }
+        }
+
+        IpcRequest::UpdatePresence {
+            peer_id,
+            display_name,
+            user_color,
+            current_file,
+            line,
+            col,
+        } => {
+            let mut presence = workspace_sync::PeerPresence::new(peer_id, display_name, user_color);
+            presence.current_file = current_file;
+            if let (Some(l), Some(c)) = (line, col) {
+                presence.cursor = Some(workspace_sync::CursorPosition { line: l, col: c });
+            }
+            state.awareness_tracker.update_presence(presence);
+            IpcResponse::ok(serde_json::json!({ "updated": true }))
+        }
+
+        IpcRequest::GetPresence { file_path } => {
+            let peers = if let Some(path) = file_path {
+                state.awareness_tracker.get_peers_for_file(&path, 30)
+            } else {
+                state.awareness_tracker.get_active_peers(30)
+            };
+            IpcResponse::ok(serde_json::to_value(peers).unwrap())
+        }
+
+        IpcRequest::SwarmAddTask {
+            task_id,
+            title,
+            description,
+            persona,
+            dependencies,
+        } => {
+            let node = agent_orchestrator::SwarmTaskNode::new(
+                task_id.clone(),
+                title,
+                description,
+                persona,
+                dependencies,
+            );
+            match state.swarm_coordinator.add_task(node) {
+                Ok(()) => IpcResponse::ok(serde_json::json!({
+                    "added": true,
+                    "task_id": task_id,
+                })),
+                Err(e) => IpcResponse::err(format!("Failed to add swarm task: {e}")),
+            }
+        }
+
+        IpcRequest::SwarmListTasks => {
+            let tasks = state.swarm_coordinator.list_tasks();
+            IpcResponse::ok(serde_json::to_value(tasks).unwrap())
+        }
+
+        IpcRequest::SwarmGetReadyTasks => {
+            let ready = state.swarm_coordinator.get_ready_tasks();
+            IpcResponse::ok(serde_json::to_value(ready).unwrap())
+        }
+
+        IpcRequest::SwarmSendMessage {
+            sender,
+            recipient,
+            task_id,
+            message_type,
+            payload,
+        } => {
+            let msg_type = match message_type.to_lowercase().as_str() {
+                "proposediff" => agent_orchestrator::AgentMessageType::ProposeDiff,
+                "reviewfeedback" => agent_orchestrator::AgentMessageType::ReviewFeedback,
+                "handoff" => agent_orchestrator::AgentMessageType::Handoff,
+                "alert" => agent_orchestrator::AgentMessageType::Alert,
+                _ => agent_orchestrator::AgentMessageType::Query,
+            };
+            let msg = agent_orchestrator::AgentMessage::new(
+                sender, recipient, task_id, msg_type, payload,
+            );
+            state.swarm_coordinator.send_message(msg.clone());
+            IpcResponse::ok(serde_json::to_value(msg).unwrap())
+        }
+
+        IpcRequest::SwarmGetMessages { persona, task_id } => {
+            let msgs = if let Some(p) = persona {
+                state.swarm_coordinator.get_messages_for_persona(&p)
+            } else if let Some(t) = task_id {
+                state.swarm_coordinator.get_messages_for_task(&t)
+            } else {
+                state.swarm_coordinator.get_messages_for_persona("*")
+            };
+            IpcResponse::ok(serde_json::to_value(msgs).unwrap())
+        }
+
+        IpcRequest::ThreeWayMerge { base, ours, theirs } => {
+            let report = agent_orchestrator::ThreeWayMergeEngine::merge(&base, &ours, &theirs);
+            IpcResponse::ok(serde_json::to_value(report).unwrap())
+        }
+
+        IpcRequest::ApplyMergeResolution {
+            base,
+            ours,
+            theirs,
+            resolutions,
+        } => {
+            let actions: Vec<agent_orchestrator::MergeResolutionAction> = resolutions
+                .into_iter()
+                .map(|s| match s.as_str() {
+                    "AcceptTheirs" => agent_orchestrator::MergeResolutionAction::AcceptTheirs,
+                    "AcceptBoth" => agent_orchestrator::MergeResolutionAction::AcceptBoth,
+                    _ => agent_orchestrator::MergeResolutionAction::AcceptOurs,
+                })
+                .collect();
+            let resolved = agent_orchestrator::ThreeWayMergeEngine::apply_resolutions(
+                &base, &ours, &theirs, &actions,
+            );
+            IpcResponse::ok(serde_json::json!({
+                "resolved_content": resolved,
+            }))
+        }
+
         _ => IpcResponse::err("Action not yet implemented in daemon slice"),
     };
 
@@ -706,8 +889,12 @@ mod tests {
             agent_orchestrator::AgentOrchestrator::new(model_gateway.clone(), db.clone());
         let project_brain = parking_lot::Mutex::new(ProjectBrain::new(db.clone()));
         let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let lsp_multiplexer = Arc::new(lsp_client::LspMultiplexer::new(workspace_root));
+        let lsp_multiplexer = Arc::new(lsp_client::LspMultiplexer::new(workspace_root.clone()));
         let terminal_manager = Arc::new(terminal_manager::TerminalManager::new());
+        let crdt_manager = Arc::new(workspace_sync::CrdtManager::new());
+        let awareness_tracker = Arc::new(workspace_sync::AwarenessTracker::new());
+        let swarm_coordinator =
+            Arc::new(agent_orchestrator::SwarmCoordinator::new(&workspace_root));
 
         Arc::new(DaemonState {
             config,
@@ -719,6 +906,9 @@ mod tests {
             indexer,
             lsp_multiplexer,
             terminal_manager,
+            crdt_manager,
+            awareness_tracker,
+            swarm_coordinator,
         })
     }
 
@@ -937,6 +1127,133 @@ mod tests {
                 assert!(data["entries"].is_object());
             }
             _ => panic!("Expected response payload"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_authenticated_crdt_and_presence_ipc() {
+        let state = create_test_state();
+
+        // 1. Initial doc state
+        let envelope = IpcEnvelope {
+            id: "test-crdt-1".into(),
+            session_token: Some(state.session_token.clone()),
+            payload: IpcPayload::Request(IpcRequest::CrdtGetDoc {
+                doc_id: "doc-shared-1".into(),
+            }),
+        };
+        let resp = handle_ipc_envelope(&state, envelope, "127.0.0.1:9999").await;
+        if let IpcPayload::Response(r) = resp.payload {
+            assert!(r.success);
+            let data = r.data.unwrap();
+            assert_eq!(data["text"], "");
+        } else {
+            panic!("Expected response");
+        }
+
+        // 2. Viewer role cannot mutate CRDT
+        let envelope_viewer = IpcEnvelope {
+            id: "test-crdt-2".into(),
+            session_token: Some(state.session_token.clone()),
+            payload: IpcPayload::Request(IpcRequest::CrdtApplyUpdate {
+                doc_id: "doc-shared-1".into(),
+                update_base64: "AAA=".into(),
+                peer_id: "peer-viewer".into(),
+                role: "Viewer".into(),
+            }),
+        };
+        let resp_viewer = handle_ipc_envelope(&state, envelope_viewer, "127.0.0.1:9999").await;
+        if let IpcPayload::Response(r) = resp_viewer.payload {
+            assert!(!r.success);
+            assert!(r.error.unwrap().contains("Role Viewer is not authorized"));
+        } else {
+            panic!("Expected response");
+        }
+
+        // 3. Presence tracking
+        let envelope_presence = IpcEnvelope {
+            id: "test-presence-1".into(),
+            session_token: Some(state.session_token.clone()),
+            payload: IpcPayload::Request(IpcRequest::UpdatePresence {
+                peer_id: "peer-alice".into(),
+                display_name: "Alice Collaborator".into(),
+                user_color: "#6366f1".into(),
+                current_file: Some("src/main.rs".into()),
+                line: Some(42),
+                col: Some(10),
+            }),
+        };
+        let resp_presence = handle_ipc_envelope(&state, envelope_presence, "127.0.0.1:9999").await;
+        if let IpcPayload::Response(r) = resp_presence.payload {
+            assert!(r.success);
+        } else {
+            panic!("Expected response");
+        }
+
+        let envelope_get_presence = IpcEnvelope {
+            id: "test-presence-2".into(),
+            session_token: Some(state.session_token.clone()),
+            payload: IpcPayload::Request(IpcRequest::GetPresence {
+                file_path: Some("src/main.rs".into()),
+            }),
+        };
+        let resp_get_presence =
+            handle_ipc_envelope(&state, envelope_get_presence, "127.0.0.1:9999").await;
+        if let IpcPayload::Response(r) = resp_get_presence.payload {
+            assert!(r.success);
+            let data = r.data.unwrap();
+            let arr = data.as_array().unwrap();
+            assert_eq!(arr.len(), 1);
+            assert_eq!(arr[0]["display_name"], "Alice Collaborator");
+        } else {
+            panic!("Expected response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_authenticated_swarm_and_merge_ipc() {
+        let state = create_test_state();
+
+        // 1. Add Swarm Task
+        let envelope_add = IpcEnvelope {
+            id: "test-swarm-1".into(),
+            session_token: Some(state.session_token.clone()),
+            payload: IpcPayload::Request(IpcRequest::SwarmAddTask {
+                task_id: "swarm-task-1".into(),
+                title: "Build Subsystem".into(),
+                description: "Design and implement".into(),
+                persona: "systems".into(),
+                dependencies: vec![],
+            }),
+        };
+        let resp_add = handle_ipc_envelope(&state, envelope_add, "127.0.0.1:9999").await;
+        if let IpcPayload::Response(r) = resp_add.payload {
+            assert!(r.success);
+        } else {
+            panic!("Expected response");
+        }
+
+        // 2. Three-Way Merge
+        let envelope_merge = IpcEnvelope {
+            id: "test-merge-1".into(),
+            session_token: Some(state.session_token.clone()),
+            payload: IpcPayload::Request(IpcRequest::ThreeWayMerge {
+                base: "fn main() {}\n".into(),
+                ours: "fn main() {}\n".into(),
+                theirs: "fn main() { println!(\"hello\"); }\n".into(),
+            }),
+        };
+        let resp_merge = handle_ipc_envelope(&state, envelope_merge, "127.0.0.1:9999").await;
+        if let IpcPayload::Response(r) = resp_merge.payload {
+            assert!(r.success);
+            let data = r.data.unwrap();
+            assert_eq!(data["is_clean"], true);
+            assert!(data["merged_content"]
+                .as_str()
+                .unwrap()
+                .contains("println!"));
+        } else {
+            panic!("Expected response");
         }
     }
 }

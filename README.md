@@ -18,8 +18,12 @@ Unlike simple UI wrappers or chatbot sidebars, AetherIDE is powered by a multith
 ## 🚀 Key Architectural Pillars
 
 ### 1. 🦀 Rust-First Core (`rust/`)
-- **21 Modular Crates:** Including `application-core`, `ipc-protocol`, `filesystem-engine`, `database-engine`, `symbol-index`, `process-manager`, `model-gateway`, and `agent-orchestrator`.
-- **High-Speed IPC:** Windows Named Pipes (`\\.\pipe\aether-daemon-ipc`) and authenticated loopback WebSocket.
+- **24 Modular Crates:** Including `application-core`, `ipc-protocol`, `filesystem-engine`, `database-engine`, `symbol-index`, `process-manager`, `model-gateway`, `agent-orchestrator`, `terminal-manager`, `workspace-sync`, and `diagnostics`.
+- **Storage-Aware External Build Cache:** Compilation cache offloaded to `%LOCALAPPDATA%\AetherIDE\build-cache\` with zero OneDrive lockups, reclaiming 11.81 GB (net 2.49 GB footprint).
+- **Cross-Platform Native Subsystems:** `TerminalBackend` trait supporting Windows ConPTY and Unix/macOS POSIX OpenPTY; `DesktopHost` trait supporting Win32 WebView2, Linux WebKitGTK, and macOS WKWebView.
+- **Real-Time CRDT Collaboration:** Yrs (Yjs V1 compatible) deterministic synchronization with ephemeral cursor tracking and Ed25519 Role-Based Access Control.
+- **Autonomous AI Swarms & Three-Way Merging:** DAG task scheduling with Kahn's cycle detection, isolated Git worktrees, and visual 3-way conflict resolution.
+- **High-Speed IPC:** Windows Named Pipes (`\\.\pipe\aether-daemon-ipc`) and authenticated loopback TCP.
 - **Embedded Storage:** SQLite with WAL mode, memory-mapped I/O, and FTS5 full-text code search.
 
 ### 2. 🤖 14-Persona Autonomous AI Engineering Team (`crates/agent-orchestrator`)

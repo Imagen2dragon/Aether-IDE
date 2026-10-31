@@ -1,4 +1,9 @@
+pub mod backend;
 pub mod conpty;
+pub mod unix_pty;
+
+pub use backend::TerminalBackend;
+pub use unix_pty::UnixPtySession;
 
 use application_core::{AetherError, Result};
 use parking_lot::Mutex;
@@ -27,6 +32,7 @@ pub struct TerminalManager {
     sessions: Arc<Mutex<HashMap<u32, TerminalSessionInfo>>>,
     #[cfg(windows)]
     conpty_sessions: Arc<Mutex<HashMap<u32, ConPtySession>>>,
+    backends: Arc<Mutex<HashMap<u32, Arc<dyn TerminalBackend>>>>,
 }
 
 impl Default for TerminalManager {
@@ -42,6 +48,7 @@ impl TerminalManager {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(windows)]
             conpty_sessions: Arc::new(Mutex::new(HashMap::new())),
+            backends: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -68,7 +75,6 @@ impl TerminalManager {
         self.sessions.lock().values().cloned().collect()
     }
 
-    #[cfg(windows)]
     pub fn spawn_interactive(
         &self,
         shell_name: &str,
@@ -79,31 +85,58 @@ impl TerminalManager {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let cmd = resolve_shell_command(shell_name);
 
-        let session = ConPtySession::spawn(id, &cmd, cwd.as_deref(), cols, rows)
-            .map_err(|e| AetherError::Process(format!("ConPTY spawn failed: {}", e)))?;
+        #[cfg(windows)]
+        {
+            let session = ConPtySession::spawn(id, &cmd, cwd.as_deref(), cols, rows)
+                .map_err(|e| AetherError::Process(format!("ConPTY spawn failed: {}", e)))?;
 
-        let pid = session.pid;
-        self.conpty_sessions.lock().insert(id, session);
+            let pid = session.pid;
+            self.conpty_sessions.lock().insert(id, session);
 
-        let info = TerminalSessionInfo {
-            id,
-            title: format!("{} (ConPTY)", shell_name),
-            shell: cmd,
-            cwd,
-            pid: Some(pid),
-            is_interactive: true,
-        };
-        self.sessions.lock().insert(id, info.clone());
-        Ok(info)
+            let info = TerminalSessionInfo {
+                id,
+                title: format!("{} (ConPTY)", shell_name),
+                shell: cmd,
+                cwd,
+                pid: Some(pid),
+                is_interactive: true,
+            };
+            self.sessions.lock().insert(id, info.clone());
+            Ok(info)
+        }
+
+        #[cfg(not(windows))]
+        {
+            let session = Arc::new(UnixPtySession::new(id, 20000 + id, cmd.clone(), cols, rows));
+            let pid = session.pid();
+            self.backends.lock().insert(id, session);
+
+            let info = TerminalSessionInfo {
+                id,
+                title: format!("{} (Unix PTY)", shell_name),
+                shell: cmd,
+                cwd,
+                pid: Some(pid),
+                is_interactive: true,
+            };
+            self.sessions.lock().insert(id, info.clone());
+            Ok(info)
+        }
     }
 
-    #[cfg(windows)]
     pub fn write_input(&self, id: u32, data: &[u8]) -> Result<usize> {
-        let lock = self.conpty_sessions.lock();
-        if let Some(session) = lock.get(&id) {
-            session
-                .write_input(data)
-                .map_err(|e| AetherError::Process(format!("ConPTY write failed: {}", e)))
+        #[cfg(windows)]
+        {
+            let lock = self.conpty_sessions.lock();
+            if let Some(session) = lock.get(&id) {
+                return session
+                    .write_input(data)
+                    .map_err(|e| AetherError::Process(format!("ConPTY write failed: {}", e)));
+            }
+        }
+        let lock = self.backends.lock();
+        if let Some(backend) = lock.get(&id) {
+            backend.write_input(data)
         } else {
             Err(AetherError::Process(format!(
                 "Terminal session {} not found",
@@ -112,13 +145,19 @@ impl TerminalManager {
         }
     }
 
-    #[cfg(windows)]
     pub fn resize_terminal(&self, id: u32, cols: u16, rows: u16) -> Result<()> {
-        let lock = self.conpty_sessions.lock();
-        if let Some(session) = lock.get(&id) {
-            session
-                .resize(cols, rows)
-                .map_err(|e| AetherError::Process(format!("ConPTY resize failed: {}", e)))
+        #[cfg(windows)]
+        {
+            let lock = self.conpty_sessions.lock();
+            if let Some(session) = lock.get(&id) {
+                return session
+                    .resize(cols, rows)
+                    .map_err(|e| AetherError::Process(format!("ConPTY resize failed: {}", e)));
+            }
+        }
+        let lock = self.backends.lock();
+        if let Some(backend) = lock.get(&id) {
+            backend.resize(cols, rows)
         } else {
             Err(AetherError::Process(format!(
                 "Terminal session {} not found",
@@ -153,11 +192,17 @@ impl TerminalManager {
         }
     }
 
-    #[cfg(windows)]
     pub fn read_output(&self, id: u32, offset: usize) -> Result<(Vec<u8>, usize, bool)> {
-        let lock = self.conpty_sessions.lock();
-        if let Some(session) = lock.get(&id) {
-            Ok(session.read_output(offset))
+        #[cfg(windows)]
+        {
+            let lock = self.conpty_sessions.lock();
+            if let Some(session) = lock.get(&id) {
+                return Ok(session.read_output(offset));
+            }
+        }
+        let lock = self.backends.lock();
+        if let Some(backend) = lock.get(&id) {
+            Ok(backend.read_output(offset))
         } else {
             Err(AetherError::Process(format!(
                 "Terminal session {} not found",
@@ -173,6 +218,7 @@ impl TerminalManager {
                 session.close();
             }
         }
+        self.backends.lock().remove(&id);
 
         let mut lock = self.sessions.lock();
         if lock.remove(&id).is_some() {
@@ -210,6 +256,7 @@ impl TerminalManager {
     }
 }
 
+#[cfg(windows)]
 pub fn resolve_shell_command(shell: &str) -> String {
     let lower = shell.to_lowercase();
     if lower == "powershell" || lower == "powershell.exe" {
@@ -224,6 +271,27 @@ pub fn resolve_shell_command(shell: &str) -> String {
             format!("\"{}\" --login -i", git_bash.to_string_lossy())
         } else {
             "bash.exe --login -i".to_string()
+        }
+    } else {
+        shell.to_string()
+    }
+}
+
+#[cfg(not(windows))]
+pub fn resolve_shell_command(shell: &str) -> String {
+    let lower = shell.to_lowercase();
+    if lower == "zsh" {
+        "/bin/zsh".to_string()
+    } else if lower == "bash" {
+        "/bin/bash".to_string()
+    } else if lower.is_empty() || lower == "default" {
+        #[cfg(target_os = "macos")]
+        {
+            "/bin/zsh".to_string()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            "/bin/bash".to_string()
         }
     } else {
         shell.to_string()

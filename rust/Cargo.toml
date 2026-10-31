@@ -53,6 +53,8 @@ parking_lot = "0.12"
 bytes = "1.9"
 sha2 = "0.10"
 ring = "0.17"
+yrs = "0.22"
+base64 = "0.22"
 
 # Local workspace crate dependencies
 application-core = { path = "crates/application-core" }
@@ -76,3 +78,27 @@ diagnostics = { path = "crates/diagnostics" }
 mobile-build-manager = { path = "crates/mobile-build-manager" }
 lsp-client = { path = "crates/lsp-client" }
 workspace-sync = { path = "crates/workspace-sync" }
+
+# Compilation Profiles Optimization (Sprint 06 Gate 0)
+[profile.dev]
+opt-level = 0
+debug = 1               # Line-tables-only: retains stack traces & file/line diagnostics, reduces PDB footprint by ~65%
+incremental = true
+
+[profile.test]
+opt-level = 0
+debug = 1
+incremental = true
+
+[profile.release]
+opt-level = 3
+debug = 0
+strip = "symbols"       # Strip debug symbols from distributed binaries
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+
+[profile.release-with-debug]
+inherits = "release"
+debug = 1
+strip = "none"

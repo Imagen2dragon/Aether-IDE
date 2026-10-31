@@ -1,3 +1,12 @@
+pub mod merge;
+pub mod swarm;
+
+pub use merge::{MergeConflictHunk, MergeReport, MergeResolutionAction, ThreeWayMergeEngine};
+pub use swarm::{
+    AgentMessage, AgentMessageType, SwarmCoordinator, SwarmTaskGraph, SwarmTaskNode,
+    SwarmTaskStatus,
+};
+
 use agent_runtime::{AgentRuntime, AgentTask};
 use application_core::{AetherError, AutonomyMode, Result};
 use database_engine::DatabaseEngine;
