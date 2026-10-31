@@ -89,6 +89,112 @@ impl UpdateVerifier {
     }
 }
 
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StagedUpdateStatus {
+    Idle,
+    Downloading,
+    Downloaded,
+    Verified,
+    Staged,
+    Applying,
+    Completed,
+    RolledBack,
+    Failed,
+}
+
+pub struct StagedUpdateApplicator {
+    staging_dir: PathBuf,
+    installed_dir: PathBuf,
+    status: StagedUpdateStatus,
+}
+
+impl StagedUpdateApplicator {
+    pub fn new(staging_dir: impl Into<PathBuf>, installed_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            staging_dir: staging_dir.into(),
+            installed_dir: installed_dir.into(),
+            status: StagedUpdateStatus::Idle,
+        }
+    }
+
+    pub fn status(&self) -> StagedUpdateStatus {
+        self.status
+    }
+
+    /// Stages a verified update payload into the staging directory.
+    pub fn stage_update(
+        &mut self,
+        payload: &[u8],
+        manifest: &AetherUpdateManifest,
+    ) -> Result<PathBuf> {
+        UpdateVerifier::verify_payload_checksum(payload, &manifest.sha256_checksum)?;
+
+        std::fs::create_dir_all(&self.staging_dir).map_err(|e| {
+            AetherError::Internal(format!("Failed to create staging directory: {e}"))
+        })?;
+
+        let staged_file = self
+            .staging_dir
+            .join(format!("aether-update-{}.bin", manifest.version));
+        std::fs::write(&staged_file, payload)
+            .map_err(|e| AetherError::Internal(format!("Failed to write staged payload: {e}")))?;
+
+        self.status = StagedUpdateStatus::Staged;
+        Ok(staged_file)
+    }
+
+    /// Applies a staged update atomically: backs up the currently installed binary,
+    /// swaps in the new staged binary, and rolls back if an error occurs.
+    pub fn apply_staged_update(&mut self, target_filename: &str, staged_file: &Path) -> Result<()> {
+        if self.status != StagedUpdateStatus::Staged {
+            return Err(AetherError::Internal(
+                "Cannot apply update: no payload is in Staged state".into(),
+            ));
+        }
+
+        self.status = StagedUpdateStatus::Applying;
+
+        let target_path = self.installed_dir.join(target_filename);
+        let backup_path = self
+            .installed_dir
+            .join(format!("{}.rollback_bak", target_filename));
+
+        // Create backup of current installation if it exists
+        let had_existing = target_path.exists();
+        if had_existing {
+            if let Err(e) = std::fs::copy(&target_path, &backup_path) {
+                self.status = StagedUpdateStatus::Failed;
+                return Err(AetherError::Internal(format!(
+                    "Failed to create rollback backup: {e}"
+                )));
+            }
+        }
+
+        // Deploy new binary from staged file
+        if let Err(e) = std::fs::copy(staged_file, &target_path) {
+            // Rollback immediately
+            if had_existing {
+                let _ = std::fs::copy(&backup_path, &target_path);
+                let _ = std::fs::remove_file(&backup_path);
+            }
+            self.status = StagedUpdateStatus::RolledBack;
+            return Err(AetherError::Internal(format!(
+                "Deployment failed, rolled back to original: {e}"
+            )));
+        }
+
+        // Clean up backup file
+        if had_existing {
+            let _ = std::fs::remove_file(&backup_path);
+        }
+
+        self.status = StagedUpdateStatus::Completed;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +241,61 @@ mod tests {
 
         assert!(UpdateVerifier::verify_payload_checksum(payload, &expected_hash).is_ok());
         assert!(UpdateVerifier::verify_payload_checksum(payload, "invalidhash").is_err());
+    }
+
+    #[test]
+    fn test_staged_update_lifecycle_and_rollback() {
+        let temp_base =
+            std::env::temp_dir().join(format!("aether_update_test_{}", uuid::Uuid::new_v4()));
+        let staging_dir = temp_base.join("staging");
+        let installed_dir = temp_base.join("installed");
+        std::fs::create_dir_all(&installed_dir).unwrap();
+
+        // 1. Existing installed binary v0.1.0
+        let target_binary = "AetherIDE.exe";
+        let target_path = installed_dir.join(target_binary);
+        std::fs::write(&target_path, b"AetherIDE Binary v0.1.0").unwrap();
+
+        let mut applicator = StagedUpdateApplicator::new(&staging_dir, &installed_dir);
+        assert_eq!(applicator.status(), StagedUpdateStatus::Idle);
+
+        // 2. Prepare v0.2.0 update payload
+        let new_payload = b"AetherIDE Binary v0.2.0 Next Generation";
+        let mut hasher = Sha256::new();
+        hasher.update(new_payload);
+        let checksum = format!("{:x}", hasher.finalize());
+
+        let manifest = AetherUpdateManifest {
+            version: "0.2.0".into(),
+            channel: "beta".into(),
+            release_notes: "Commercial Beta v0.2.0".into(),
+            download_url: "https://releases.aetheride.dev/v0.2.0/AetherIDE.exe".into(),
+            sha256_checksum: checksum,
+            signature_base64: "dGVzdC1zaWc=".into(),
+            min_os_version: None,
+            published_at: Utc::now(),
+        };
+
+        // 3. Stage the verified update
+        let staged_file = applicator.stage_update(new_payload, &manifest).unwrap();
+        assert_eq!(applicator.status(), StagedUpdateStatus::Staged);
+        assert!(staged_file.exists());
+
+        // 4. Apply the staged update
+        applicator
+            .apply_staged_update(target_binary, &staged_file)
+            .unwrap();
+        assert_eq!(applicator.status(), StagedUpdateStatus::Completed);
+
+        // Verify target binary was upgraded
+        let upgraded_content = std::fs::read(&target_path).unwrap();
+        assert_eq!(upgraded_content, new_payload);
+
+        // Verify rollback backup was cleaned up
+        let backup_path = installed_dir.join(format!("{}.rollback_bak", target_binary));
+        assert!(!backup_path.exists());
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&temp_base);
     }
 }

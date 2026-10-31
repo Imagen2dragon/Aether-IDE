@@ -1,6 +1,8 @@
 pub mod update;
 
-pub use update::{AetherUpdateManifest, UpdateVerifier};
+pub use update::{
+    AetherUpdateManifest, StagedUpdateApplicator, StagedUpdateStatus, UpdateVerifier,
+};
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

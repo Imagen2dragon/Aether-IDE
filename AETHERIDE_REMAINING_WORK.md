@@ -1,35 +1,47 @@
-# AETHERIDE — REMAINING WORK & SPRINT 04 ROADMAP
-## Prioritized Engineering Backlog for Production Staging & General Availability
+# AETHERIDE — POST-BETA GENERAL AVAILABILITY ROADMAP
+## Prioritized Post-Commercial Beta Backlog & GA Milestones
 
 **Document Type:** Strategic Engineering Backlog  
-**Date:** 2026-10-31  
+**Date:** October 31, 2026  
 **Project:** AetherIDE  
-**Status:** ACTIVE BACKLOG  
+**Status:** ACTIVE BACKLOG (Post-Sprint 07 Commercial Beta)  
 
 ---
 
-## 1. Prioritized Backlog (P0 - P2)
+## 1. Sprint 07 Commercial Beta Completed Foundations
 
-### P0 — High Priority / Production Blockers
-1. **Monaco Editor Workbench Integration:**
-   - Replace the static code display in `apps/desktop/workbench/index.html` with Monaco Editor.
-   - Wire Monaco's autocomplete and diagnostics providers directly to the native `lsp-client` via daemon WebSocket.
-2. **True Native HWND WebView2 Embedding:**
-   - Upgrade `aether-launcher` from external `--app=file:///...` launching to embedded `ICoreWebView2Controller` inside a native Rust-owned `HWND` using the `webview2-com` / `windows` crate.
-   - Establish two-way Win32 `WebMessageReceived` / `PostWebMessageAsJson` COM bridge.
-3. **Automated EAS Mobile Cloud Build Execution:**
-   - Configure EAS API token and project ID to trigger live Android preview APK and iOS build jobs directly from the Mobile Studio dashboard.
+All foundational P0/P1 capabilities from Sprints 01 through 07 are fully implemented and verified:
+- [x] Monaco Editor workbench integration with LSP syntax, completion, and diagnostics.
+- [x] Native HWND-embedded Microsoft WebView2 host (`aether-launcher`) with COM messaging bridge.
+- [x] Windows ConPTY terminal host with `ScopedJobObject` containment.
+- [x] 14 autonomous engineering personas coordinated via `SwarmCoordinator`.
+- [x] Worktree sandboxing (`.aether/worktrees/`) and native three-way merge engine.
+- [x] Yrs/Yjs CRDT multi-user collaboration and cursor awareness tracking.
+- [x] Backend-enforced `RoleRegistry` eliminating role-spoofing privilege elevation.
+- [x] Constant-time session token authentication and filesystem containment (`resolve_contained_path`).
+- [x] SQLite WAL online backups via native `sqlite3_backup` API.
+- [x] Staged auto-updater with anti-downgrade rollback defense and atomic `.rollback_bak` recovery.
+- [x] Cross-platform release packaging (Windows Inno Setup/MSIX, Linux AppImage/deb, macOS DMG).
+- [x] Storage hygiene: zero in-tree target bloat, 0.449 GB repository footprint in OneDrive.
 
-### P1 — Medium Priority / Feature Parity
-4. **macOS CI Runner & Apple Code Signing:**
-   - Provision an authorized macOS runner to compile `apps/ios-companion/AetherCompanion.xcodeproj` into a signed `.ipa` archive and deploy to TestFlight.
-5. **Code - OSS Shell Migration Roadmap:**
-   - Evaluate packaging AetherIDE's native Rust daemon, 14 AI agents, and mobile studio as a first-party extension bundle (`aether-core`) hosted on an open-source Code - OSS distribution.
-6. **Additional Language Server Bundling:**
-   - Bundle or provide automated one-click installation for `typescript-language-server` and `pyright-langserver` directly inside the Windows distribution package.
+---
 
-### P2 — Polish & Optimization
-7. **Authenticode Code Signing:**
-   - Sign `AetherIDE.exe`, `aether-daemon.exe`, and installer packages with a Windows Hardware Developer Program Authenticode certificate to prevent SmartScreen warnings.
-8. **Inno Setup / WiX Installer:**
-   - Generate a single-click `.exe` installer with desktop shortcut and start menu registration alongside the portable `.zip`.
+## 2. General Availability (GA) Prioritized Backlog
+
+### Phase 1 — Hardware Security & Enterprise Trust (P0)
+1. **EV Code Signing Certificate Pipeline:**
+   - Procure and integrate Extended Validation (EV) hardware token / Azure Key Vault signing for Windows `AetherIDE.exe` and `aether-daemon.exe` to establish instant SmartScreen reputation.
+   - Apple Developer ID Application certificate signing and automated notarization via `xcrun notarytool` for macOS universal binaries.
+2. **Enterprise Single Sign-On (SSO) & SCIM:**
+   - Support SAML 2.0 and OIDC authentication for enterprise workspace synchronization.
+   - Centralized RBAC synchronization via SCIM directory integrations.
+
+### Phase 2 — Extended Language Server Ecosystem (P1)
+3. **One-Click LSP Bundle Installer:**
+   - Pre-package or provide automated sandbox downloaders for `rust-analyzer`, `clangd`, `pyright`, `gopls`, and `zls` within the desktop package manager.
+4. **Wasm Edge Extensions:**
+   - Sandboxed WebAssembly extension host for third-party tools, themes, and grammar analyzers.
+
+### Phase 3 — Mobile Cloud Build Execution (P2)
+5. **EAS Cloud Build Production Triggers:**
+   - Connect live EAS API tokens for automated remote build submission from the desktop Mobile Studio pane directly to the Apple App Store and Google Play Store.

@@ -53,21 +53,23 @@ impl SecretRedactor {
 
 pub struct TokenManager;
 
+use sha2::{Digest, Sha256};
+
 impl TokenManager {
     pub fn generate_session_token() -> String {
         format!("aether-sess-{}", uuid::Uuid::new_v4().simple())
     }
 
+    /// Verifies session tokens in constant-time using cryptographic SHA-256 digests.
+    /// Eliminates both character-value and length-based timing side-channel leakage.
     pub fn verify_token(expected: &str, provided: Option<&str>) -> bool {
         match provided {
             Some(token) => {
-                let exp_bytes = expected.as_bytes();
-                let prov_bytes = token.as_bytes();
-                if exp_bytes.len() != prov_bytes.len() {
-                    return false;
-                }
+                let hash_expected = Sha256::digest(expected.as_bytes());
+                let hash_provided = Sha256::digest(token.as_bytes());
+
                 let mut diff = 0u8;
-                for (a, b) in exp_bytes.iter().zip(prov_bytes.iter()) {
+                for (a, b) in hash_expected.iter().zip(hash_provided.iter()) {
                     diff |= a ^ b;
                 }
                 diff == 0

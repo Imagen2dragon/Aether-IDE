@@ -63,13 +63,10 @@ impl DatabaseEngine {
         let conn = Connection::open(path).map_err(|e| AetherError::Database(e.to_string()))?;
 
         // Enable WAL mode, memory cache, and synchronous=NORMAL
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
-             PRAGMA foreign_keys = ON;
-             PRAGMA cache_size = -64000;",
-        )
-        .map_err(|e| AetherError::Database(e.to_string()))?;
+        let _ = conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()));
+        let _ = conn.query_row("PRAGMA synchronous = NORMAL", [], |_| Ok(()));
+        let _ = conn.query_row("PRAGMA foreign_keys = ON", [], |_| Ok(()));
+        let _ = conn.query_row("PRAGMA cache_size = -64000", [], |_| Ok(()));
 
         let engine = Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -312,6 +309,29 @@ impl DatabaseEngine {
             .map_err(|e| AetherError::Database(e.to_string()))?;
         Ok(rows > 0)
     }
+
+    /// Performs a non-blocking, consistent online backup of the SQLite database
+    /// to the destination path using the native SQLite online backup API (`sqlite3_backup`).
+    /// This works safely on live WAL databases without database lockups or inconsistent read states.
+    pub fn backup_online<P: AsRef<Path>>(&self, dest_path: P) -> Result<()> {
+        let dest = dest_path.as_ref();
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut dst_conn =
+            Connection::open(dest).map_err(|e| AetherError::Database(e.to_string()))?;
+        let src_conn = self.conn.lock();
+
+        let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn).map_err(|e| {
+            AetherError::Database(format!("Failed to initialize online backup: {e}"))
+        })?;
+
+        backup
+            .run_to_completion(100, std::time::Duration::from_millis(10), None)
+            .map_err(|e| AetherError::Database(format!("Backup execution failed: {e}")))?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -388,5 +408,64 @@ mod tests {
         let deleted = db.delete_memory_note("mem-01").expect("delete failed");
         assert!(deleted);
         assert_eq!(db.get_memory_notes().expect("get after delete").len(), 0);
+    }
+
+    #[test]
+    fn test_sqlite_online_backup_and_restore() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_backup_test_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let live_db_path = temp_dir.join("live.db");
+        let backup_db_path = temp_dir.join("backup.db");
+
+        // 1. Open live database in WAL mode and insert records
+        let live_db = DatabaseEngine::open(&live_db_path).expect("failed to open live db");
+        let sym = SymbolRecord {
+            id: None,
+            file_path: "src/crypto.rs".into(),
+            name: "chacha20_poly1305_encrypt".into(),
+            kind: "function".into(),
+            line_start: 45,
+            line_end: 90,
+            signature: "pub fn chacha20_poly1305_encrypt()".into(),
+            docstring: Some("Encrypts payload using ChaCha20-Poly1305".into()),
+        };
+        live_db.insert_symbol(&sym).expect("failed to index symbol");
+
+        let note = ProjectMemoryNote {
+            id: "mem-backup-01".into(),
+            title: "Backup Verification".into(),
+            content: "Testing SQLite native online backup mechanism".into(),
+            tags: vec!["backup".into(), "sqlite".into()],
+            created_at: "2026-10-31T12:00:00Z".into(),
+            updated_at: "2026-10-31T12:00:00Z".into(),
+        };
+        live_db
+            .save_memory_note(&note)
+            .expect("failed to save memory note");
+
+        // 2. Perform live non-blocking online backup
+        live_db
+            .backup_online(&backup_db_path)
+            .expect("online backup failed");
+        assert!(backup_db_path.exists());
+
+        // 3. Open the backup database independently and verify contents
+        let restored_db = DatabaseEngine::open(&backup_db_path).expect("failed to open backup db");
+        let found_symbols = restored_db
+            .search_symbols_fts("chacha20_poly1305_encrypt", 10)
+            .expect("symbol search failed in backup");
+        assert_eq!(found_symbols.len(), 1);
+        assert_eq!(found_symbols[0].name, "chacha20_poly1305_encrypt");
+
+        let restored_notes = restored_db
+            .get_memory_notes()
+            .expect("notes failed in backup");
+        assert_eq!(restored_notes.len(), 1);
+        assert_eq!(restored_notes[0].title, "Backup Verification");
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

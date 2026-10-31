@@ -447,21 +447,19 @@ pub mod native {
             .get("path")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        let target = base_dir.join(rel_path);
 
-        // Security: Prevent Directory Traversal Escape
-        if let Ok(canon_base) = base_dir.canonicalize() {
-            if let Ok(canon_target) = target.canonicalize() {
-                if !canon_target.starts_with(&canon_base) {
+        let target =
+            match filesystem_engine::FilesystemEngine::resolve_contained_path(base_dir, rel_path) {
+                Ok(p) => p,
+                Err(e) => {
                     return serde_json::json!({
                         "id": req_id,
                         "action": "FileRead",
-                        "error": "Access Denied: Path escapes workspace root",
+                        "error": format!("Access Denied: {}", e),
                         "result": null
                     });
                 }
-            }
-        }
+            };
 
         match std::fs::read_to_string(&target) {
             Ok(content) => serde_json::json!({
@@ -492,17 +490,19 @@ pub mod native {
             .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        let target = base_dir.join(rel_path);
 
-        // Security check
-        if rel_path.contains("..") {
-            return serde_json::json!({
-                "id": req_id,
-                "action": "FileWrite",
-                "error": "Access Denied: Path contains illegal relative components",
-                "result": null
-            });
-        }
+        let target =
+            match filesystem_engine::FilesystemEngine::resolve_contained_path(base_dir, rel_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    return serde_json::json!({
+                        "id": req_id,
+                        "action": "FileWrite",
+                        "error": format!("Access Denied: {}", e),
+                        "result": null
+                    });
+                }
+            };
 
         if let Some(parent) = target.parent() {
             let _ = std::fs::create_dir_all(parent);

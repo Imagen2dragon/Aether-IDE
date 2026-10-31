@@ -28,6 +28,7 @@ struct DaemonState {
     terminal_manager: Arc<terminal_manager::TerminalManager>,
     crdt_manager: Arc<workspace_sync::CrdtManager>,
     awareness_tracker: Arc<workspace_sync::AwarenessTracker>,
+    role_registry: Arc<workspace_sync::RoleRegistry>,
     swarm_coordinator: Arc<agent_orchestrator::SwarmCoordinator>,
 }
 
@@ -55,6 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let terminal_manager = Arc::new(terminal_manager::TerminalManager::new());
     let crdt_manager = Arc::new(workspace_sync::CrdtManager::new());
     let awareness_tracker = Arc::new(workspace_sync::AwarenessTracker::new());
+    let role_registry = Arc::new(workspace_sync::RoleRegistry::new());
     let swarm_coordinator = Arc::new(agent_orchestrator::SwarmCoordinator::new(&workspace_root));
 
     let state = Arc::new(DaemonState {
@@ -69,6 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         terminal_manager,
         crdt_manager,
         awareness_tracker,
+        role_registry,
         swarm_coordinator,
     });
 
@@ -690,17 +693,34 @@ async fn handle_ipc_envelope(
             }
         }
 
+        IpcRequest::RegisterPeerRole { peer_id, role } => {
+            let parsed_role = workspace_sync::DeviceRole::parse(&role);
+            state.role_registry.register_peer(&peer_id, parsed_role);
+            IpcResponse::ok(serde_json::json!({
+                "peer_id": peer_id,
+                "role": format!("{:?}", parsed_role)
+            }))
+        }
+
+        IpcRequest::RevokePeerRole { peer_id } => {
+            let revoked = state.role_registry.revoke_peer(&peer_id);
+            IpcResponse::ok(serde_json::json!({
+                "peer_id": peer_id,
+                "revoked": revoked
+            }))
+        }
+
         IpcRequest::CrdtApplyUpdate {
             doc_id,
             update_base64,
-            peer_id: _,
-            role,
+            peer_id,
+            role: _, // Security: Do NOT trust client-supplied role parameter to prevent role-spoofing
         } => {
-            let parsed_role = workspace_sync::DeviceRole::parse(&role);
-            if !parsed_role.can_write() {
+            let authorized_role = state.role_registry.get_role(&peer_id);
+            if !authorized_role.can_write() {
                 IpcResponse::err(format!(
-                    "Role {:?} is not authorized to mutate CRDT document",
-                    parsed_role
+                    "Peer '{}' with role {:?} is not authorized to mutate CRDT document",
+                    peer_id, authorized_role
                 ))
             } else {
                 let doc = state.crdt_manager.get_or_create(&doc_id);
@@ -893,6 +913,7 @@ mod tests {
         let terminal_manager = Arc::new(terminal_manager::TerminalManager::new());
         let crdt_manager = Arc::new(workspace_sync::CrdtManager::new());
         let awareness_tracker = Arc::new(workspace_sync::AwarenessTracker::new());
+        let role_registry = Arc::new(workspace_sync::RoleRegistry::new());
         let swarm_coordinator =
             Arc::new(agent_orchestrator::SwarmCoordinator::new(&workspace_root));
 
@@ -908,6 +929,7 @@ mod tests {
             terminal_manager,
             crdt_manager,
             awareness_tracker,
+            role_registry,
             swarm_coordinator,
         })
     }
@@ -1165,7 +1187,7 @@ mod tests {
         let resp_viewer = handle_ipc_envelope(&state, envelope_viewer, "127.0.0.1:9999").await;
         if let IpcPayload::Response(r) = resp_viewer.payload {
             assert!(!r.success);
-            assert!(r.error.unwrap().contains("Role Viewer is not authorized"));
+            assert!(r.error.unwrap().contains("Viewer is not authorized"));
         } else {
             panic!("Expected response");
         }
@@ -1252,6 +1274,112 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("println!"));
+        } else {
+            panic!("Expected response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_crdt_payload_role_spoofing_rejected() {
+        let state = create_test_state();
+
+        // 1. Rogue client registers or connects as peer-bob, but does NOT have write permissions.
+        // It attempts to spoof role: "Owner" in the CrdtApplyUpdate payload.
+        let envelope_spoofed = IpcEnvelope {
+            id: "test-spoof-1".into(),
+            session_token: Some(state.session_token.clone()),
+            payload: IpcPayload::Request(IpcRequest::CrdtApplyUpdate {
+                doc_id: "doc-vault-1".into(),
+                update_base64: "AAA=".into(),
+                peer_id: "peer-bob".into(),
+                role: "Owner".into(), // Attacker claims Owner in IPC payload
+            }),
+        };
+        let resp_spoofed = handle_ipc_envelope(&state, envelope_spoofed, "127.0.0.1:9999").await;
+        if let IpcPayload::Response(r) = resp_spoofed.payload {
+            assert!(!r.success);
+            assert!(
+                r.error
+                    .unwrap()
+                    .contains("is not authorized to mutate CRDT document"),
+                "Backend RoleRegistry must disallow spoofed role from untrusted payload"
+            );
+        } else {
+            panic!("Expected response");
+        }
+
+        // 2. Legitimate admin registers peer-bob as Editor in backend RoleRegistry
+        let envelope_register = IpcEnvelope {
+            id: "test-reg-1".into(),
+            session_token: Some(state.session_token.clone()),
+            payload: IpcPayload::Request(IpcRequest::RegisterPeerRole {
+                peer_id: "peer-bob".into(),
+                role: "Editor".into(),
+            }),
+        };
+        let resp_reg = handle_ipc_envelope(&state, envelope_register, "127.0.0.1:9999").await;
+        if let IpcPayload::Response(r) = resp_reg.payload {
+            assert!(r.success);
+        } else {
+            panic!("Expected response");
+        }
+
+        // 3. Now peer-bob's update is accepted by the backend
+        let doc = state.crdt_manager.get_or_create("doc-vault-1");
+        doc.set_text("Authenticated edit");
+        let update_b64 = doc.get_full_update_base64();
+
+        let envelope_valid = IpcEnvelope {
+            id: "test-valid-1".into(),
+            session_token: Some(state.session_token.clone()),
+            payload: IpcPayload::Request(IpcRequest::CrdtApplyUpdate {
+                doc_id: "doc-vault-1".into(),
+                update_base64: update_b64,
+                peer_id: "peer-bob".into(),
+                role: "Viewer".into(), // Even if client passes Viewer, registered Editor role governs
+            }),
+        };
+        let resp_valid = handle_ipc_envelope(&state, envelope_valid, "127.0.0.1:9999").await;
+        if let IpcPayload::Response(r) = resp_valid.payload {
+            assert!(r.success);
+        } else {
+            panic!("Expected response");
+        }
+
+        // 4. Revoke peer-bob
+        let envelope_revoke = IpcEnvelope {
+            id: "test-rev-1".into(),
+            session_token: Some(state.session_token.clone()),
+            payload: IpcPayload::Request(IpcRequest::RevokePeerRole {
+                peer_id: "peer-bob".into(),
+            }),
+        };
+        let resp_revoke = handle_ipc_envelope(&state, envelope_revoke, "127.0.0.1:9999").await;
+        if let IpcPayload::Response(r) = resp_revoke.payload {
+            assert!(r.success);
+        } else {
+            panic!("Expected response");
+        }
+
+        // 5. Subsequent update from revoked peer is rejected
+        let envelope_after_revoke = IpcEnvelope {
+            id: "test-after-rev-1".into(),
+            session_token: Some(state.session_token.clone()),
+            payload: IpcPayload::Request(IpcRequest::CrdtApplyUpdate {
+                doc_id: "doc-vault-1".into(),
+                update_base64: "AAA=".into(),
+                peer_id: "peer-bob".into(),
+                role: "Editor".into(),
+            }),
+        };
+        let resp_after_revoke =
+            handle_ipc_envelope(&state, envelope_after_revoke, "127.0.0.1:9999").await;
+        if let IpcPayload::Response(r) = resp_after_revoke.payload {
+            assert!(!r.success);
+            assert!(r
+                .error
+                .unwrap()
+                .contains("is not authorized to mutate CRDT document"));
         } else {
             panic!("Expected response");
         }

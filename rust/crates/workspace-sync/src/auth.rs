@@ -5,6 +5,9 @@ use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashMap;
+use std::sync::RwLock;
+
 /// Role-based access control tiers for collaborative workspaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum DeviceRole {
@@ -42,6 +45,46 @@ impl DeviceRole {
     /// Whether this role can read documents and track peer presence.
     pub fn can_read(&self) -> bool {
         true
+    }
+}
+
+/// Backend-enforced registry mapping authenticated peer IDs to their authorized DeviceRole.
+/// Disallows untrusted callers from forging role parameters in IPC payloads.
+#[derive(Debug, Default)]
+pub struct RoleRegistry {
+    roles: RwLock<HashMap<String, DeviceRole>>,
+}
+
+impl RoleRegistry {
+    pub fn new() -> Self {
+        Self {
+            roles: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Registers or updates the role of a peer.
+    pub fn register_peer(&self, peer_id: impl Into<String>, role: DeviceRole) {
+        let mut map = self
+            .roles
+            .write()
+            .expect("RoleRegistry write lock poisoned");
+        map.insert(peer_id.into(), role);
+    }
+
+    /// Retrieves the authorized role for a given peer ID.
+    /// If the peer is not registered, defaults to `DeviceRole::Viewer` (least privilege).
+    pub fn get_role(&self, peer_id: &str) -> DeviceRole {
+        let map = self.roles.read().expect("RoleRegistry read lock poisoned");
+        map.get(peer_id).copied().unwrap_or(DeviceRole::Viewer)
+    }
+
+    /// Revokes an existing peer registration.
+    pub fn revoke_peer(&self, peer_id: &str) -> bool {
+        let mut map = self
+            .roles
+            .write()
+            .expect("RoleRegistry write lock poisoned");
+        map.remove(peer_id).is_some()
     }
 }
 
@@ -141,5 +184,29 @@ mod tests {
         let tampered = b"CRDT_UPDATE_OPERATION_HASH_TAMPERED";
         let res_tampered = DeviceIdentity::verify_signature(&pubkey, tampered, &signature);
         assert!(res_tampered.is_err());
+    }
+
+    #[test]
+    fn test_role_registry_enforcement() {
+        let registry = RoleRegistry::new();
+
+        // Unregistered peer defaults to Viewer (least privilege, cannot write)
+        assert_eq!(registry.get_role("unknown-peer"), DeviceRole::Viewer);
+        assert!(!registry.get_role("unknown-peer").can_write());
+
+        // Register peer as Editor
+        registry.register_peer("peer-alice", DeviceRole::Editor);
+        assert_eq!(registry.get_role("peer-alice"), DeviceRole::Editor);
+        assert!(registry.get_role("peer-alice").can_write());
+
+        // Update peer to Viewer
+        registry.register_peer("peer-alice", DeviceRole::Viewer);
+        assert_eq!(registry.get_role("peer-alice"), DeviceRole::Viewer);
+        assert!(!registry.get_role("peer-alice").can_write());
+
+        // Revoke peer
+        assert!(registry.revoke_peer("peer-alice"));
+        assert_eq!(registry.get_role("peer-alice"), DeviceRole::Viewer);
+        assert!(!registry.revoke_peer("peer-alice"));
     }
 }

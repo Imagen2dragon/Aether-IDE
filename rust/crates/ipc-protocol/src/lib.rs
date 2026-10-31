@@ -202,6 +202,13 @@ pub enum IpcRequest {
     GetPresence {
         file_path: Option<String>,
     },
+    RegisterPeerRole {
+        peer_id: String,
+        role: String,
+    },
+    RevokePeerRole {
+        peer_id: String,
+    },
     SwarmAddTask {
         task_id: String,
         title: String,

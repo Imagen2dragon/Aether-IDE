@@ -281,8 +281,16 @@ impl SwarmCoordinator {
         self.graph.read().get_ready_tasks()
     }
 
+    pub fn mark_running(&self, task_id: &str, worktree: PathBuf) -> Result<()> {
+        self.graph.write().mark_running(task_id, worktree)
+    }
+
     pub fn mark_completed(&self, task_id: &str, artifacts: Vec<String>) -> Result<()> {
         self.graph.write().mark_completed(task_id, artifacts)
+    }
+
+    pub fn mark_failed(&self, task_id: &str) -> Result<()> {
+        self.graph.write().mark_failed(task_id)
     }
 
     pub fn list_tasks(&self) -> Vec<SwarmTaskNode> {

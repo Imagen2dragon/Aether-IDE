@@ -44,6 +44,32 @@
   - Mutual TLS (mTLS) or end-to-end encrypted WebSocket connection using ChaCha20-Poly1305.
   - Device revocation list stored in local SQLite database.
 
+### 3.4 Constant-Time Session Authentication & Timing Attack Elimination (Sprint 07)
+- **Threat:** Statistical timing analysis of byte-by-byte or length-checked token comparisons allows local attackers to recover session tokens.
+- **Mitigation:**
+  - `security-core::TokenManager::verify_token` digests both expected and provided tokens using SHA-256 (32 bytes fixed).
+  - Bitwise XOR accumulation (`diff |= a ^ b`) compares all 32 bytes without early loop termination or variable branch penalties.
+
+### 3.5 Filesystem Boundary Containment (`resolve_contained_path`) (Sprint 07)
+- **Threat:** Directory traversal (`../../`), Windows drive letters (`C:\Windows\...`), UNC paths, symlinks, or reserved Windows device names (`CON`, `PRN`, `AUX`, `NUL`) escape workspace root boundaries.
+- **Mitigation:**
+  - Component-by-component path validation rejects root directories, drive letters, and parent traversal components.
+  - Case-insensitive blacklist rejection for all reserved DOS/Windows device namespaces.
+  - Canonicalization target strictly verified to start with workspace root canonical path.
+
+### 3.6 Backend-Enforced Role-Based Access Control (`RoleRegistry`) (Sprint 07)
+- **Threat:** Rogue or demoted peers forge elevated roles (e.g. `role: "Owner"`) in collaborative CRDT IPC payloads.
+- **Mitigation:**
+  - Client-supplied `role` parameter in `CrdtApplyUpdate` is strictly ignored by the backend.
+  - `aether-daemon` verifies permissions directly against `RoleRegistry`, defaulting unregistered peers to least-privilege `Viewer`.
+
+### 3.7 Staged Auto-Updater & Rollback Protection (Sprint 07)
+- **Threat:** Downgrade attacks or corrupted update payloads breaking desktop installations.
+- **Mitigation:**
+  - Strict semantic version comparison ensures target version strictly exceeds current installed version.
+  - SHA-256 checksum and Ed25519 digital signature validation before staging.
+  - Atomic swap with automatic `.rollback_bak` recovery upon installation failure.
+
 ---
 
 ## 4. Secret Redaction Engine
