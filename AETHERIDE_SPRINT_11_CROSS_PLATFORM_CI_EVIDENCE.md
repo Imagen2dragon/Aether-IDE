@@ -10,12 +10,15 @@
 
 ## 1. Problem Diagnosis: The 0-Second Workflow Failure
 
-In Sprint 10, GitHub Actions runs failed instantly on push (0s duration). Analysis of `.github/workflows/ci.yml` identified two fatal syntax errors:
+In Sprint 10 and previous sprints, GitHub Actions runs failed instantly on push (0s duration with 0 executed jobs). Independent reverse-engineering of GitHub Actions run logs identified the root causes:
 
-1. **Invalid Action Reference:**
+1. **Job-Level Context Scope Violation (`runner.temp`):**
+   - Error: `(Line: 33, Col: 25): Unrecognized named-value: 'runner'. Located at position 1 within expression: runner.temp`
+   - Cause: In GitHub Actions, the `${{ runner }}` context is strictly undefined at the `jobs.<job_id>.env:` scope. It is only valid within `jobs.<job_id>.steps[*]`. Attempting to reference `${{ runner.temp }}` at the job-level environment causes GitHub's workflow schema validator to reject the workflow prior to job creation.
+2. **Invalid Action Reference:**
    - Incorrect: `uses: dtolnay/rust-toolchain@stable`
-   - Cause: GitHub Action repositories use release tags or branches (`@master`, `@v1`). The ref `@stable` does not exist in `dtolnay/rust-toolchain`. GitHub Actions failed during workflow schema resolution before executing any steps.
-2. **Brittle Branch Filter:**
+   - Cause: GitHub Action repositories use release tags or branches (`@master`, `@v1`). The ref `@stable` does not exist in `dtolnay/rust-toolchain`. The channel is set via `with: toolchain: stable`.
+3. **Brittle Branch Filter:**
    - Incorrect: `branches: [ "main", "feat/*", "fix/*" ]`
    - Cause: Single-asterisk globs in GitHub Actions do not match branch names with multiple slash levels.
 
@@ -24,6 +27,13 @@ In Sprint 10, GitHub Actions runs failed instantly on push (0s duration). Analys
 ## 2. Sprint 11 Remediation
 
 The workflow was completely overhauled:
+- `CARGO_TARGET_DIR` configuration moved to a dedicated step writing to `$GITHUB_ENV`:
+  ```bash
+  echo "CARGO_TARGET_DIR=${{ runner.temp }}/aether-build/windows-x64" >> $GITHUB_ENV
+  ```
+- Action references updated to `dtolnay/rust-toolchain@master` with `with: toolchain: stable`.
+- Branch filters updated to `[ "main", "feat/**", "fix/**" ]`.
+- Integrated frontend TypeScript build verification (`npm --prefix apps/desktop run build`).
 ```yaml
 name: AetherIDE Cross-Platform CI
 
