@@ -37,7 +37,7 @@ impl UnixPtySession {
     pub fn spawn_unix(
         id: u32,
         shell: &str,
-        cwd: Option<&std::path::Path>,
+        _cwd: Option<&std::path::Path>,
         cols: u16,
         rows: u16,
     ) -> Result<Self> {
