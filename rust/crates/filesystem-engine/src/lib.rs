@@ -64,19 +64,23 @@ pub fn sanitize_relative_path(user_path: &str) -> Result<PathBuf> {
         ));
     }
 
-    // 6. Reject UNC paths and Windows extended device namespaces
+    // 6. Reject UNC paths, extended device namespaces, or root slash prefixes
     let trimmed_leading = user_path.trim_start();
     if trimmed_leading.starts_with(r"\\")
         || trimmed_leading.starts_with("//")
         || trimmed_leading.starts_with(r"\??\")
         || trimmed_leading.starts_with(r"//?/")
+        || trimmed_leading.starts_with('/')
+        || trimmed_leading.starts_with('\\')
     {
         return Err(AetherError::PermissionDenied(
-            "Access Denied: UNC and extended device namespaces are strictly forbidden".into(),
+            "Access Denied: Root, UNC, and extended device namespaces are strictly forbidden"
+                .into(),
         ));
     }
 
-    let clean = Path::new(user_path);
+    let normalized_slash_str = user_path.replace('\\', "/");
+    let clean = Path::new(&normalized_slash_str);
     if clean.is_absolute() {
         return Err(AetherError::PermissionDenied(
             "Access Denied: Absolute paths are strictly forbidden".into(),
