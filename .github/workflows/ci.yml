@@ -100,6 +100,13 @@ jobs:
           toolchain: stable
           targets: aarch64-apple-darwin
           components: clippy
+      - name: Setup Headless macOS Keychain
+        run: |
+          security create-keychain -p "" build.keychain || true
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security list-keychains -d user -s build.keychain
       - name: Run macOS Clippy
         run: |
           cd rust
