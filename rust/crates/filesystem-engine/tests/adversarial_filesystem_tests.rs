@@ -318,3 +318,120 @@ fn test_12_forbidden_control_and_wildcard_characters() {
 
     let _ = fs::remove_dir_all(&ws);
 }
+
+#[test]
+fn test_13_concurrent_adversarial_symlink_race() {
+    let ws = setup_temp_workspace();
+    let outside_dir = std::env::temp_dir().join(format!(
+        "aether_outside_sentinel_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    fs::create_dir_all(&outside_dir).expect("Failed to create outside directory");
+
+    let sentinel_file = outside_dir.join("sentinel.txt");
+    let canary_file = outside_dir.join("canary.txt");
+    fs::write(&sentinel_file, "CRITICAL_SENTINEL_ROOT_KEY_DO_NOT_TAMPER").unwrap();
+    fs::write(&canary_file, "OUTSIDE_CANARY_DO_NOT_DELETE").unwrap();
+
+    let race_sub = ws.join("race_target");
+    let _ = fs::create_dir_all(&race_sub);
+
+    let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_clone = stop_flag.clone();
+    let ws_clone = ws.clone();
+    let outside_clone = outside_dir.clone();
+
+    // Background adversarial thread: repeatedly attempts to substitute directory with symlink/junction
+    let attacker = std::thread::spawn(move || {
+        let mut iter = 0;
+        while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) && iter < 150 {
+            iter += 1;
+            let target = ws_clone.join("race_target");
+            let _ = fs::remove_dir_all(&target);
+
+            #[cfg(windows)]
+            let _ = std::os::windows::fs::symlink_dir(&outside_clone, &target);
+            #[cfg(unix)]
+            let _ = std::os::unix::fs::symlink(&outside_clone, &target);
+
+            std::thread::sleep(std::time::Duration::from_millis(1));
+
+            let _ = fs::remove_dir(&target);
+            let _ = fs::create_dir_all(&target);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    });
+
+    // Worker thread: repeatedly executes contained filesystem operations
+    for _ in 0..100 {
+        // Attempt contained write
+        let _ = FilesystemEngine::write_file_contained(
+            &ws,
+            "race_target/payload.txt",
+            "WORKER_SAFE_CONTENT",
+        );
+
+        // Attempt contained read
+        let _ = FilesystemEngine::read_file_contained(&ws, "race_target/payload.txt");
+
+        // Attempt contained create dir
+        let _ = FilesystemEngine::create_dir_contained(&ws, "race_target/inner_dir");
+
+        // Attempt contained rename
+        let _ = FilesystemEngine::rename_contained(
+            &ws,
+            "race_target/payload.txt",
+            "race_target/payload_moved.txt",
+        );
+
+        // Attempt contained delete
+        let _ = FilesystemEngine::delete_file_contained(&ws, "race_target/payload_moved.txt");
+    }
+
+    stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = attacker.join();
+
+    // RIGOROUS VERIFICATION:
+    // 1. Outside sentinel file content must remain completely unchanged!
+    let current_sentinel =
+        fs::read_to_string(&sentinel_file).expect("Sentinel file must still exist");
+    assert_eq!(
+        current_sentinel, "CRITICAL_SENTINEL_ROOT_KEY_DO_NOT_TAMPER",
+        "Sentinel file was tampered during concurrent attack race!"
+    );
+
+    // 2. Outside canary file must NOT have been deleted!
+    let current_canary = fs::read_to_string(&canary_file).expect("Canary file must still exist");
+    assert_eq!(
+        current_canary, "OUTSIDE_CANARY_DO_NOT_DELETE",
+        "Canary file was tampered or deleted!"
+    );
+
+    // 3. No unauthorized files or directories created in outside directory!
+    let outside_entries: Vec<String> = fs::read_dir(&outside_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+
+    for name in &outside_entries {
+        assert!(
+            name == "sentinel.txt" || name == "canary.txt",
+            "Unauthorized file '{}' was created in outside directory during race attack!",
+            name
+        );
+    }
+
+    // 4. Indexer scan of workspace never ingests outside sentinel
+    let scanned = FilesystemEngine::scan_workspace_files(&ws, &[]).unwrap_or_default();
+    for path in scanned {
+        let content = fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            !content.contains("CRITICAL_SENTINEL"),
+            "Outside sentinel data leaked into workspace indexer!"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&ws);
+    let _ = fs::remove_dir_all(&outside_dir);
+}

@@ -211,7 +211,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_usage() {
-    println!("AetherIDE Developer CLI v0.1.0-alpha");
+    println!(
+        "AetherIDE Developer CLI v{}",
+        application_core::AETHER_VERSION
+    );
     println!("Usage:");
     println!("  aether-cli doctor                  # Audit developer environment & SDKs");
     println!("  aether-cli ping                    # Test connection to Aether daemon");
@@ -251,11 +254,7 @@ fn get_bootstrap_identity() -> (Option<String>, Option<String>) {
             return (token, peer);
         }
     }
-    let token_path = data_dir.join("daemon_session.token");
-    let token = std::fs::read_to_string(token_path)
-        .ok()
-        .map(|s| s.trim().to_string());
-    (token, None)
+    (None, None)
 }
 
 async fn send_ipc_request(

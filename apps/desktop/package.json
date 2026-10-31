@@ -1,7 +1,7 @@
 {
   "name": "aether-desktop",
   "productName": "AetherIDE",
-  "version": "0.1.0-alpha",
+  "version": "0.1.0-beta.2",
   "description": "Production-Grade Rust-First AI-Native IDE and Autonomous Software Engineering Ecosystem",
   "main": "dist/main.js",
   "scripts": {

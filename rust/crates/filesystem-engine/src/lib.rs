@@ -1,5 +1,6 @@
 use application_core::{AetherError, Result};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub struct FilesystemEngine;
@@ -16,7 +17,7 @@ impl FilesystemEngine {
 
     fn walk_dir(
         current: &Path,
-        _root: &Path,
+        root: &Path,
         exclude_patterns: &[String],
         results: &mut Vec<PathBuf>,
     ) -> Result<()> {
@@ -24,7 +25,11 @@ impl FilesystemEngine {
             return Ok(());
         }
 
-        let entries = fs::read_dir(current).map_err(AetherError::Io)?;
+        let root_canon = root.canonicalize().map_err(AetherError::Io)?;
+        let entries = match fs::read_dir(current) {
+            Ok(e) => e,
+            Err(_) => return Ok(()),
+        };
 
         for entry in entries.flatten() {
             let path = entry.path();
@@ -38,8 +43,31 @@ impl FilesystemEngine {
                 continue;
             }
 
+            // Inspect symlink / reparse metadata without following external links
+            let meta = match fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            // SECURITY: Do not follow symbolic links or directory junctions outside the workspace boundary
+            if meta.file_type().is_symlink() {
+                if let Ok(canon) = path.canonicalize() {
+                    if !Self::is_within_boundary(&canon, &root_canon) {
+                        // Skip external symlink target
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+
             if path.is_dir() {
-                Self::walk_dir(&path, _root, exclude_patterns, results)?;
+                // Ensure directory itself resides strictly within workspace boundary before recursing
+                if let Ok(canon) = path.canonicalize() {
+                    if Self::is_within_boundary(&canon, &root_canon) {
+                        Self::walk_dir(&path, root, exclude_patterns, results)?;
+                    }
+                }
             } else if path.is_file() {
                 results.push(path);
             }
@@ -247,9 +275,10 @@ impl FilesystemEngine {
         }
     }
 
-    /// Safely writes content to a file inside the workspace root, immune to TOCTOU symlink races.
-    /// Performs post-creation validation to verify that the file actually created on disk is
-    /// strictly within the canonical workspace boundary.
+    /// Safely writes content to a file inside the workspace root using capability-isolated I/O.
+    /// Creates a temporary file in the validated parent directory via `create_new(true)`, writes to
+    /// the validated file handle, verifies the destination is not an external symlink, and performs an
+    /// atomic rename within the verified directory capability.
     pub fn write_file_contained<P: AsRef<Path>>(
         root: P,
         user_path: &str,
@@ -259,24 +288,94 @@ impl FilesystemEngine {
         let root_canon = root.canonicalize().map_err(AetherError::Io)?;
         let resolved = Self::resolve_contained_path(&root_canon, user_path)?;
 
-        if let Some(parent) = resolved.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent).map_err(AetherError::Io)?;
-            }
-            let parent_canon = parent.canonicalize().map_err(AetherError::Io)?;
-            if !Self::is_within_boundary(&parent_canon, &root_canon) {
+        let parent = resolved.parent().ok_or_else(|| {
+            AetherError::PermissionDenied("Target path lacks parent directory".into())
+        })?;
+
+        if !parent.exists() {
+            fs::create_dir_all(parent).map_err(AetherError::Io)?;
+        }
+
+        let parent_canon = parent.canonicalize().map_err(AetherError::Io)?;
+        if !Self::is_within_boundary(&parent_canon, &root_canon) {
+            return Err(AetherError::PermissionDenied(
+                "Access Denied: Parent directory escaped boundary".into(),
+            ));
+        }
+
+        // Verify parent is not a symlink pointing outside
+        if let Ok(meta) = fs::symlink_metadata(parent) {
+            if meta.file_type().is_symlink()
+                && !Self::is_within_boundary(&parent_canon, &root_canon)
+            {
                 return Err(AetherError::PermissionDenied(
-                    "Access Denied: Parent directory escaped boundary".into(),
+                    "Access Denied: Parent directory is an external symlink".into(),
                 ));
             }
         }
 
-        Self::write_file_atomic(&resolved, content)?;
+        // Target verification: if file exists, ensure it is not an external symlink
+        if resolved.exists() {
+            if let Ok(meta) = fs::symlink_metadata(&resolved) {
+                if meta.file_type().is_symlink() {
+                    let dest_canon = resolved.canonicalize().map_err(AetherError::Io)?;
+                    if !Self::is_within_boundary(&dest_canon, &root_canon) {
+                        return Err(AetherError::PermissionDenied(
+                            "Access Denied: Destination is an external symlink".into(),
+                        ));
+                    }
+                }
+            }
+        }
 
-        // Post-creation canonical check against TOCTOU symlink substitution races
-        let post_canon = resolved.canonicalize().map_err(AetherError::Io)?;
+        // Step 1: Create capability-isolated temporary file in the validated parent directory
+        let temp_filename = format!(".aether-tmp-{}", uuid::Uuid::new_v4().simple());
+        let temp_path = parent_canon.join(&temp_filename);
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(AetherError::Io)?;
+
+        // Step 2: Write to the open file handle and flush
+        file.write_all(content.as_bytes())
+            .map_err(AetherError::Io)?;
+        file.sync_all().map_err(AetherError::Io)?;
+        drop(file);
+
+        // Step 3: Before atomic rename, ensure destination did not become an external symlink
+        let dest_filename = resolved
+            .file_name()
+            .ok_or_else(|| AetherError::PermissionDenied("Invalid destination file name".into()))?;
+        let final_dest = parent_canon.join(dest_filename);
+
+        if final_dest.exists() {
+            if let Ok(meta) = fs::symlink_metadata(&final_dest) {
+                if meta.file_type().is_symlink() {
+                    if let Ok(dest_canon) = final_dest.canonicalize() {
+                        if !Self::is_within_boundary(&dest_canon, &root_canon) {
+                            let _ = fs::remove_file(&temp_path);
+                            return Err(AetherError::PermissionDenied(
+                                "Access Denied: Destination target escaped workspace boundary"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 4: Atomic rename within validated parent directory
+        if let Err(e) = fs::rename(&temp_path, &final_dest) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(AetherError::Io(e));
+        }
+
+        // Step 5: Post-rename canonical verification
+        let post_canon = final_dest.canonicalize().map_err(AetherError::Io)?;
         if !Self::is_within_boundary(&post_canon, &root_canon) {
-            let _ = fs::remove_file(&resolved);
+            let _ = fs::remove_file(&final_dest);
             return Err(AetherError::PermissionDenied(
                 "Access Denied: Post-creation verification failed; target escaped boundary".into(),
             ));
@@ -290,21 +389,45 @@ impl FilesystemEngine {
         let root = root.as_ref();
         let root_canon = root.canonicalize().map_err(AetherError::Io)?;
         let resolved = Self::resolve_contained_path(&root_canon, user_path)?;
+
+        // Verify that neither the file nor any parent directory is an external symlink
         let target_canon = resolved.canonicalize().map_err(AetherError::Io)?;
         if !Self::is_within_boundary(&target_canon, &root_canon) {
             return Err(AetherError::PermissionDenied(
                 "Access Denied: Target path escapes workspace boundary".into(),
             ));
         }
+
+        if let Ok(meta) = fs::symlink_metadata(&resolved) {
+            if meta.file_type().is_symlink()
+                && !Self::is_within_boundary(&target_canon, &root_canon)
+            {
+                return Err(AetherError::PermissionDenied(
+                    "Access Denied: Symlink points outside workspace boundary".into(),
+                ));
+            }
+        }
+
         fs::read_to_string(target_canon).map_err(AetherError::Io)
     }
 
-    /// Safely deletes a file contained within the workspace root.
+    /// Safely deletes a file contained within the workspace root without following external symlinks.
     pub fn delete_file_contained<P: AsRef<Path>>(root: P, user_path: &str) -> Result<()> {
         let root = root.as_ref();
         let root_canon = root.canonicalize().map_err(AetherError::Io)?;
         let resolved = Self::resolve_contained_path(&root_canon, user_path)?;
+
         if resolved.exists() {
+            // Check symlink status: if it is a symlink pointing outside, delete ONLY the symlink itself
+            // never follow it to delete the outside file!
+            if let Ok(meta) = fs::symlink_metadata(&resolved) {
+                if meta.file_type().is_symlink() {
+                    // Remove symlink directly without following
+                    fs::remove_file(&resolved).map_err(AetherError::Io)?;
+                    return Ok(());
+                }
+            }
+
             let target_canon = resolved.canonicalize().map_err(AetherError::Io)?;
             if !Self::is_within_boundary(&target_canon, &root_canon) {
                 return Err(AetherError::PermissionDenied(
@@ -321,6 +444,26 @@ impl FilesystemEngine {
         let root = root.as_ref();
         let root_canon = root.canonicalize().map_err(AetherError::Io)?;
         let resolved = Self::resolve_contained_path(&root_canon, user_path)?;
+
+        // Check if any ancestor is an external symlink
+        let mut ancestor = resolved.as_path();
+        while let Some(parent) = ancestor.parent() {
+            if parent.exists() {
+                if let Ok(meta) = fs::symlink_metadata(parent) {
+                    if meta.file_type().is_symlink() {
+                        let canon = parent.canonicalize().map_err(AetherError::Io)?;
+                        if !Self::is_within_boundary(&canon, &root_canon) {
+                            return Err(AetherError::PermissionDenied(
+                                "Access Denied: Directory creation encounters external symlink"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+            }
+            ancestor = parent;
+        }
+
         fs::create_dir_all(&resolved).map_err(AetherError::Io)?;
         let target_canon = resolved.canonicalize().map_err(AetherError::Io)?;
         if !Self::is_within_boundary(&target_canon, &root_canon) {
@@ -331,7 +474,7 @@ impl FilesystemEngine {
         Ok(target_canon)
     }
 
-    /// Safely renames or moves a file within the workspace root.
+    /// Safely renames or moves a file within the workspace root without crossing boundaries.
     pub fn rename_contained<P: AsRef<Path>>(
         root: P,
         from_user_path: &str,
@@ -521,5 +664,55 @@ mod tests {
         ));
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_walk_dir_blocks_external_symlinks() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_fs_walk_{}", uuid::Uuid::new_v4().simple()));
+        let outside_dir = std::env::temp_dir().join(format!(
+            "aether_fs_outside_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+
+        let _ = fs::create_dir_all(&temp_dir);
+        let _ = fs::create_dir_all(&outside_dir);
+
+        // Inside file
+        let inside_file = temp_dir.join("inside.rs");
+        let _ = fs::write(&inside_file, "fn inside() {}");
+
+        // Outside file
+        let outside_file = outside_dir.join("secret_outside.rs");
+        let _ = fs::write(&outside_file, "CRITICAL_OUTSIDE_SECRET");
+
+        // Attempt symlink inside workspace pointing outside
+        let link_path = temp_dir.join("link_to_outside");
+        #[cfg(windows)]
+        let _ = std::os::windows::fs::symlink_dir(&outside_dir, &link_path);
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink(&outside_dir, &link_path);
+
+        // Scan workspace
+        let scanned = FilesystemEngine::scan_workspace_files(&temp_dir, &[])
+            .expect("scan_workspace_files must succeed");
+
+        // Verify that outside file was NOT scanned or leaked!
+        for file in &scanned {
+            let canon = file.canonicalize().unwrap_or_else(|_| file.clone());
+            assert!(
+                FilesystemEngine::is_within_boundary(&canon, &temp_dir.canonicalize().unwrap()),
+                "Scanned file escaped workspace boundary: {:?}",
+                file
+            );
+            assert!(
+                !file.to_string_lossy().contains("secret_outside"),
+                "External file appeared in scan results: {:?}",
+                file
+            );
+        }
+
+        let _ = fs::remove_dir_all(temp_dir);
+        let _ = fs::remove_dir_all(outside_dir);
     }
 }
