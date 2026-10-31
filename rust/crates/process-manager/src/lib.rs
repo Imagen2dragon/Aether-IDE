@@ -304,9 +304,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_command_timeout_clean_termination() {
-        // Run a command that takes longer than 500ms timeout
+        #[cfg(windows)]
+        let sleep_cmd = "ping 127.0.0.1 -n 5 > nul";
+        #[cfg(not(windows))]
+        let sleep_cmd = "sleep 5";
+
         let res = ProcessManager::run_command_streaming(
-            "powershell -Command \"Start-Sleep -Seconds 10\"",
+            sleep_cmd,
             None,
             Some(Duration::from_millis(300)),
             None,
