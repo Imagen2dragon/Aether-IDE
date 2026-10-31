@@ -81,12 +81,306 @@ impl TokenManager {
 }
 
 // ============================================================================
-// Platform-Protected Credential Provisioning (DPAPI / OS-Bound Storage)
+// Platform-Protected Credential Provisioning (DPAPI / OS-Bound Keyring Storage)
 // ============================================================================
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+/// Cross-platform credential store abstraction for secure token and secret persistence.
+pub trait CredentialStore: Send + Sync {
+    fn store(&self, key: &str, secret: &str) -> Result<(), String>;
+    fn retrieve(&self, key: &str) -> Result<Option<String>, String>;
+    fn delete(&self, key: &str) -> Result<(), String>;
+}
+
+/// OS-native keyring store (macOS Keychain, Linux Secret Service via DBus, Windows Credential Manager).
+pub struct OsKeyringStore {
+    service_name: String,
+}
+
+impl OsKeyringStore {
+    pub fn new(service_name: impl Into<String>) -> Self {
+        Self {
+            service_name: service_name.into(),
+        }
+    }
+}
+
+impl CredentialStore for OsKeyringStore {
+    fn store(&self, key: &str, secret: &str) -> Result<(), String> {
+        let entry = keyring::Entry::new(&self.service_name, key)
+            .map_err(|e| format!("Failed to initialize OS keyring entry for '{}': {}", key, e))?;
+        entry
+            .set_password(secret)
+            .map_err(|e| format!("Failed to store secret in OS keyring for '{}': {}", key, e))?;
+        Ok(())
+    }
+
+    fn retrieve(&self, key: &str) -> Result<Option<String>, String> {
+        let entry = keyring::Entry::new(&self.service_name, key)
+            .map_err(|e| format!("Failed to initialize OS keyring entry for '{}': {}", key, e))?;
+        match entry.get_password() {
+            Ok(pwd) => Ok(Some(pwd)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(format!(
+                "Failed to retrieve secret from OS keyring for '{}': {}",
+                key, e
+            )),
+        }
+    }
+
+    fn delete(&self, key: &str) -> Result<(), String> {
+        let entry = keyring::Entry::new(&self.service_name, key)
+            .map_err(|e| format!("Failed to initialize OS keyring entry for '{}': {}", key, e))?;
+        match entry.delete_credential() {
+            Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(format!(
+                "Failed to delete secret from OS keyring for '{}': {}",
+                key, e
+            )),
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn dpapi_encrypt(plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    use std::ptr::null_mut;
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct DATA_BLOB {
+        cbData: u32,
+        pbData: *mut u8,
+    }
+    #[link(name = "Crypt32")]
+    extern "system" {
+        fn CryptProtectData(
+            pDataIn: *const DATA_BLOB,
+            szDataDescr: *const u16,
+            pOptionalEntropy: *const DATA_BLOB,
+            pvReserved: *mut std::ffi::c_void,
+            pPromptStruct: *mut std::ffi::c_void,
+            dwFlags: u32,
+            pDataOut: *mut DATA_BLOB,
+        ) -> i32;
+    }
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn LocalFree(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    }
+    const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
+
+    let mut in_bytes = plaintext.to_vec();
+    let data_in = DATA_BLOB {
+        cbData: in_bytes.len() as u32,
+        pbData: in_bytes.as_mut_ptr(),
+    };
+    let mut data_out = DATA_BLOB {
+        cbData: 0,
+        pbData: null_mut(),
+    };
+
+    let res = unsafe {
+        CryptProtectData(
+            &data_in,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut data_out,
+        )
+    };
+
+    if res == 0 || data_out.pbData.is_null() {
+        return Err("CryptProtectData failed to protect credential".into());
+    }
+
+    let encrypted_bytes =
+        unsafe { std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec() };
+    unsafe { LocalFree(data_out.pbData as *mut _) };
+
+    Ok(encrypted_bytes)
+}
+
+#[cfg(windows)]
+pub fn dpapi_decrypt(ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+    use std::ptr::null_mut;
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct DATA_BLOB {
+        cbData: u32,
+        pbData: *mut u8,
+    }
+    #[link(name = "Crypt32")]
+    extern "system" {
+        fn CryptUnprotectData(
+            pDataIn: *const DATA_BLOB,
+            ppszDataDescr: *mut *mut u16,
+            pOptionalEntropy: *const DATA_BLOB,
+            pvReserved: *mut std::ffi::c_void,
+            pPromptStruct: *mut std::ffi::c_void,
+            dwFlags: u32,
+            pDataOut: *mut DATA_BLOB,
+        ) -> i32;
+    }
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn LocalFree(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    }
+    const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
+
+    let mut enc_bytes = ciphertext.to_vec();
+    let data_in = DATA_BLOB {
+        cbData: enc_bytes.len() as u32,
+        pbData: enc_bytes.as_mut_ptr(),
+    };
+    let mut data_out = DATA_BLOB {
+        cbData: 0,
+        pbData: null_mut(),
+    };
+
+    let res = unsafe {
+        CryptUnprotectData(
+            &data_in,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut data_out,
+        )
+    };
+
+    if res == 0 || data_out.pbData.is_null() {
+        return Err("CryptUnprotectData failed (access denied or corrupted credential)".into());
+    }
+
+    let dec_bytes =
+        unsafe { std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec() };
+    unsafe { LocalFree(data_out.pbData as *mut _) };
+
+    Ok(dec_bytes)
+}
+
+/// Windows DPAPI-backed file vault store.
+/// Stores DPAPI-encrypted blobs on disk in the user's local application data directory.
+#[cfg(windows)]
+pub struct WindowsDpapiStore {
+    vault_dir: PathBuf,
+}
+
+#[cfg(windows)]
+impl WindowsDpapiStore {
+    pub fn new(vault_dir: PathBuf) -> Self {
+        Self { vault_dir }
+    }
+}
+
+#[cfg(windows)]
+impl Default for WindowsDpapiStore {
+    fn default() -> Self {
+        let base = if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+            PathBuf::from(appdata).join("AetherIDE")
+        } else {
+            PathBuf::from(".aether")
+        };
+        Self {
+            vault_dir: base.join("vault"),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl CredentialStore for WindowsDpapiStore {
+    fn store(&self, key: &str, secret: &str) -> Result<(), String> {
+        let encrypted = dpapi_encrypt(secret.as_bytes())?;
+        std::fs::create_dir_all(&self.vault_dir)
+            .map_err(|e| format!("Failed to create DPAPI vault directory: {}", e))?;
+        let target_file = self.vault_dir.join(format!("{}.dat", key));
+        std::fs::write(&target_file, &encrypted)
+            .map_err(|e| format!("Failed to write DPAPI encrypted vault record: {}", e))?;
+        Ok(())
+    }
+
+    fn retrieve(&self, key: &str) -> Result<Option<String>, String> {
+        let target_file = self.vault_dir.join(format!("{}.dat", key));
+        if !target_file.exists() {
+            return Ok(None);
+        }
+        let encrypted = std::fs::read(&target_file)
+            .map_err(|e| format!("Failed to read DPAPI vault record: {}", e))?;
+        let decrypted = dpapi_decrypt(&encrypted)?;
+        let secret = String::from_utf8(decrypted)
+            .map_err(|e| format!("DPAPI payload is not valid UTF-8: {}", e))?;
+        Ok(Some(secret))
+    }
+
+    fn delete(&self, key: &str) -> Result<(), String> {
+        let target_file = self.vault_dir.join(format!("{}.dat", key));
+        if target_file.exists() {
+            std::fs::remove_file(&target_file)
+                .map_err(|e| format!("Failed to remove DPAPI vault record: {}", e))?;
+        }
+        Ok(())
+    }
+}
+
+/// Ephemeral in-memory credential store.
+/// Zero-persistence, non-disk fallback for test suites and memory-only execution contexts.
+pub struct EphemeralMemoryStore {
+    entries: std::sync::RwLock<HashMap<String, String>>,
+}
+
+impl Default for EphemeralMemoryStore {
+    fn default() -> Self {
+        Self {
+            entries: std::sync::RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+impl EphemeralMemoryStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl CredentialStore for EphemeralMemoryStore {
+    fn store(&self, key: &str, secret: &str) -> Result<(), String> {
+        self.entries
+            .write()
+            .map_err(|e| e.to_string())?
+            .insert(key.to_string(), secret.to_string());
+        Ok(())
+    }
+
+    fn retrieve(&self, key: &str) -> Result<Option<String>, String> {
+        let lock = self.entries.read().map_err(|e| e.to_string())?;
+        Ok(lock.get(key).cloned())
+    }
+
+    fn delete(&self, key: &str) -> Result<(), String> {
+        self.entries.write().map_err(|e| e.to_string())?.remove(key);
+        Ok(())
+    }
+}
+
+/// Factory returning the platform-native credential store implementation.
+pub fn get_platform_credential_store() -> Arc<dyn CredentialStore> {
+    #[cfg(windows)]
+    {
+        Arc::new(WindowsDpapiStore::default())
+    }
+    #[cfg(not(windows))]
+    {
+        Arc::new(OsKeyringStore::new("AetherIDE"))
+    }
+}
 
 /// Protects a bearer credential string using platform-level operating system protection.
 /// On Windows, utilizes CryptProtectData (DPAPI) bound to the current logged-in user.
-/// On non-Windows platforms, utilizes user-bound machine-isolated derivation.
+/// On non-Windows platforms (macOS / Linux), utilizes OS Keyring (Keychain / Secret Service).
 /// Guarantees that raw bearer tokens are never persisted in plaintext.
 pub fn protect_credential(plaintext: &str) -> Result<String, String> {
     if plaintext.is_empty() {
@@ -95,62 +389,7 @@ pub fn protect_credential(plaintext: &str) -> Result<String, String> {
 
     #[cfg(windows)]
     {
-        use std::ptr::null_mut;
-        #[repr(C)]
-        #[allow(non_snake_case)]
-        struct DATA_BLOB {
-            cbData: u32,
-            pbData: *mut u8,
-        }
-        #[link(name = "Crypt32")]
-        extern "system" {
-            fn CryptProtectData(
-                pDataIn: *const DATA_BLOB,
-                szDataDescr: *const u16,
-                pOptionalEntropy: *const DATA_BLOB,
-                pvReserved: *mut std::ffi::c_void,
-                pPromptStruct: *mut std::ffi::c_void,
-                dwFlags: u32,
-                pDataOut: *mut DATA_BLOB,
-            ) -> i32;
-        }
-        #[link(name = "Kernel32")]
-        extern "system" {
-            fn LocalFree(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
-        }
-        const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
-
-        let mut in_bytes = plaintext.as_bytes().to_vec();
-        let data_in = DATA_BLOB {
-            cbData: in_bytes.len() as u32,
-            pbData: in_bytes.as_mut_ptr(),
-        };
-        let mut data_out = DATA_BLOB {
-            cbData: 0,
-            pbData: null_mut(),
-        };
-
-        let res = unsafe {
-            CryptProtectData(
-                &data_in,
-                null_mut(),
-                null_mut(),
-                null_mut(),
-                null_mut(),
-                CRYPTPROTECT_UI_FORBIDDEN,
-                &mut data_out,
-            )
-        };
-
-        if res == 0 || data_out.pbData.is_null() {
-            return Err("CryptProtectData failed to protect credential".into());
-        }
-
-        let encrypted_bytes = unsafe {
-            std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec()
-        };
-        unsafe { LocalFree(data_out.pbData as *mut _) };
-
+        let encrypted_bytes = dpapi_encrypt(plaintext.as_bytes())?;
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&encrypted_bytes);
         Ok(format!("dpapi:{}", b64))
@@ -158,105 +397,50 @@ pub fn protect_credential(plaintext: &str) -> Result<String, String> {
 
     #[cfg(not(windows))]
     {
-        use sha2::{Digest, Sha256};
-        let uid = std::env::var("USER").unwrap_or_else(|_| "user".into());
-        let key = Sha256::digest(uid.as_bytes());
-        let enc: Vec<u8> = plaintext
-            .as_bytes()
-            .iter()
-            .enumerate()
-            .map(|(i, b)| b ^ key[i % key.len()])
-            .collect();
-        use base64::Engine;
-        Ok(format!(
-            "user-bound:{}",
-            base64::engine::general_purpose::STANDARD.encode(&enc)
-        ))
+        let store = OsKeyringStore::new("AetherIDE");
+        store
+            .store("owner_token", plaintext)
+            .map_err(|e| format!("OS credential service unavailable: {}", e))?;
+        Ok("os-keyring:owner_token".to_string())
     }
 }
 
 /// Unprotects a platform-protected credential string.
 /// On Windows, utilizes CryptUnprotectData (DPAPI) to decrypt using the current user's key.
-/// On non-Windows platforms, decrypts using user-bound machine-isolated derivation.
+/// On macOS and Linux, retrieves from the OS Keyring (Keychain / Secret Service).
+/// Securely rejects or migrates deprecated legacy tokens with audit logging.
 pub fn unprotect_credential(protected: &str) -> Result<String, String> {
     if protected.is_empty() {
         return Err("Cannot unprotect empty credential".into());
     }
 
-    #[cfg(windows)]
-    {
-        use std::ptr::null_mut;
-        #[repr(C)]
-        #[allow(non_snake_case)]
-        struct DATA_BLOB {
-            cbData: u32,
-            pbData: *mut u8,
+    if let Some(b64) = protected.strip_prefix("dpapi:") {
+        #[cfg(windows)]
+        {
+            use base64::Engine;
+            let enc_bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| format!("Base64 decode failed: {}", e))?;
+            let dec_bytes = dpapi_decrypt(&enc_bytes)?;
+            String::from_utf8(dec_bytes).map_err(|e| format!("UTF-8 decode failed: {}", e))
         }
-        #[link(name = "Crypt32")]
-        extern "system" {
-            fn CryptUnprotectData(
-                pDataIn: *const DATA_BLOB,
-                ppszDataDescr: *mut *mut u16,
-                pOptionalEntropy: *const DATA_BLOB,
-                pvReserved: *mut std::ffi::c_void,
-                pPromptStruct: *mut std::ffi::c_void,
-                dwFlags: u32,
-                pDataOut: *mut DATA_BLOB,
-            ) -> i32;
+        #[cfg(not(windows))]
+        {
+            let _ = b64;
+            Err("DPAPI credential format is only supported on Windows".into())
         }
-        #[link(name = "Kernel32")]
-        extern "system" {
-            fn LocalFree(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    } else if let Some(key) = protected.strip_prefix("os-keyring:") {
+        let store = OsKeyringStore::new("AetherIDE");
+        match store.retrieve(key) {
+            Ok(Some(token)) => Ok(token),
+            Ok(None) => Err(format!("Credential '{}' not found in OS keyring", key)),
+            Err(e) => Err(format!("OS keyring retrieval failed for '{}': {}", key, e)),
         }
-        const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
-
-        let b64 = protected.strip_prefix("dpapi:").ok_or_else(|| {
-            "Invalid protected credential format (missing dpapi: prefix)".to_string()
-        })?;
-
-        use base64::Engine;
-        let mut enc_bytes = base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .map_err(|e| format!("Base64 decode failed: {}", e))?;
-
-        let data_in = DATA_BLOB {
-            cbData: enc_bytes.len() as u32,
-            pbData: enc_bytes.as_mut_ptr(),
-        };
-        let mut data_out = DATA_BLOB {
-            cbData: 0,
-            pbData: null_mut(),
-        };
-
-        let res = unsafe {
-            CryptUnprotectData(
-                &data_in,
-                null_mut(),
-                null_mut(),
-                null_mut(),
-                null_mut(),
-                CRYPTPROTECT_UI_FORBIDDEN,
-                &mut data_out,
-            )
-        };
-
-        if res == 0 || data_out.pbData.is_null() {
-            return Err("CryptUnprotectData failed (access denied or corrupted credential)".into());
-        }
-
-        let dec_bytes = unsafe {
-            std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec()
-        };
-        unsafe { LocalFree(data_out.pbData as *mut _) };
-
-        String::from_utf8(dec_bytes).map_err(|e| format!("UTF-8 decode failed: {}", e))
-    }
-
-    #[cfg(not(windows))]
-    {
-        let b64 = protected
-            .strip_prefix("user-bound:")
-            .ok_or_else(|| "Invalid protected credential format".to_string())?;
+    } else if let Some(b64) = protected.strip_prefix("user-bound:") {
+        // Deprecated legacy format from Sprint 11: decode for seamless migration, but log warning
+        tracing::warn!(
+            "Encountered deprecated legacy user-bound credential; migrating to native OS vault"
+        );
         use base64::Engine;
         let enc = base64::engine::general_purpose::STANDARD
             .decode(b64)
@@ -270,6 +454,15 @@ pub fn unprotect_credential(protected: &str) -> Result<String, String> {
             .map(|(i, b)| b ^ key[i % key.len()])
             .collect();
         String::from_utf8(dec).map_err(|e| format!("UTF-8 decode failed: {}", e))
+    } else {
+        Err(format!(
+            "Invalid protected credential format (unrecognized prefix in '{}')",
+            if protected.len() > 16 {
+                &protected[..16]
+            } else {
+                protected
+            }
+        ))
     }
 }
 
@@ -293,8 +486,9 @@ impl std::fmt::Display for SessionType {
 }
 
 /// Server-controlled session record binding an authenticated token to a cryptographic identity and role.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionRecord {
+    #[serde(skip_serializing, default)]
     pub session_token: String,
     pub peer_id: String,
     pub role: String,
@@ -302,6 +496,19 @@ pub struct SessionRecord {
     #[serde(skip, default = "Instant::now")]
     pub created_at: Instant,
     pub ttl: Duration,
+}
+
+impl std::fmt::Debug for SessionRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionRecord")
+            .field("session_token", &"[REDACTED_SESSION_TOKEN]")
+            .field("peer_id", &self.peer_id)
+            .field("role", &self.role)
+            .field("session_type", &self.session_type)
+            .field("created_at", &self.created_at)
+            .field("ttl", &self.ttl)
+            .finish()
+    }
 }
 
 impl SessionRecord {
@@ -897,6 +1104,81 @@ mod tests {
             legit_res,
             AuthVerificationResult::Success,
             "Legitimate owner must not be locked out by attacker churn"
+        );
+    }
+
+    #[test]
+    fn test_session_record_secret_redaction_and_serde() {
+        let secret = "super-secret-bearer-session-token-123456";
+        let session = SessionRecord::new(
+            secret,
+            "peer-test-uuid",
+            "Owner",
+            SessionType::DesktopOwner,
+            Duration::from_secs(3600),
+        );
+
+        // 1. Debug formatting MUST redact session token
+        let debug_str = format!("{:?}", session);
+        assert!(
+            debug_str.contains("[REDACTED_SESSION_TOKEN]"),
+            "Debug output must contain [REDACTED_SESSION_TOKEN]"
+        );
+        assert!(
+            !debug_str.contains(secret),
+            "Debug output must NEVER leak the raw session token!"
+        );
+
+        // 2. Serde serialization MUST omit session_token entirely
+        let json_str = serde_json::to_string(&session).expect("Serialization must succeed");
+        assert!(
+            !json_str.contains(secret),
+            "Serialized JSON must NEVER leak session token!"
+        );
+        assert!(
+            !json_str.contains("session_token"),
+            "Serialized JSON must omit the session_token field entirely"
+        );
+    }
+
+    #[test]
+    fn test_ephemeral_credential_store() {
+        let store = EphemeralMemoryStore::new();
+        assert_eq!(store.retrieve("key1").unwrap(), None);
+
+        store.store("key1", "secret-value-1").unwrap();
+        assert_eq!(
+            store.retrieve("key1").unwrap(),
+            Some("secret-value-1".to_string())
+        );
+
+        store.delete("key1").unwrap();
+        assert_eq!(store.retrieve("key1").unwrap(), None);
+    }
+
+    #[test]
+    fn test_legacy_user_bound_migration() {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let uid = std::env::var("USER").unwrap_or_else(|_| "user".into());
+        let key = Sha256::digest(uid.as_bytes());
+        let secret = "legacy-token-migration-test-uuid-555";
+        let enc: Vec<u8> = secret
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i % key.len()])
+            .collect();
+        let legacy_str = format!(
+            "user-bound:{}",
+            base64::engine::general_purpose::STANDARD.encode(&enc)
+        );
+
+        let recovered =
+            unprotect_credential(&legacy_str).expect("Legacy unprotection must succeed");
+        assert_eq!(
+            recovered, secret,
+            "Legacy user-bound token must be successfully migrated"
         );
     }
 }

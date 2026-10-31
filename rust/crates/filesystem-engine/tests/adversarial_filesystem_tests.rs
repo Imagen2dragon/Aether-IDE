@@ -38,11 +38,7 @@ fn remove_path_robust(p: &std::path::Path) -> std::io::Result<()> {
         }
         // Fallback to cmd rmdir /S /Q
         let _ = std::process::Command::new("cmd")
-            .arg("/C")
-            .arg("rmdir")
-            .arg("/S")
-            .arg("/Q")
-            .arg(p)
+            .args(["/C", &format!("rmdir /S /Q \"{}\"", p.display())])
             .output();
         if !p.exists() && fs::symlink_metadata(p).is_err() {
             return Ok(());
@@ -431,20 +427,23 @@ fn test_13_concurrent_adversarial_symlink_race() {
     fs::write(&sentinel_file, "CRITICAL_SENTINEL_ROOT_KEY_DO_NOT_TAMPER").unwrap();
     fs::write(&canary_file, "OUTSIDE_CANARY_DO_NOT_DELETE").unwrap();
 
-    let race_sub = ws.join("race_target");
-    let _ = fs::create_dir_all(&race_sub);
-
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let stop_clone = stop_flag.clone();
-    let ws_clone = ws.clone();
-    let outside_clone = outside_dir.clone();
-
     // PROVEN OVERLAP COORDINATION COUNTERS
     let substitution_count = Arc::new(AtomicU64::new(0));
     let sub_clone = substitution_count.clone();
 
     let overlapped_operations = Arc::new(AtomicU64::new(0));
     let overlap_clone = overlapped_operations.clone();
+
+    let race_sub = ws.join("race_target");
+    // Establish initial adversarial symlink/junction prior to worker execution
+    if create_symlink_or_junction(&outside_dir, &race_sub).is_ok() {
+        substitution_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop_flag.clone();
+    let ws_clone = ws.clone();
+    let outside_clone = outside_dir.clone();
 
     // Background adversarial thread: repeatedly substitutes directory with symlink/junction
     let attacker = std::thread::spawn(move || {
@@ -467,7 +466,7 @@ fn test_13_concurrent_adversarial_symlink_race() {
                 sub_clone.fetch_add(1, Ordering::Relaxed);
             }
 
-            std::thread::sleep(std::time::Duration::from_millis(15));
+            std::thread::sleep(std::time::Duration::from_millis(25));
 
             // Remove junction and replace with benign directory
             for _ in 0..15 {
@@ -485,7 +484,7 @@ fn test_13_concurrent_adversarial_symlink_race() {
     // Worker thread: executes contained filesystem operations concurrently with attacker
     let start_time = std::time::Instant::now();
     let mut worker_iters = 0;
-    while start_time.elapsed() < std::time::Duration::from_millis(1200) && worker_iters < 60 {
+    while start_time.elapsed() < std::time::Duration::from_millis(1500) && worker_iters < 100 {
         worker_iters += 1;
         // Detect if attacker has active symlink in place right now
         let target = ws.join("race_target");
@@ -516,7 +515,7 @@ fn test_13_concurrent_adversarial_symlink_race() {
         // Attempt contained delete
         let _ = FilesystemEngine::delete_file_contained(&ws, "race_target/payload_moved.txt");
 
-        std::thread::sleep(std::time::Duration::from_millis(15));
+        std::thread::sleep(std::time::Duration::from_millis(8));
     }
 
     stop_flag.store(true, Ordering::Relaxed);
@@ -532,6 +531,10 @@ fn test_13_concurrent_adversarial_symlink_race() {
     assert!(
         total_subs > 0,
         "Attacker must have successfully created at least one symlink substitution"
+    );
+    assert!(
+        total_overlaps > 0,
+        "Worker operations must have executed while adversarial symlink substitution was actively in place"
     );
 
     // RIGOROUS VERIFICATION:
