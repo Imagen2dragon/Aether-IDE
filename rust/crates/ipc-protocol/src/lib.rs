@@ -131,6 +131,37 @@ pub enum IpcRequest {
     TerminalClose {
         session_id: u32,
     },
+    TerminalPollOutput {
+        session_id: u32,
+        offset: usize,
+    },
+    ListAgentPersonas,
+    CancelAgentTask {
+        task_id: String,
+    },
+    QueryProjectGraph {
+        workspace_path: Option<String>,
+    },
+    AnalyzeChangeImpact {
+        file_path: String,
+    },
+    SaveProjectMemoryNote {
+        title: String,
+        content: String,
+        tags: Vec<String>,
+    },
+    GetProjectMemoryNotes,
+    DeleteProjectMemoryNote {
+        note_id: String,
+    },
+    StartExpoServer {
+        project_path: String,
+        port: Option<u16>,
+    },
+    GetExpoStatus {
+        project_path: String,
+    },
+    DiscoverMobileDevices,
     SyncGeneratePairing {
         device_name: Option<String>,
         host: Option<String>,

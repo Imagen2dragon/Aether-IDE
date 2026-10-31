@@ -367,12 +367,27 @@ pub mod native {
                 "Ping",
                 "RunDoctorCheck",
                 "QueryProjectBrain",
+                "QueryProjectGraph",
+                "AnalyzeChangeImpact",
+                "SaveProjectMemoryNote",
+                "GetProjectMemoryNotes",
+                "DeleteProjectMemoryNote",
                 "FileRead",
                 "FileWrite",
                 "TerminalSpawn",
                 "TerminalWrite",
                 "TerminalResize",
+                "TerminalClose",
+                "TerminalPollOutput",
+                "ListAgentPersonas",
                 "CreateAgentTask",
+                "GetAgentTask",
+                "ApproveAgentStep",
+                "RejectAgentStep",
+                "CancelAgentTask",
+                "StartExpoServer",
+                "GetExpoStatus",
+                "DiscoverMobileDevices",
             ];
 
             if !allowed_actions.contains(&action.as_str()) {
@@ -635,6 +650,20 @@ pub mod native {
                 cols: params.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16,
                 rows: params.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16,
             },
+            "TerminalClose" => IpcRequest::TerminalClose {
+                session_id: params
+                    .get("session_id")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
+            },
+            "TerminalPollOutput" => IpcRequest::TerminalPollOutput {
+                session_id: params
+                    .get("session_id")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
+                offset: params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            },
+            "ListAgentPersonas" => IpcRequest::ListAgentPersonas,
             "CreateAgentTask" => IpcRequest::CreateAgentTask {
                 role: params
                     .get("role")
@@ -652,6 +681,110 @@ pub mod native {
                     .unwrap_or("autopilot")
                     .to_string(),
             },
+            "GetAgentTask" => IpcRequest::GetAgentTask {
+                task_id: params
+                    .get("task_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            "ApproveAgentStep" => IpcRequest::ApproveAgentStep {
+                task_id: params
+                    .get("task_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                step_id: params
+                    .get("step_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            "RejectAgentStep" => IpcRequest::RejectAgentStep {
+                task_id: params
+                    .get("task_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                step_id: params
+                    .get("step_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                reason: params
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("User rejected step")
+                    .to_string(),
+            },
+            "CancelAgentTask" => IpcRequest::CancelAgentTask {
+                task_id: params
+                    .get("task_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            "QueryProjectGraph" => IpcRequest::QueryProjectGraph {
+                workspace_path: params
+                    .get("workspace_path")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+            },
+            "AnalyzeChangeImpact" => IpcRequest::AnalyzeChangeImpact {
+                file_path: params
+                    .get("file_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            "SaveProjectMemoryNote" => IpcRequest::SaveProjectMemoryNote {
+                title: params
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Untitled Note")
+                    .to_string(),
+                content: params
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                tags: params
+                    .get("tags")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            },
+            "GetProjectMemoryNotes" => IpcRequest::GetProjectMemoryNotes,
+            "DeleteProjectMemoryNote" => IpcRequest::DeleteProjectMemoryNote {
+                note_id: params
+                    .get("note_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            "StartExpoServer" => IpcRequest::StartExpoServer {
+                project_path: params
+                    .get("project_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".")
+                    .to_string(),
+                port: params
+                    .get("port")
+                    .and_then(|v| v.as_u64())
+                    .map(|p| p as u16),
+            },
+            "GetExpoStatus" => IpcRequest::GetExpoStatus {
+                project_path: params
+                    .get("project_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".")
+                    .to_string(),
+            },
+            "DiscoverMobileDevices" => IpcRequest::DiscoverMobileDevices,
             _ => {
                 return serde_json::json!({
                     "id": req_id,
@@ -793,15 +926,33 @@ pub mod native {
                 "Ping",
                 "RunDoctorCheck",
                 "QueryProjectBrain",
+                "QueryProjectGraph",
+                "AnalyzeChangeImpact",
+                "SaveProjectMemoryNote",
+                "GetProjectMemoryNotes",
+                "DeleteProjectMemoryNote",
                 "FileRead",
                 "FileWrite",
                 "TerminalSpawn",
                 "TerminalWrite",
                 "TerminalResize",
+                "TerminalClose",
+                "TerminalPollOutput",
+                "ListAgentPersonas",
                 "CreateAgentTask",
+                "GetAgentTask",
+                "ApproveAgentStep",
+                "RejectAgentStep",
+                "CancelAgentTask",
+                "StartExpoServer",
+                "GetExpoStatus",
+                "DiscoverMobileDevices",
             ];
             assert!(allowed_actions.contains(&"LspCompletion"));
             assert!(allowed_actions.contains(&"FileWrite"));
+            assert!(allowed_actions.contains(&"TerminalPollOutput"));
+            assert!(allowed_actions.contains(&"QueryProjectGraph"));
+            assert!(allowed_actions.contains(&"ApproveAgentStep"));
             assert!(!allowed_actions.contains(&"ArbitraryShellExecute"));
             assert!(!allowed_actions.contains(&"FormatDrive"));
         }

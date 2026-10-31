@@ -212,6 +212,19 @@ impl AgentOrchestrator {
         self.tasks.lock().insert(task_id.to_string(), runtime);
         Ok(task_clone)
     }
+
+    pub fn cancel_task(&self, task_id: &str) -> Result<AgentTask> {
+        let mut runtime = {
+            let mut lock = self.tasks.lock();
+            lock.remove(task_id)
+                .ok_or_else(|| AetherError::Agent(format!("Task {} not found", task_id)))?
+        };
+
+        runtime.task.status = agent_runtime::TaskStatus::Cancelled;
+        let task_clone = runtime.task.clone();
+        self.tasks.lock().insert(task_id.to_string(), runtime);
+        Ok(task_clone)
+    }
 }
 
 #[cfg(test)]

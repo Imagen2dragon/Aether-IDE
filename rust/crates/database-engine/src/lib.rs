@@ -35,6 +35,16 @@ pub struct ProofOfWorkRecord {
     pub timestamp: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectMemoryNote {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    pub tags: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 impl DatabaseEngine {
     pub fn open_in_memory() -> Result<Self> {
         let conn =
@@ -115,6 +125,15 @@ impl DatabaseEngine {
                 edge_type TEXT NOT NULL,
                 weight REAL DEFAULT 1.0,
                 PRIMARY KEY (source_node, target_node, edge_type)
+            );
+
+            CREATE TABLE IF NOT EXISTS project_memory_notes (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tags_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );",
         )
         .map_err(|e| AetherError::Database(e.to_string()))?;
@@ -231,6 +250,68 @@ impl DatabaseEngine {
         }
         Ok(results)
     }
+
+    pub fn save_memory_note(&self, note: &ProjectMemoryNote) -> Result<()> {
+        let conn = self.conn.lock();
+        let tags_json = serde_json::to_string(&note.tags).unwrap_or_else(|_| "[]".into());
+        conn.execute(
+            "INSERT INTO project_memory_notes (id, title, content, tags_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET title=?2, content=?3, tags_json=?4, updated_at=?6",
+            params![
+                note.id,
+                note.title,
+                note.content,
+                tags_json,
+                note.created_at,
+                note.updated_at
+            ],
+        )
+        .map_err(|e| AetherError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn get_memory_notes(&self) -> Result<Vec<ProjectMemoryNote>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, title, content, tags_json, created_at, updated_at
+                 FROM project_memory_notes ORDER BY updated_at DESC",
+            )
+            .map_err(|e| AetherError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let tags_json: String = row.get(3)?;
+                let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+                Ok(ProjectMemoryNote {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    content: row.get(2)?,
+                    tags,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            })
+            .map_err(|e| AetherError::Database(e.to_string()))?;
+
+        let mut notes = Vec::new();
+        for n in rows.flatten() {
+            notes.push(n);
+        }
+        Ok(notes)
+    }
+
+    pub fn delete_memory_note(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "DELETE FROM project_memory_notes WHERE id = ?1",
+                params![id],
+            )
+            .map_err(|e| AetherError::Database(e.to_string()))?;
+        Ok(rows > 0)
+    }
 }
 
 #[cfg(test)]
@@ -282,5 +363,30 @@ mod tests {
         assert_eq!(ledger.len(), 1);
         assert_eq!(ledger[0].tool_name, "cargo_test");
         assert_eq!(ledger[0].exit_code, 0);
+    }
+
+    #[test]
+    fn test_project_memory_crud() {
+        let db = DatabaseEngine::open_in_memory().expect("failed to open in-memory db");
+
+        let note = ProjectMemoryNote {
+            id: "mem-01".into(),
+            title: "Architecture Decision: ConPTY".into(),
+            content: "We use Windows ConPTY with ScopedJobObject for reliable process containment."
+                .into(),
+            tags: vec!["architecture".into(), "terminal".into(), "security".into()],
+            created_at: "2026-10-31T11:00:00Z".into(),
+            updated_at: "2026-10-31T11:00:00Z".into(),
+        };
+
+        db.save_memory_note(&note).expect("save failed");
+        let notes = db.get_memory_notes().expect("get failed");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "Architecture Decision: ConPTY");
+        assert_eq!(notes[0].tags.len(), 3);
+
+        let deleted = db.delete_memory_note("mem-01").expect("delete failed");
+        assert!(deleted);
+        assert_eq!(db.get_memory_notes().expect("get after delete").len(), 0);
     }
 }

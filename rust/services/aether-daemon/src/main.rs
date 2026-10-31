@@ -500,6 +500,122 @@ async fn handle_ipc_envelope(
             }
         }
 
+        IpcRequest::TerminalPollOutput { session_id, offset } => {
+            #[cfg(windows)]
+            {
+                match state.terminal_manager.read_output(session_id, offset) {
+                    Ok((bytes, total, is_alive)) => {
+                        let data_str = String::from_utf8_lossy(&bytes).to_string();
+                        IpcResponse::ok(serde_json::json!({
+                            "session_id": session_id,
+                            "data": data_str,
+                            "offset": total,
+                            "is_alive": is_alive,
+                        }))
+                    }
+                    Err(e) => IpcResponse::err(e.to_string()),
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (session_id, offset);
+                IpcResponse::ok(serde_json::json!({
+                    "session_id": session_id,
+                    "data": "",
+                    "offset": 0,
+                    "is_alive": false,
+                }))
+            }
+        }
+
+        IpcRequest::ListAgentPersonas => {
+            let personas = state.agent_orchestrator.list_personas();
+            IpcResponse::ok(serde_json::to_value(personas).unwrap())
+        }
+
+        IpcRequest::CancelAgentTask { task_id } => {
+            match state.agent_orchestrator.cancel_task(&task_id) {
+                Ok(task) => IpcResponse::ok(serde_json::to_value(task).unwrap()),
+                Err(e) => IpcResponse::err(e.to_string()),
+            }
+        }
+
+        IpcRequest::QueryProjectGraph { workspace_path } => {
+            let root = workspace_path
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            let mut brain = state.project_brain.lock();
+            if brain.get_graph().nodes.is_empty() {
+                let _ = brain.scan_workspace(&root);
+            }
+            IpcResponse::ok(serde_json::to_value(brain.get_graph()).unwrap())
+        }
+
+        IpcRequest::AnalyzeChangeImpact { file_path } => {
+            let brain = state.project_brain.lock();
+            let report = brain.calculate_impact_radar(&file_path);
+            IpcResponse::ok(serde_json::to_value(report).unwrap())
+        }
+
+        IpcRequest::SaveProjectMemoryNote {
+            title,
+            content,
+            tags,
+        } => {
+            let note = database_engine::ProjectMemoryNote {
+                id: format!("note-{}", uuid::Uuid::new_v4().simple()),
+                title,
+                content,
+                tags,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            };
+            let brain = state.project_brain.lock();
+            match brain.save_memory_note(&note) {
+                Ok(_) => IpcResponse::ok(serde_json::to_value(note).unwrap()),
+                Err(e) => IpcResponse::err(e.to_string()),
+            }
+        }
+
+        IpcRequest::GetProjectMemoryNotes => {
+            let brain = state.project_brain.lock();
+            match brain.get_memory_notes() {
+                Ok(notes) => IpcResponse::ok(serde_json::to_value(notes).unwrap()),
+                Err(e) => IpcResponse::err(e.to_string()),
+            }
+        }
+
+        IpcRequest::DeleteProjectMemoryNote { note_id } => {
+            let brain = state.project_brain.lock();
+            match brain.delete_memory_note(&note_id) {
+                Ok(deleted) => IpcResponse::ok(serde_json::json!({ "deleted": deleted })),
+                Err(e) => IpcResponse::err(e.to_string()),
+            }
+        }
+
+        IpcRequest::StartExpoServer { project_path, port } => {
+            let p = PathBuf::from(&project_path);
+            let info = mobile_build_manager::MobileBuildManager::get_expo_dev_server_info(&p, port);
+            match info {
+                Ok(s) => IpcResponse::ok(serde_json::to_value(s).unwrap()),
+                Err(e) => IpcResponse::err(e.to_string()),
+            }
+        }
+
+        IpcRequest::GetExpoStatus { project_path } => {
+            let p = PathBuf::from(&project_path);
+            let info = mobile_build_manager::MobileBuildManager::get_expo_dev_server_info(&p, None);
+            match info {
+                Ok(s) => IpcResponse::ok(serde_json::to_value(s).unwrap()),
+                Err(e) => IpcResponse::err(e.to_string()),
+            }
+        }
+
+        IpcRequest::DiscoverMobileDevices => {
+            let devices = mobile_build_manager::MobileBuildManager::discover_devices().await;
+            IpcResponse::ok(serde_json::to_value(devices).unwrap())
+        }
+
         IpcRequest::SyncGeneratePairing {
             device_name,
             host,

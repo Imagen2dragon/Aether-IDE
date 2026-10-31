@@ -451,6 +451,17 @@ pub mod win32 {
             self.recent_output.lock().clone()
         }
 
+        pub fn read_output(&self, offset: usize) -> (Vec<u8>, usize, bool) {
+            let recent = self.recent_output.lock();
+            let is_alive = !self.closed.load(Ordering::SeqCst);
+            let total = recent.len();
+            if offset >= total {
+                (Vec::new(), total, is_alive)
+            } else {
+                (recent[offset..].to_vec(), total, is_alive)
+            }
+        }
+
         pub fn is_alive(&self) -> bool {
             !self.closed.load(Ordering::SeqCst)
         }

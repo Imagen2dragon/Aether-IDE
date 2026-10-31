@@ -24,6 +24,7 @@ dependencies = [
  "agent-runtime",
  "application-core",
  "checkpoint-engine",
+ "chrono",
  "database-engine",
  "diagnostics",
  "filesystem-engine",
@@ -45,6 +46,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "workspace-sync",
 ]
 

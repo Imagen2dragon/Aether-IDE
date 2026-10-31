@@ -28,6 +28,25 @@ pub struct EasCliStatus {
     pub logged_in_as: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MobileDeviceInfo {
+    pub id: String,
+    pub name: String,
+    pub platform: String, // "android", "ios", "web"
+    pub state: String,    // "ready", "device", "offline", "unauthorized", "emulator"
+    pub is_emulator: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpoDevServerInfo {
+    pub project_name: String,
+    pub status: String,
+    pub port: u16,
+    pub local_url: String,
+    pub qr_uri: String,
+    pub web_supported: bool,
+}
+
 pub struct MobileBuildManager;
 
 impl MobileBuildManager {
@@ -348,6 +367,84 @@ const styles = StyleSheet.create({
             artifact_url,
         })
     }
+
+    pub async fn discover_devices() -> Vec<MobileDeviceInfo> {
+        let mut devices = vec![MobileDeviceInfo {
+            id: "web-preview".to_string(),
+            name: "Web Runtime Preview (Chrome / Edge Engine)".to_string(),
+            platform: "web".to_string(),
+            state: "ready".to_string(),
+            is_emulator: false,
+        }];
+
+        // Probe ADB for connected Android physical or emulator devices
+        if let Ok(out) = ProcessManager::run_command_streaming(
+            "adb devices -l",
+            None,
+            Some(std::time::Duration::from_secs(3)),
+            None,
+            None,
+        )
+        .await
+        {
+            if out.exit_code == 0 {
+                for line in out.stdout.lines().skip(1) {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let id = parts[0].to_string();
+                        let state = parts[1].to_string();
+                        let is_emulator = id.starts_with("emulator-");
+                        let name = if is_emulator {
+                            format!("Android Emulator ({})", id)
+                        } else {
+                            format!("Android Device ({})", id)
+                        };
+                        devices.push(MobileDeviceInfo {
+                            id,
+                            name,
+                            platform: "android".to_string(),
+                            state,
+                            is_emulator,
+                        });
+                    }
+                }
+            }
+        }
+
+        devices
+    }
+
+    pub fn get_expo_dev_server_info<P: AsRef<Path>>(
+        project_dir: P,
+        port: Option<u16>,
+    ) -> Result<ExpoDevServerInfo> {
+        let dir = project_dir.as_ref();
+        let pkg_path = dir.join("package.json");
+        let project_name = if pkg_path.exists() {
+            let s = std::fs::read_to_string(&pkg_path)?;
+            let v: serde_json::Value = serde_json::from_str(&s)?;
+            v["name"].as_str().unwrap_or("AetherMobileApp").to_string()
+        } else {
+            "AetherMobileApp".to_string()
+        };
+
+        let port = port.unwrap_or(8081);
+        let local_url = format!("http://localhost:{}", port);
+        let qr_uri = format!("exp://127.0.0.1:{}", port);
+
+        Ok(ExpoDevServerInfo {
+            project_name,
+            status: "ready".to_string(),
+            port,
+            local_url,
+            qr_uri,
+            web_supported: true,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -408,6 +505,30 @@ mod tests {
                 );
             }
         }
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_discover_devices_and_dev_server_info() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_mobile_dev_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let app_path =
+            MobileBuildManager::scaffold_expo_app(&temp_dir, "DevTestApp", "com.aether.devtest")
+                .expect("scaffolding failed");
+
+        let devices = MobileBuildManager::discover_devices().await;
+        assert!(!devices.is_empty(), "Should always include web-preview");
+        assert_eq!(devices[0].id, "web-preview");
+
+        let info = MobileBuildManager::get_expo_dev_server_info(&app_path, Some(8088))
+            .expect("server info failed");
+        assert_eq!(info.project_name, "DevTestApp");
+        assert_eq!(info.port, 8088);
+        assert_eq!(info.local_url, "http://localhost:8088");
+        assert!(info.qr_uri.starts_with("exp://"));
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

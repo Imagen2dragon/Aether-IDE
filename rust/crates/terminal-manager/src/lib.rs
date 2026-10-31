@@ -153,6 +153,19 @@ impl TerminalManager {
         }
     }
 
+    #[cfg(windows)]
+    pub fn read_output(&self, id: u32, offset: usize) -> Result<(Vec<u8>, usize, bool)> {
+        let lock = self.conpty_sessions.lock();
+        if let Some(session) = lock.get(&id) {
+            Ok(session.read_output(offset))
+        } else {
+            Err(AetherError::Process(format!(
+                "Terminal session {} not found",
+                id
+            )))
+        }
+    }
+
     pub fn close_session(&self, id: u32) -> Result<()> {
         #[cfg(windows)]
         {
