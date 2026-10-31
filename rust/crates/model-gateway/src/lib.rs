@@ -1143,8 +1143,11 @@ mod tests {
         assert_eq!(deep_model, "claude-3-5-sonnet");
     }
 
+    static ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn test_missing_credentials_return_actionable_errors() {
+        let _guard = ENV_MUTEX.lock().await;
         // Ensure keys are unset in this test scope
         std::env::remove_var("OPENAI_API_KEY");
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -1187,6 +1190,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_provider_status_model_diagnostics() {
+        let _guard = ENV_MUTEX.lock().await;
         let gateway = ModelGateway::new();
 
         // Local provider is ModelAvailable
