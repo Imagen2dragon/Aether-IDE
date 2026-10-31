@@ -244,9 +244,14 @@ fn get_bootstrap_identity() -> (Option<String>, Option<String>) {
     if let Ok(content) = std::fs::read_to_string(&bootstrap_path) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
             let token = val
-                .get("session_token")
+                .get("protected_token")
                 .and_then(|v| v.as_str())
-                .map(|s| s.trim().to_string());
+                .and_then(|pt| security_core::unprotect_credential(pt).ok())
+                .or_else(|| {
+                    val.get("session_token")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                });
             let peer = val
                 .get("owner_peer_id")
                 .and_then(|v| v.as_str())

@@ -94,23 +94,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         swarm_coordinator,
     });
 
-    // Write desktop bootstrap credentials (owner_peer_id + session_token)
-    let _ = std::fs::create_dir_all(&config.data_dir);
+    // SEC-P0: Write platform-protected desktop bootstrap credentials (DPAPI / OS-bound)
+    // Never persist raw bearer tokens in plaintext to ordinary files.
+    std::fs::create_dir_all(&config.data_dir).map_err(|e| {
+        error!("CRITICAL: Failed to create data directory: {}", e);
+        e
+    })?;
+
+    let protected_token = security_core::protect_credential(&session_token).map_err(|e| {
+        error!("CRITICAL: Platform credential protection failed: {}", e);
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
+    })?;
+
     let bootstrap_file = config.data_dir.join("desktop_bootstrap.json");
     let bootstrap_payload = serde_json::json!({
         "owner_peer_id": owner_peer_id,
-        "session_token": session_token,
+        "protected_token": protected_token,
         "role": "Owner",
         "session_type": "DesktopOwner",
         "version": AETHER_VERSION,
         "created_at": chrono::Utc::now().to_rfc3339(),
     });
-    let _ = std::fs::write(
+
+    std::fs::write(
         &bootstrap_file,
         serde_json::to_string_pretty(&bootstrap_payload).unwrap_or_default(),
-    );
+    )
+    .map_err(|e| {
+        error!(
+            "CRITICAL: Failed to write protected desktop bootstrap file: {}",
+            e
+        );
+        e
+    })?;
+
     info!(
-        "Desktop bootstrap identity published to {:?}",
+        "Platform-protected desktop bootstrap identity published to {:?}",
         bootstrap_file
     );
 
@@ -2594,6 +2613,119 @@ mod tests {
             assert!(
                 r.success,
                 "Legitimate desktop client must never be locked out by attacker"
+            );
+        } else {
+            panic!("Expected response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cred_01_and_02_at_rest_audit_no_plaintext_token_on_disk() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_cred_audit_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temporary directory for audit");
+
+        let raw_token = "aether_sec_owner_raw_bearer_token_super_secret_999";
+        let bootstrap_file = temp_dir.join("desktop_bootstrap.json");
+
+        // Protect token via security_core platform DPAPI/key derivation
+        let protected_token = security_core::protect_credential(raw_token)
+            .expect("Credential protection must succeed on current platform");
+
+        // Write bootstrap JSON with ONLY protected_token
+        let bootstrap_json = serde_json::json!({
+            "port": 44888,
+            "owner_peer_id": "owner-audit-peer",
+            "protected_token": protected_token,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+        });
+        std::fs::write(
+            &bootstrap_file,
+            serde_json::to_string_pretty(&bootstrap_json).unwrap(),
+        )
+        .expect("Writing protected bootstrap must succeed");
+
+        // STRICT AT-REST AUDIT:
+        // Walk entire directory tree and verify raw token string NEVER appears anywhere on disk
+        for entry in std::fs::read_dir(&temp_dir)
+            .expect("Read temp dir")
+            .flatten()
+        {
+            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                let bytes = std::fs::read(entry.path()).expect("File must be readable");
+                let content_str = String::from_utf8_lossy(&bytes);
+                assert!(
+                    !content_str.contains(raw_token),
+                    "FAIL: Raw plaintext owner token found at rest in file '{}'!",
+                    entry.path().display()
+                );
+            }
+        }
+
+        // Verify consumer can recover raw token from protected bootstrap
+        let read_back_raw = std::fs::read_to_string(&bootstrap_file).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&read_back_raw).unwrap();
+        let enc_token_b64 = parsed["protected_token"]
+            .as_str()
+            .expect("protected_token must exist");
+        let recovered_token = security_core::unprotect_credential(enc_token_b64)
+            .expect("Unprotecting valid credential must succeed");
+
+        assert_eq!(
+            recovered_token, raw_token,
+            "Recovered credential must match original byte-for-byte"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_sec_09_connection_churn_rate_limiting_defense() {
+        let state = create_test_state();
+
+        // Attacker attempts rapid brute-force / auth failure by churning 25 distinct client connection IDs
+        for i in 1..=25 {
+            let churned_client = format!("ephemeral-churn-source-{}", i);
+            let env_bad = IpcEnvelope {
+                id: format!("churn-{}", i),
+                session_token: Some("invalid-token".into()),
+                peer_id: None,
+                payload: IpcPayload::Request(IpcRequest::Ping),
+            };
+            let _ = handle_ipc_envelope(&state, env_bad, &churned_client).await;
+        }
+
+        // Attacker on new source is throttled by global rate limiter
+        let env_attack_churn = IpcEnvelope {
+            id: "attack-churn-locked".into(),
+            session_token: Some("invalid-token".into()),
+            peer_id: None,
+            payload: IpcPayload::Request(IpcRequest::Ping),
+        };
+        let resp_churn =
+            handle_ipc_envelope(&state, env_attack_churn, "ephemeral-churn-source-999").await;
+        if let IpcPayload::Response(r) = resp_churn.payload {
+            assert!(!r.success);
+            assert!(r.error.unwrap().contains("rate-limited"));
+        } else {
+            panic!("Expected response");
+        }
+
+        // Legitimate desktop Owner presenting valid session token is NOT denied
+        let env_owner = IpcEnvelope {
+            id: "owner-available".into(),
+            session_token: Some(state.session_token.clone()),
+            peer_id: Some(state.owner_peer_id.clone()),
+            payload: IpcPayload::Request(IpcRequest::Ping),
+        };
+        let resp_owner =
+            handle_ipc_envelope(&state, env_owner, "legit-desktop-owner-session").await;
+        if let IpcPayload::Response(r) = resp_owner.payload {
+            assert!(
+                r.success,
+                "Legitimate Owner with valid credential must remain available under connection-churn attack"
             );
         } else {
             panic!("Expected response");

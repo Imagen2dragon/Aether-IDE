@@ -1,79 +1,393 @@
 use application_core::{AetherError, Result};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-pub struct FilesystemEngine;
+/// Sanitizes an untrusted user-provided relative path for capability operations.
+/// Strictly rejects path traversals (`..`), drive prefixes, absolute roots,
+/// Alternate Data Streams (`:`), Windows device names (CON, NUL, PRN, etc.),
+/// trailing dots/spaces, null bytes, and extended device namespaces.
+pub fn sanitize_relative_path(user_path: &str) -> Result<PathBuf> {
+    if user_path.is_empty() {
+        return Err(AetherError::PermissionDenied("Path cannot be empty".into()));
+    }
 
-impl FilesystemEngine {
-    pub fn scan_workspace_files<P: AsRef<Path>>(
-        root: P,
-        exclude_patterns: &[String],
-    ) -> Result<Vec<PathBuf>> {
+    // 1. Explicitly reject null bytes and control characters
+    if user_path.as_bytes().contains(&0) || user_path.chars().any(|c| (c as u32) < 0x20) {
+        return Err(AetherError::PermissionDenied(
+            "Access Denied: Null bytes and control characters are strictly forbidden in paths"
+                .into(),
+        ));
+    }
+
+    // 2. Explicitly reject URL encoded traversal attempts (%2e, %00, %2f, %5c)
+    let lower = user_path.to_ascii_lowercase();
+    if lower.contains("%2e")
+        || lower.contains("%00")
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+    {
+        return Err(AetherError::PermissionDenied(
+            "Access Denied: URL encoded path sequences are strictly forbidden".into(),
+        ));
+    }
+
+    // 3. Explicitly reject Alternate Data Streams and drive colons anywhere in relative paths
+    if user_path.contains(':') {
+        return Err(AetherError::PermissionDenied(
+            "Access Denied: Stream separator or colon ':' is strictly forbidden in relative paths"
+                .into(),
+        ));
+    }
+
+    // 4. Explicitly reject Windows invalid filename characters (<, >, ", |, ?, *)
+    if user_path.contains(['<', '>', '"', '|', '?', '*']) {
+        return Err(AetherError::PermissionDenied(
+            "Access Denied: Forbidden characters in path".into(),
+        ));
+    }
+
+    // 5. Explicitly reject trailing dots or spaces in raw user path or any path component
+    if user_path.ends_with('.') || user_path.ends_with(' ') {
+        return Err(AetherError::PermissionDenied(
+            "Access Denied: Trailing dot or space in path is forbidden".into(),
+        ));
+    }
+    if user_path
+        .split(['/', '\\'])
+        .any(|seg| seg.ends_with('.') || seg.ends_with(' '))
+    {
+        return Err(AetherError::PermissionDenied(
+            "Access Denied: Trailing dot or space in path component is forbidden".into(),
+        ));
+    }
+
+    // 6. Reject UNC paths and Windows extended device namespaces
+    let trimmed_leading = user_path.trim_start();
+    if trimmed_leading.starts_with(r"\\")
+        || trimmed_leading.starts_with("//")
+        || trimmed_leading.starts_with(r"\??\")
+        || trimmed_leading.starts_with(r"//?/")
+    {
+        return Err(AetherError::PermissionDenied(
+            "Access Denied: UNC and extended device namespaces are strictly forbidden".into(),
+        ));
+    }
+
+    let clean = Path::new(user_path);
+    if clean.is_absolute() {
+        return Err(AetherError::PermissionDenied(
+            "Access Denied: Absolute paths are strictly forbidden".into(),
+        ));
+    }
+
+    let mut depth: usize = 0;
+    let mut normalized = PathBuf::new();
+
+    for comp in clean.components() {
+        match comp {
+            std::path::Component::Prefix(_) => {
+                return Err(AetherError::PermissionDenied(
+                    "Access Denied: Drive prefixes are forbidden".into(),
+                ));
+            }
+            std::path::Component::RootDir => {
+                return Err(AetherError::PermissionDenied(
+                    "Access Denied: Root directory references are forbidden".into(),
+                ));
+            }
+            std::path::Component::ParentDir => {
+                if depth == 0 {
+                    return Err(AetherError::PermissionDenied(
+                        "Access Denied: Path traversal (..) is forbidden".into(),
+                    ));
+                }
+                depth -= 1;
+                normalized.pop();
+            }
+            std::path::Component::Normal(c) => {
+                let s = c.to_string_lossy();
+                let upper = s.to_ascii_uppercase();
+                let stem = Path::new(&*s)
+                    .file_stem()
+                    .and_then(|st| st.to_str())
+                    .unwrap_or("")
+                    .to_ascii_uppercase();
+
+                let is_reserved = |name: &str| {
+                    matches!(
+                        name,
+                        "CON"
+                            | "PRN"
+                            | "AUX"
+                            | "NUL"
+                            | "COM1"
+                            | "COM2"
+                            | "COM3"
+                            | "COM4"
+                            | "COM5"
+                            | "COM6"
+                            | "COM7"
+                            | "COM8"
+                            | "COM9"
+                            | "LPT1"
+                            | "LPT2"
+                            | "LPT3"
+                            | "LPT4"
+                            | "LPT5"
+                            | "LPT6"
+                            | "LPT7"
+                            | "LPT8"
+                            | "LPT9"
+                    )
+                };
+
+                if is_reserved(&upper) || is_reserved(&stem) {
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Access Denied: Reserved device name '{s}' is forbidden"
+                    )));
+                }
+
+                depth += 1;
+                normalized.push(c);
+            }
+            std::path::Component::CurDir => {}
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        return Err(AetherError::PermissionDenied(
+            "Access Denied: Normalized relative path is empty".into(),
+        ));
+    }
+
+    Ok(normalized)
+}
+
+/// Capability-based workspace directory handle.
+/// All file and directory operations are anchored directly to the opened directory capability (`Dir`).
+/// Enforces genuine handle-level capability boundaries across Windows, Linux, and macOS.
+pub struct WorkspaceCapability {
+    root_path: PathBuf,
+    dir: Dir,
+}
+
+impl WorkspaceCapability {
+    /// Opens the authorized workspace root as a directory capability.
+    pub fn open<P: AsRef<Path>>(root: P) -> Result<Self> {
+        let root = root.as_ref();
+        let canon = root.canonicalize().map_err(AetherError::Io)?;
+        let dir = Dir::open_ambient_dir(&canon, ambient_authority()).map_err(AetherError::Io)?;
+        Ok(Self {
+            root_path: canon,
+            dir,
+        })
+    }
+
+    pub fn root_path(&self) -> &Path {
+        &self.root_path
+    }
+
+    pub fn raw_dir(&self) -> &Dir {
+        &self.dir
+    }
+
+    /// Reads text file strictly anchored to the workspace directory capability.
+    pub fn read_file(&self, user_path: &str) -> Result<String> {
+        let rel = sanitize_relative_path(user_path)?;
+
+        // Ensure target is not an external symlink
+        if let Ok(meta) = self.dir.symlink_metadata(&rel) {
+            if meta.is_symlink() {
+                return Err(AetherError::PermissionDenied(
+                    "Access Denied: Symlink points outside workspace boundary".into(),
+                ));
+            }
+        }
+
+        self.dir.read_to_string(&rel).map_err(AetherError::Io)
+    }
+
+    /// Reads binary bytes strictly anchored to the workspace directory capability.
+    pub fn read_file_bytes(&self, user_path: &str) -> Result<Vec<u8>> {
+        let rel = sanitize_relative_path(user_path)?;
+        if let Ok(meta) = self.dir.symlink_metadata(&rel) {
+            if meta.is_symlink() {
+                return Err(AetherError::PermissionDenied(
+                    "Access Denied: Symlink points outside workspace boundary".into(),
+                ));
+            }
+        }
+        let mut f = self.dir.open(&rel).map_err(AetherError::Io)?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).map_err(AetherError::Io)?;
+        Ok(buf)
+    }
+
+    /// Writes content to a file inside the capability using atomic handle-level operations.
+    /// Creates a capability-isolated temporary file via `create_new(true)`, writes and syncs to disk,
+    /// verifies the destination is not a symlink, and performs an atomic rename anchored to the capability.
+    pub fn write_file_atomic(&self, user_path: &str, content: &str) -> Result<PathBuf> {
+        let rel = sanitize_relative_path(user_path)?;
+
+        // Ensure parent directory exists anchored inside capability
+        if let Some(parent) = rel.parent() {
+            if !parent.as_os_str().is_empty() {
+                self.dir.create_dir_all(parent).map_err(AetherError::Io)?;
+            }
+        }
+
+        // Verify destination is not a symlink; refuse to write through destination symlinks
+        if let Ok(meta) = self.dir.symlink_metadata(&rel) {
+            if meta.is_symlink() {
+                return Err(AetherError::PermissionDenied(
+                    "Access Denied: Destination is a symlink".into(),
+                ));
+            }
+        }
+
+        // Step 1: Create capability-isolated temporary file in parent directory
+        let temp_name = format!(".aether-tmp-{}", uuid::Uuid::new_v4().simple());
+        let temp_rel = if let Some(parent) = rel.parent() {
+            parent.join(&temp_name)
+        } else {
+            PathBuf::from(&temp_name)
+        };
+
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+
+        let mut f = self
+            .dir
+            .open_with(&temp_rel, &opts)
+            .map_err(AetherError::Io)?;
+        f.write_all(content.as_bytes()).map_err(AetherError::Io)?;
+        f.sync_all().map_err(AetherError::Io)?;
+        drop(f);
+
+        // Step 2: Atomic rename anchored to directory capability
+        if let Err(e) = self.dir.rename(&temp_rel, &self.dir, &rel) {
+            let _ = self.dir.remove_file(&temp_rel);
+            return Err(AetherError::Io(e));
+        }
+
+        Ok(self.root_path.join(rel))
+    }
+
+    /// Creates directory inside workspace capability.
+    pub fn create_dir(&self, user_path: &str) -> Result<PathBuf> {
+        let rel = sanitize_relative_path(user_path)?;
+        self.dir.create_dir_all(&rel).map_err(AetherError::Io)?;
+        Ok(self.root_path.join(rel))
+    }
+
+    /// Deletes a file entry inside workspace capability.
+    /// If target is a symlink, removes the symlink entry itself without following to target.
+    pub fn delete_file(&self, user_path: &str) -> Result<()> {
+        let rel = sanitize_relative_path(user_path)?;
+        self.dir.remove_file(&rel).map_err(AetherError::Io)
+    }
+
+    /// Renames a file entry within the workspace capability.
+    pub fn rename(&self, from_user_path: &str, to_user_path: &str) -> Result<()> {
+        let from_rel = sanitize_relative_path(from_user_path)?;
+        let to_rel = sanitize_relative_path(to_user_path)?;
+
+        if let Some(parent) = to_rel.parent() {
+            if !parent.as_os_str().is_empty() {
+                self.dir.create_dir_all(parent).map_err(AetherError::Io)?;
+            }
+        }
+
+        // Verify destination is not an external symlink
+        if let Ok(meta) = self.dir.symlink_metadata(&to_rel) {
+            if meta.is_symlink() {
+                return Err(AetherError::PermissionDenied(
+                    "Access Denied: Destination is a symlink".into(),
+                ));
+            }
+        }
+
+        self.dir
+            .rename(&from_rel, &self.dir, &to_rel)
+            .map_err(AetherError::Io)
+    }
+
+    /// Recursively scans workspace files anchored to directory capability.
+    /// Skips all symbolic links and reparse points by capability policy.
+    pub fn scan_workspace_files(&self, exclude_patterns: &[String]) -> Result<Vec<PathBuf>> {
         let mut results = Vec::new();
-        Self::walk_dir(root.as_ref(), root.as_ref(), exclude_patterns, &mut results)?;
+        self.walk_dir_cap(&PathBuf::new(), exclude_patterns, &mut results)?;
         Ok(results)
     }
 
-    fn walk_dir(
-        current: &Path,
-        root: &Path,
+    fn walk_dir_cap(
+        &self,
+        current_rel: &Path,
         exclude_patterns: &[String],
         results: &mut Vec<PathBuf>,
     ) -> Result<()> {
-        if !current.exists() {
-            return Ok(());
-        }
+        let read_dir_result = if current_rel.as_os_str().is_empty() {
+            self.dir.read_dir(".")
+        } else {
+            self.dir.read_dir(current_rel)
+        };
 
-        let root_canon = root.canonicalize().map_err(AetherError::Io)?;
-        let entries = match fs::read_dir(current) {
+        let entries = match read_dir_result {
             Ok(e) => e,
             Err(_) => return Ok(()),
         };
 
         for entry in entries.flatten() {
-            let path = entry.path();
-            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_string_lossy();
 
-            // Check exclusions
             if exclude_patterns
                 .iter()
-                .any(|pattern| file_name == pattern || file_name.starts_with('.'))
+                .any(|pattern| file_name_str == *pattern || file_name_str.starts_with('.'))
             {
                 continue;
             }
 
-            // Inspect symlink / reparse metadata without following external links
-            let meta = match fs::symlink_metadata(&path) {
+            let entry_rel = if current_rel.as_os_str().is_empty() {
+                PathBuf::from(&file_name)
+            } else {
+                current_rel.join(&file_name)
+            };
+
+            let meta = match self.dir.symlink_metadata(&entry_rel) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
 
-            // SECURITY: Do not follow symbolic links or directory junctions outside the workspace boundary
-            if meta.file_type().is_symlink() {
-                if let Ok(canon) = path.canonicalize() {
-                    if !Self::is_within_boundary(&canon, &root_canon) {
-                        // Skip external symlink target
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
+            // By capability policy, skip symbolic links and reparse points
+            if meta.is_symlink() {
+                continue;
             }
 
-            if path.is_dir() {
-                // Ensure directory itself resides strictly within workspace boundary before recursing
-                if let Ok(canon) = path.canonicalize() {
-                    if Self::is_within_boundary(&canon, &root_canon) {
-                        Self::walk_dir(&path, root, exclude_patterns, results)?;
-                    }
-                }
-            } else if path.is_file() {
-                results.push(path);
+            if meta.is_dir() {
+                let _ = self.walk_dir_cap(&entry_rel, exclude_patterns, results);
+            } else if meta.is_file() {
+                results.push(self.root_path.join(&entry_rel));
             }
         }
 
         Ok(())
+    }
+}
+
+pub struct FilesystemEngine;
+
+impl FilesystemEngine {
+    /// Recursively scans workspace files anchored to directory capability.
+    pub fn scan_workspace_files<P: AsRef<Path>>(
+        root: P,
+        exclude_patterns: &[String],
+    ) -> Result<Vec<PathBuf>> {
+        let cap = WorkspaceCapability::open(root)?;
+        cap.scan_workspace_files(exclude_patterns)
     }
 
     pub fn write_file_atomic<P: AsRef<Path>>(path: P, content: &str) -> Result<()> {
@@ -108,146 +422,11 @@ impl FilesystemEngine {
         true
     }
 
-    /// Securely resolves a user-provided relative path against a workspace root.
-    /// Strictly guarantees that the resolved target cannot escape the workspace root
-    /// via parent directory traversal (`..`), absolute paths, Windows drive letters,
-    /// UNC paths, Alternate Data Streams (ADS), trailing dot/space bypasses,
-    /// Windows device files (CON, NUL, AUX, PRN), or filesystem symlinks.
+    /// Resolves a user-provided relative path against a workspace root.
     pub fn resolve_contained_path(root: &Path, user_path: &str) -> Result<PathBuf> {
-        // 1. Explicitly reject null bytes and control characters
-        if user_path.contains('\0') || user_path.chars().any(|c| (c as u32) < 0x20) {
-            return Err(AetherError::PermissionDenied(
-                "Access Denied: Null bytes and control characters are strictly forbidden in paths"
-                    .into(),
-            ));
-        }
-
-        // 2. Explicitly reject URL encoded traversal attempts (%2e, %00, %2f, %5c)
-        let lower = user_path.to_ascii_lowercase();
-        if lower.contains("%2e")
-            || lower.contains("%00")
-            || lower.contains("%2f")
-            || lower.contains("%5c")
-        {
-            return Err(AetherError::PermissionDenied(
-                "Access Denied: URL encoded path sequences are strictly forbidden".into(),
-            ));
-        }
-
-        // 3. Explicitly reject Alternate Data Streams and drive colons anywhere in relative paths
-        if user_path.contains(':') {
-            return Err(AetherError::PermissionDenied(
-                "Access Denied: Stream separator or colon ':' is strictly forbidden in relative paths".into(),
-            ));
-        }
-
-        // 4. Explicitly reject Windows invalid filename characters (<, >, ", |, ?, *)
-        if user_path.contains(['<', '>', '"', '|', '?', '*']) {
-            return Err(AetherError::PermissionDenied(
-                "Access Denied: Forbidden characters in path".into(),
-            ));
-        }
-
-        // 5. Explicitly reject trailing dots or spaces in raw user path or any path component
-        if user_path.ends_with('.') || user_path.ends_with(' ') {
-            return Err(AetherError::PermissionDenied(
-                "Access Denied: Trailing dot or space in path is forbidden".into(),
-            ));
-        }
-        if user_path
-            .split(['/', '\\'])
-            .any(|seg| seg.ends_with('.') || seg.ends_with(' '))
-        {
-            return Err(AetherError::PermissionDenied(
-                "Access Denied: Trailing dot or space in path component is forbidden".into(),
-            ));
-        }
-
-        // 6. Reject UNC paths and Windows extended device namespaces
-        let trimmed_leading = user_path.trim_start();
-        if trimmed_leading.starts_with(r"\\")
-            || trimmed_leading.starts_with("//")
-            || trimmed_leading.starts_with(r"\??\")
-            || trimmed_leading.starts_with(r"//?/")
-        {
-            return Err(AetherError::PermissionDenied(
-                "Access Denied: UNC and extended device namespaces are strictly forbidden".into(),
-            ));
-        }
-
-        let clean = Path::new(user_path);
-        if clean.is_absolute() {
-            return Err(AetherError::PermissionDenied(
-                "Access Denied: Absolute paths are strictly forbidden".into(),
-            ));
-        }
-
-        for comp in clean.components() {
-            match comp {
-                std::path::Component::Prefix(_) => {
-                    return Err(AetherError::PermissionDenied(
-                        "Access Denied: Drive prefixes are forbidden".into(),
-                    ));
-                }
-                std::path::Component::RootDir => {
-                    return Err(AetherError::PermissionDenied(
-                        "Access Denied: Root directory references are forbidden".into(),
-                    ));
-                }
-                std::path::Component::ParentDir => {
-                    return Err(AetherError::PermissionDenied(
-                        "Access Denied: Path traversal (..) is forbidden".into(),
-                    ));
-                }
-                std::path::Component::Normal(c) => {
-                    let s = c.to_string_lossy();
-                    let upper = s.to_ascii_uppercase();
-                    let stem = Path::new(&*s)
-                        .file_stem()
-                        .and_then(|st| st.to_str())
-                        .unwrap_or("")
-                        .to_ascii_uppercase();
-
-                    let is_reserved = |name: &str| {
-                        matches!(
-                            name,
-                            "CON"
-                                | "PRN"
-                                | "AUX"
-                                | "NUL"
-                                | "COM1"
-                                | "COM2"
-                                | "COM3"
-                                | "COM4"
-                                | "COM5"
-                                | "COM6"
-                                | "COM7"
-                                | "COM8"
-                                | "COM9"
-                                | "LPT1"
-                                | "LPT2"
-                                | "LPT3"
-                                | "LPT4"
-                                | "LPT5"
-                                | "LPT6"
-                                | "LPT7"
-                                | "LPT8"
-                                | "LPT9"
-                        )
-                    };
-
-                    if is_reserved(&upper) || is_reserved(&stem) {
-                        return Err(AetherError::PermissionDenied(format!(
-                            "Access Denied: Reserved device name '{s}' is forbidden"
-                        )));
-                    }
-                }
-                std::path::Component::CurDir => {}
-            }
-        }
-
+        let clean = sanitize_relative_path(user_path)?;
         let root_canon = root.canonicalize().map_err(AetherError::Io)?;
-        let candidate = root_canon.join(clean);
+        let candidate = root_canon.join(&clean);
 
         if candidate.exists() {
             let candidate_canon = candidate.canonicalize().map_err(AetherError::Io)?;
@@ -275,203 +454,32 @@ impl FilesystemEngine {
         }
     }
 
-    /// Safely writes content to a file inside the workspace root using capability-isolated I/O.
-    /// Creates a temporary file in the validated parent directory via `create_new(true)`, writes to
-    /// the validated file handle, verifies the destination is not an external symlink, and performs an
-    /// atomic rename within the verified directory capability.
+    /// Safely writes content to a file inside the workspace root using capability-anchored I/O.
     pub fn write_file_contained<P: AsRef<Path>>(
         root: P,
         user_path: &str,
         content: &str,
     ) -> Result<PathBuf> {
-        let root = root.as_ref();
-        let root_canon = root.canonicalize().map_err(AetherError::Io)?;
-        let resolved = Self::resolve_contained_path(&root_canon, user_path)?;
-
-        let parent = resolved.parent().ok_or_else(|| {
-            AetherError::PermissionDenied("Target path lacks parent directory".into())
-        })?;
-
-        if !parent.exists() {
-            fs::create_dir_all(parent).map_err(AetherError::Io)?;
-        }
-
-        let parent_canon = parent.canonicalize().map_err(AetherError::Io)?;
-        if !Self::is_within_boundary(&parent_canon, &root_canon) {
-            return Err(AetherError::PermissionDenied(
-                "Access Denied: Parent directory escaped boundary".into(),
-            ));
-        }
-
-        // Verify parent is not a symlink pointing outside
-        if let Ok(meta) = fs::symlink_metadata(parent) {
-            if meta.file_type().is_symlink()
-                && !Self::is_within_boundary(&parent_canon, &root_canon)
-            {
-                return Err(AetherError::PermissionDenied(
-                    "Access Denied: Parent directory is an external symlink".into(),
-                ));
-            }
-        }
-
-        // Target verification: if file exists, ensure it is not an external symlink
-        if resolved.exists() {
-            if let Ok(meta) = fs::symlink_metadata(&resolved) {
-                if meta.file_type().is_symlink() {
-                    let dest_canon = resolved.canonicalize().map_err(AetherError::Io)?;
-                    if !Self::is_within_boundary(&dest_canon, &root_canon) {
-                        return Err(AetherError::PermissionDenied(
-                            "Access Denied: Destination is an external symlink".into(),
-                        ));
-                    }
-                }
-            }
-        }
-
-        // Step 1: Create capability-isolated temporary file in the validated parent directory
-        let temp_filename = format!(".aether-tmp-{}", uuid::Uuid::new_v4().simple());
-        let temp_path = parent_canon.join(&temp_filename);
-
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .map_err(AetherError::Io)?;
-
-        // Step 2: Write to the open file handle and flush
-        file.write_all(content.as_bytes())
-            .map_err(AetherError::Io)?;
-        file.sync_all().map_err(AetherError::Io)?;
-        drop(file);
-
-        // Step 3: Before atomic rename, ensure destination did not become an external symlink
-        let dest_filename = resolved
-            .file_name()
-            .ok_or_else(|| AetherError::PermissionDenied("Invalid destination file name".into()))?;
-        let final_dest = parent_canon.join(dest_filename);
-
-        if final_dest.exists() {
-            if let Ok(meta) = fs::symlink_metadata(&final_dest) {
-                if meta.file_type().is_symlink() {
-                    if let Ok(dest_canon) = final_dest.canonicalize() {
-                        if !Self::is_within_boundary(&dest_canon, &root_canon) {
-                            let _ = fs::remove_file(&temp_path);
-                            return Err(AetherError::PermissionDenied(
-                                "Access Denied: Destination target escaped workspace boundary"
-                                    .into(),
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Step 4: Atomic rename within validated parent directory
-        if let Err(e) = fs::rename(&temp_path, &final_dest) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(AetherError::Io(e));
-        }
-
-        // Step 5: Post-rename canonical verification
-        let post_canon = final_dest.canonicalize().map_err(AetherError::Io)?;
-        if !Self::is_within_boundary(&post_canon, &root_canon) {
-            let _ = fs::remove_file(&final_dest);
-            return Err(AetherError::PermissionDenied(
-                "Access Denied: Post-creation verification failed; target escaped boundary".into(),
-            ));
-        }
-
-        Ok(post_canon)
+        let cap = WorkspaceCapability::open(root)?;
+        cap.write_file_atomic(user_path, content)
     }
 
-    /// Safely reads the text content of a file strictly contained inside the workspace root.
+    /// Safely reads the text content of a file strictly anchored inside the workspace capability.
     pub fn read_file_contained<P: AsRef<Path>>(root: P, user_path: &str) -> Result<String> {
-        let root = root.as_ref();
-        let root_canon = root.canonicalize().map_err(AetherError::Io)?;
-        let resolved = Self::resolve_contained_path(&root_canon, user_path)?;
-
-        // Verify that neither the file nor any parent directory is an external symlink
-        let target_canon = resolved.canonicalize().map_err(AetherError::Io)?;
-        if !Self::is_within_boundary(&target_canon, &root_canon) {
-            return Err(AetherError::PermissionDenied(
-                "Access Denied: Target path escapes workspace boundary".into(),
-            ));
-        }
-
-        if let Ok(meta) = fs::symlink_metadata(&resolved) {
-            if meta.file_type().is_symlink()
-                && !Self::is_within_boundary(&target_canon, &root_canon)
-            {
-                return Err(AetherError::PermissionDenied(
-                    "Access Denied: Symlink points outside workspace boundary".into(),
-                ));
-            }
-        }
-
-        fs::read_to_string(target_canon).map_err(AetherError::Io)
+        let cap = WorkspaceCapability::open(root)?;
+        cap.read_file(user_path)
     }
 
     /// Safely deletes a file contained within the workspace root without following external symlinks.
     pub fn delete_file_contained<P: AsRef<Path>>(root: P, user_path: &str) -> Result<()> {
-        let root = root.as_ref();
-        let root_canon = root.canonicalize().map_err(AetherError::Io)?;
-        let resolved = Self::resolve_contained_path(&root_canon, user_path)?;
-
-        if resolved.exists() {
-            // Check symlink status: if it is a symlink pointing outside, delete ONLY the symlink itself
-            // never follow it to delete the outside file!
-            if let Ok(meta) = fs::symlink_metadata(&resolved) {
-                if meta.file_type().is_symlink() {
-                    // Remove symlink directly without following
-                    fs::remove_file(&resolved).map_err(AetherError::Io)?;
-                    return Ok(());
-                }
-            }
-
-            let target_canon = resolved.canonicalize().map_err(AetherError::Io)?;
-            if !Self::is_within_boundary(&target_canon, &root_canon) {
-                return Err(AetherError::PermissionDenied(
-                    "Access Denied: Target path escapes workspace boundary".into(),
-                ));
-            }
-            fs::remove_file(target_canon).map_err(AetherError::Io)?;
-        }
-        Ok(())
+        let cap = WorkspaceCapability::open(root)?;
+        cap.delete_file(user_path)
     }
 
     /// Safely creates a directory contained within the workspace root.
     pub fn create_dir_contained<P: AsRef<Path>>(root: P, user_path: &str) -> Result<PathBuf> {
-        let root = root.as_ref();
-        let root_canon = root.canonicalize().map_err(AetherError::Io)?;
-        let resolved = Self::resolve_contained_path(&root_canon, user_path)?;
-
-        // Check if any ancestor is an external symlink
-        let mut ancestor = resolved.as_path();
-        while let Some(parent) = ancestor.parent() {
-            if parent.exists() {
-                if let Ok(meta) = fs::symlink_metadata(parent) {
-                    if meta.file_type().is_symlink() {
-                        let canon = parent.canonicalize().map_err(AetherError::Io)?;
-                        if !Self::is_within_boundary(&canon, &root_canon) {
-                            return Err(AetherError::PermissionDenied(
-                                "Access Denied: Directory creation encounters external symlink"
-                                    .into(),
-                            ));
-                        }
-                    }
-                }
-            }
-            ancestor = parent;
-        }
-
-        fs::create_dir_all(&resolved).map_err(AetherError::Io)?;
-        let target_canon = resolved.canonicalize().map_err(AetherError::Io)?;
-        if !Self::is_within_boundary(&target_canon, &root_canon) {
-            return Err(AetherError::PermissionDenied(
-                "Access Denied: Created directory escapes workspace boundary".into(),
-            ));
-        }
-        Ok(target_canon)
+        let cap = WorkspaceCapability::open(root)?;
+        cap.create_dir(user_path)
     }
 
     /// Safely renames or moves a file within the workspace root without crossing boundaries.
@@ -480,39 +488,8 @@ impl FilesystemEngine {
         from_user_path: &str,
         to_user_path: &str,
     ) -> Result<()> {
-        let root = root.as_ref();
-        let root_canon = root.canonicalize().map_err(AetherError::Io)?;
-        let from_target = Self::resolve_contained_path(&root_canon, from_user_path)?;
-        let to_target = Self::resolve_contained_path(&root_canon, to_user_path)?;
-
-        let from_canon = from_target.canonicalize().map_err(AetherError::Io)?;
-        if !Self::is_within_boundary(&from_canon, &root_canon) {
-            return Err(AetherError::PermissionDenied(
-                "Access Denied: Source path escapes workspace boundary".into(),
-            ));
-        }
-
-        if let Some(parent) = to_target.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent).map_err(AetherError::Io)?;
-            }
-            let parent_canon = parent.canonicalize().map_err(AetherError::Io)?;
-            if !Self::is_within_boundary(&parent_canon, &root_canon) {
-                return Err(AetherError::PermissionDenied(
-                    "Access Denied: Destination parent directory escapes workspace boundary".into(),
-                ));
-            }
-        }
-
-        fs::rename(&from_canon, &to_target).map_err(AetherError::Io)?;
-
-        let to_canon = to_target.canonicalize().map_err(AetherError::Io)?;
-        if !Self::is_within_boundary(&to_canon, &root_canon) {
-            return Err(AetherError::PermissionDenied(
-                "Access Denied: Destination target escaped workspace boundary".into(),
-            ));
-        }
-        Ok(())
+        let cap = WorkspaceCapability::open(root)?;
+        cap.rename(from_user_path, to_user_path)
     }
 }
 
