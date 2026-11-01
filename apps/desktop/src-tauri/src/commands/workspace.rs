@@ -16,10 +16,7 @@ fn get_parent_hwnd_isize(app: &AppHandle) -> isize {
 }
 
 #[tauri::command]
-pub async fn workspace_open_folder(
-    app: AppHandle,
-    path: Option<String>,
-) -> Result<Value, String> {
+pub async fn workspace_open_folder(app: AppHandle, path: Option<String>) -> Result<Value, String> {
     let target_path = match path {
         Some(p) => {
             let pb = PathBuf::from(&p);
@@ -59,10 +56,7 @@ pub async fn workspace_open_folder(
 }
 
 #[tauri::command]
-pub async fn workspace_add_folder(
-    app: AppHandle,
-    path: Option<String>,
-) -> Result<Value, String> {
+pub async fn workspace_add_folder(app: AppHandle, path: Option<String>) -> Result<Value, String> {
     let target_path = match path {
         Some(p) => {
             let pb = PathBuf::from(&p);
@@ -105,14 +99,11 @@ pub async fn workspace_add_folder(
 pub async fn workspace_get_tree(app: AppHandle) -> Result<Value, String> {
     let session_arc = app.state::<SharedWorkspace>();
     let session = session_arc.lock();
-    Ok(session.get_workspace_summary()?)
+    session.get_workspace_summary()
 }
 
 #[tauri::command]
-pub async fn workspace_open_file(
-    app: AppHandle,
-    path: Option<String>,
-) -> Result<Value, String> {
+pub async fn workspace_open_file(app: AppHandle, path: Option<String>) -> Result<Value, String> {
     let target_path = match path {
         Some(p) => p,
         None => {
@@ -195,20 +186,14 @@ pub async fn workspace_save_file_as(
 }
 
 #[tauri::command]
-pub async fn workspace_create_file(
-    app: AppHandle,
-    path: String,
-) -> Result<Value, String> {
+pub async fn workspace_create_file(app: AppHandle, path: String) -> Result<Value, String> {
     let session_arc = app.state::<SharedWorkspace>();
     let session = session_arc.lock();
     session.create_file(&path)
 }
 
 #[tauri::command]
-pub async fn workspace_create_folder(
-    app: AppHandle,
-    path: String,
-) -> Result<Value, String> {
+pub async fn workspace_create_folder(app: AppHandle, path: String) -> Result<Value, String> {
     let session_arc = app.state::<SharedWorkspace>();
     let session = session_arc.lock();
     session.create_directory(&path)
@@ -226,20 +211,14 @@ pub async fn workspace_rename_entry(
 }
 
 #[tauri::command]
-pub async fn workspace_delete_entry(
-    app: AppHandle,
-    path: String,
-) -> Result<Value, String> {
+pub async fn workspace_delete_entry(app: AppHandle, path: String) -> Result<Value, String> {
     let session_arc = app.state::<SharedWorkspace>();
     let session = session_arc.lock();
     session.delete_entry(&path)
 }
 
 #[tauri::command]
-pub async fn workspace_reveal_in_explorer(
-    app: AppHandle,
-    path: String,
-) -> Result<Value, String> {
+pub async fn workspace_reveal_in_explorer(app: AppHandle, path: String) -> Result<Value, String> {
     let session_arc = app.state::<SharedWorkspace>();
     let session = session_arc.lock();
     session.reveal_in_explorer(&path)

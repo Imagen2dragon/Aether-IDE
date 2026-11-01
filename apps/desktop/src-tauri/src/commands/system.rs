@@ -38,55 +38,111 @@ pub async fn ide_dispatch(
     let p = payload.unwrap_or(json!({}));
     match action.as_str() {
         "ShowOpenFolderDialog" => {
-            let path = p.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let path = p
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             workspace_open_folder(app, path).await
         }
         "ShowAddFolderDialog" => {
-            let path = p.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let path = p
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             workspace_add_folder(app, path).await
         }
         "ShowOpenFileDialog" => {
-            let path = p.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let path = p
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             workspace_open_file(app, path).await
         }
         "ShowSaveFileDialog" => {
-            let content = p.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let default_name = p.get("defaultName").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let content = p
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let default_name = p
+                .get("defaultName")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             workspace_save_file_as(app, content, default_name).await
         }
         "WorkspaceGetTree" => workspace_get_tree(app).await,
         "WorkspaceOpenFile" => {
-            let path = p.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?.to_string();
+            let path = p
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing path")?
+                .to_string();
             workspace_open_file(app, Some(path)).await
         }
         "WorkspaceSaveFile" => {
-            let path = p.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?.to_string();
-            let content = p.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let path = p
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing path")?
+                .to_string();
+            let content = p
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             workspace_save_file(app, path, content).await
         }
         "WorkspaceCreateFile" => {
-            let path = p.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?.to_string();
+            let path = p
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing path")?
+                .to_string();
             workspace_create_file(app, path).await
         }
         "WorkspaceCreateFolder" => {
-            let path = p.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?.to_string();
+            let path = p
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing path")?
+                .to_string();
             workspace_create_folder(app, path).await
         }
         "WorkspaceRenameEntry" => {
-            let old_path = p.get("oldPath").and_then(|v| v.as_str()).ok_or("Missing oldPath")?.to_string();
-            let new_path = p.get("newPath").and_then(|v| v.as_str()).ok_or("Missing newPath")?.to_string();
+            let old_path = p
+                .get("oldPath")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing oldPath")?
+                .to_string();
+            let new_path = p
+                .get("newPath")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing newPath")?
+                .to_string();
             workspace_rename_entry(app, old_path, new_path).await
         }
         "WorkspaceDeleteEntry" => {
-            let path = p.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?.to_string();
+            let path = p
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing path")?
+                .to_string();
             workspace_delete_entry(app, path).await
         }
         "WorkspaceRevealInExplorer" => {
-            let path = p.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?.to_string();
+            let path = p
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing path")?
+                .to_string();
             workspace_reveal_in_explorer(app, path).await
         }
         "WorkspaceSetTrust" => {
-            let path = p.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let path = p
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let trusted = p.get("trusted").and_then(|v| v.as_bool()).unwrap_or(true);
             workspace_set_trust(app, path, trusted).await
         }
@@ -97,7 +153,11 @@ pub async fn ide_dispatch(
             terminal_spawn(app, cwd, cols, rows).await
         }
         "TerminalWrite" => {
-            let data = p.get("data").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let data = p
+                .get("data")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             terminal_write(app, data).await
         }
         "TerminalResize" => {

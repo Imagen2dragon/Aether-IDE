@@ -64,10 +64,7 @@ pub async fn terminal_spawn(
 }
 
 #[tauri::command]
-pub async fn terminal_write(
-    app: AppHandle,
-    data: String,
-) -> Result<Value, String> {
+pub async fn terminal_write(app: AppHandle, data: String) -> Result<Value, String> {
     let active_id_arc = app.state::<ActiveTerminalId>();
     let active_id = active_id_arc.lock().ok_or("No active terminal session")?;
 
@@ -80,11 +77,7 @@ pub async fn terminal_write(
 }
 
 #[tauri::command]
-pub async fn terminal_resize(
-    app: AppHandle,
-    cols: u16,
-    rows: u16,
-) -> Result<Value, String> {
+pub async fn terminal_resize(app: AppHandle, cols: u16, rows: u16) -> Result<Value, String> {
     let active_id_arc = app.state::<ActiveTerminalId>();
     let active_id = active_id_arc.lock().ok_or("No active terminal session")?;
 

@@ -24,7 +24,8 @@ pub mod native {
         default_dir: Option<&Path>,
     ) -> Result<Option<PathBuf>> {
         unsafe {
-            let pfd: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+            let pfd: IFileOpenDialog =
+                CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
 
             let mut options = pfd.GetOptions()?;
             options |= FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST;
@@ -38,7 +39,9 @@ pub mod native {
             if let Some(dir) = default_dir {
                 let dir_str = dir.to_string_lossy();
                 let hdir = HSTRING::from(dir_str.as_ref());
-                if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&hdir, None::<&IBindCtx>) {
+                if let Ok(item) =
+                    SHCreateItemFromParsingName::<_, _, IShellItem>(&hdir, None::<&IBindCtx>)
+                {
                     let _ = pfd.SetFolder(&item);
                 }
             }
@@ -65,7 +68,8 @@ pub mod native {
         filter_spec: Option<&str>,
     ) -> Result<Option<PathBuf>> {
         unsafe {
-            let pfd: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+            let pfd: IFileOpenDialog =
+                CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
 
             let mut options = pfd.GetOptions()?;
             options |= FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST;
@@ -89,7 +93,9 @@ pub mod native {
             if let Some(dir) = default_dir {
                 let dir_str = dir.to_string_lossy();
                 let hdir = HSTRING::from(dir_str.as_ref());
-                if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&hdir, None::<&IBindCtx>) {
+                if let Ok(item) =
+                    SHCreateItemFromParsingName::<_, _, IShellItem>(&hdir, None::<&IBindCtx>)
+                {
                     let _ = pfd.SetFolder(&item);
                 }
             }
@@ -115,7 +121,8 @@ pub mod native {
         default_name: Option<&str>,
     ) -> Result<Option<PathBuf>> {
         unsafe {
-            let pfd: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER)?;
+            let pfd: IFileSaveDialog =
+                CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER)?;
 
             let mut options = pfd.GetOptions()?;
             options |= FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR;
@@ -134,7 +141,9 @@ pub mod native {
             if let Some(dir) = default_dir {
                 let dir_str = dir.to_string_lossy();
                 let hdir = HSTRING::from(dir_str.as_ref());
-                if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&hdir, None::<&IBindCtx>) {
+                if let Ok(item) =
+                    SHCreateItemFromParsingName::<_, _, IShellItem>(&hdir, None::<&IBindCtx>)
+                {
                     let _ = pfd.SetFolder(&item);
                 }
             }
