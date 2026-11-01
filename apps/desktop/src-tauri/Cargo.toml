@@ -1,0 +1,60 @@
+[package]
+name = "aether-desktop"
+version = "0.1.0"
+description = "AetherIDE — AI-Native Engineering Studio"
+edition = "2021"
+authors = ["Aether Engineering Team"]
+default-run = "AetherIDE"
+
+[lib]
+name = "aether_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "AetherIDE"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["unstable"] }
+tauri-plugin-single-instance = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.13", features = ["v4", "serde"] }
+tokio = { version = "1.43", features = ["full"] }
+parking_lot = "0.12"
+tracing = "0.1"
+
+# AetherIDE Workspace Crates
+application-core = { path = "../../../rust/crates/application-core" }
+filesystem-engine = { path = "../../../rust/crates/filesystem-engine" }
+security-core = { path = "../../../rust/crates/security-core" }
+ipc-protocol = { path = "../../../rust/crates/ipc-protocol" }
+terminal-manager = { path = "../../../rust/crates/terminal-manager" }
+process-manager = { path = "../../../rust/crates/process-manager" }
+git-engine = { path = "../../../rust/crates/git-engine" }
+diagnostics = { path = "../../../rust/crates/diagnostics" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell_Common",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
+strip = true
+panic = "abort"

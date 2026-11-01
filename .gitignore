@@ -9,6 +9,7 @@ node_modules/
 **/node_modules/
 dist/
 dist/*
+apps/desktop/src-tauri/gen/
 .npm
 npm-debug.log*
 
