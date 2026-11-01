@@ -23,6 +23,7 @@ webview2-com = "0.33"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
     "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",
     "Win32_System_Com",
@@ -30,4 +31,5 @@ windows = { version = "0.58", features = [
     "Win32_System_WinRT",
 ] }
 
-
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
