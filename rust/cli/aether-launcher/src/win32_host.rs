@@ -31,7 +31,9 @@ pub mod native {
 
     thread_local! {
         static CONTROLLER: RefCell<Option<ICoreWebView2Controller>> = const { RefCell::new(None) };
+        static MAIN_HWND: RefCell<Option<HWND>> = const { RefCell::new(None) };
         static HOST_CONFIG: RefCell<Option<HostConfig>> = const { RefCell::new(None) };
+        static WORKSPACE_SESSION: RefCell<Option<std::sync::Arc<crate::workspace_bridge::WorkspaceSession>>> = const { RefCell::new(None) };
     }
 
     pub use crate::host::HostConfig;
@@ -127,6 +129,17 @@ pub mod native {
                     );
                 }
 
+                // Initialize workspace session anchored to user data dir
+                let session = std::sync::Arc::new(crate::workspace_bridge::WorkspaceSession::new(
+                    self.config.user_data_dir.clone(),
+                ));
+                if let Some(ref init_p) = self.config.initial_path {
+                    let _ = session.set_single_root(init_p.clone());
+                } else if let Ok(cwd) = std::env::current_dir() {
+                    let _ = session.set_single_root(cwd);
+                }
+                WORKSPACE_SESSION.with(|s| *s.borrow_mut() = Some(session.clone()));
+
                 // 4. Create Win32 Top-Level Window (HWND)
                 let hwnd = CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
@@ -157,6 +170,7 @@ pub mod native {
                     LPARAM(h_icon_sm.0 as isize),
                 );
 
+                MAIN_HWND.with(|h| *h.borrow_mut() = Some(hwnd));
                 let _ = ShowWindow(hwnd, SW_SHOW);
                 let _ = UpdateWindow(hwnd);
 
@@ -501,6 +515,19 @@ pub mod native {
                 "SwarmGetMessages",
                 "ThreeWayMerge",
                 "ApplyMergeResolution",
+                "ShowOpenFolderDialog",
+                "ShowAddFolderDialog",
+                "ShowOpenFileDialog",
+                "ShowSaveFileDialog",
+                "WorkspaceGetTree",
+                "WorkspaceOpenFile",
+                "WorkspaceSaveFile",
+                "WorkspaceCreateFile",
+                "WorkspaceCreateFolder",
+                "WorkspaceRenameEntry",
+                "WorkspaceDeleteEntry",
+                "WorkspaceRevealInExplorer",
+                "WorkspaceSetTrust",
             ];
 
             if !allowed_actions.contains(&action.as_str()) {
@@ -517,10 +544,281 @@ pub mod native {
             }
 
             // 4. Dispatch action
-            let reply = if action == "FileRead" {
-                handle_file_read(&req_id, &params, workbench_dir)
-            } else if action == "FileWrite" {
-                handle_file_write(&req_id, &params, workbench_dir)
+            let reply = if action == "ShowOpenFolderDialog" {
+                let hwnd = MAIN_HWND.with(|h| h.borrow().unwrap_or_default());
+                let cur = WORKSPACE_SESSION
+                    .with(|s| s.borrow().as_ref().and_then(|ws| ws.primary_root()));
+                match crate::win32_dialogs::native::pick_folder(
+                    hwnd,
+                    Some("Open Folder — AetherIDE"),
+                    cur.as_deref(),
+                ) {
+                    Ok(Some(folder)) => {
+                        let res = WORKSPACE_SESSION
+                            .with(|s| s.borrow().as_ref().unwrap().set_single_root(folder));
+                        match res {
+                            Ok(summary) => {
+                                serde_json::json!({ "id": req_id, "action": action, "result": summary, "error": null })
+                            }
+                            Err(e) => {
+                                serde_json::json!({ "id": req_id, "action": action, "error": e, "result": null })
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        serde_json::json!({ "id": req_id, "action": action, "result": null, "cancelled": true, "error": null })
+                    }
+                    Err(e) => {
+                        serde_json::json!({ "id": req_id, "action": action, "error": format!("{:?}", e), "result": null })
+                    }
+                }
+            } else if action == "ShowAddFolderDialog" {
+                let hwnd = MAIN_HWND.with(|h| h.borrow().unwrap_or_default());
+                let cur = WORKSPACE_SESSION
+                    .with(|s| s.borrow().as_ref().and_then(|ws| ws.primary_root()));
+                match crate::win32_dialogs::native::pick_folder(
+                    hwnd,
+                    Some("Add Folder to Workspace — AetherIDE"),
+                    cur.as_deref(),
+                ) {
+                    Ok(Some(folder)) => {
+                        let res = WORKSPACE_SESSION
+                            .with(|s| s.borrow().as_ref().unwrap().add_root(folder));
+                        match res {
+                            Ok(summary) => {
+                                serde_json::json!({ "id": req_id, "action": action, "result": summary, "error": null })
+                            }
+                            Err(e) => {
+                                serde_json::json!({ "id": req_id, "action": action, "error": e, "result": null })
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        serde_json::json!({ "id": req_id, "action": action, "result": null, "cancelled": true, "error": null })
+                    }
+                    Err(e) => {
+                        serde_json::json!({ "id": req_id, "action": action, "error": format!("{:?}", e), "result": null })
+                    }
+                }
+            } else if action == "ShowOpenFileDialog" {
+                let hwnd = MAIN_HWND.with(|h| h.borrow().unwrap_or_default());
+                let cur = WORKSPACE_SESSION
+                    .with(|s| s.borrow().as_ref().and_then(|ws| ws.primary_root()));
+                match crate::win32_dialogs::native::pick_file(
+                    hwnd,
+                    Some("Open File — AetherIDE"),
+                    cur.as_deref(),
+                    Some("All Files (*.*)"),
+                    Some("*.*"),
+                ) {
+                    Ok(Some(file_path)) => {
+                        let path_str = file_path.to_string_lossy().to_string();
+                        match std::fs::read_to_string(&file_path) {
+                            Ok(content) => serde_json::json!({
+                                "id": req_id,
+                                "action": action,
+                                "result": { "path": path_str, "content": content },
+                                "error": null
+                            }),
+                            Err(e) => {
+                                serde_json::json!({ "id": req_id, "action": action, "error": format!("Read error: {}", e), "result": null })
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        serde_json::json!({ "id": req_id, "action": action, "result": null, "cancelled": true, "error": null })
+                    }
+                    Err(e) => {
+                        serde_json::json!({ "id": req_id, "action": action, "error": format!("{:?}", e), "result": null })
+                    }
+                }
+            } else if action == "ShowSaveFileDialog" {
+                let hwnd = MAIN_HWND.with(|h| h.borrow().unwrap_or_default());
+                let cur = WORKSPACE_SESSION
+                    .with(|s| s.borrow().as_ref().and_then(|ws| ws.primary_root()));
+                let default_name = params.get("default_name").and_then(|v| v.as_str());
+                let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                match crate::win32_dialogs::native::save_file(
+                    hwnd,
+                    Some("Save File As — AetherIDE"),
+                    cur.as_deref(),
+                    default_name,
+                ) {
+                    Ok(Some(dest_path)) => match std::fs::write(&dest_path, content) {
+                        Ok(()) => serde_json::json!({
+                            "id": req_id,
+                            "action": action,
+                            "result": { "saved_path": dest_path.to_string_lossy().to_string(), "success": true },
+                            "error": null
+                        }),
+                        Err(e) => {
+                            serde_json::json!({ "id": req_id, "action": action, "error": format!("Save error: {}", e), "result": null })
+                        }
+                    },
+                    Ok(None) => {
+                        serde_json::json!({ "id": req_id, "action": action, "result": null, "cancelled": true, "error": null })
+                    }
+                    Err(e) => {
+                        serde_json::json!({ "id": req_id, "action": action, "error": format!("{:?}", e), "result": null })
+                    }
+                }
+            } else if action == "WorkspaceGetTree" {
+                let res = WORKSPACE_SESSION.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .map(|ws| ws.get_workspace_summary())
+                        .unwrap_or_else(|| Err("Workspace session not initialized".into()))
+                });
+                match res {
+                    Ok(summary) => {
+                        serde_json::json!({ "id": req_id, "action": action, "result": summary, "error": null })
+                    }
+                    Err(e) => {
+                        serde_json::json!({ "id": req_id, "action": action, "error": e, "result": null })
+                    }
+                }
+            } else if action == "WorkspaceOpenFile" || action == "FileRead" {
+                let target = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let res = WORKSPACE_SESSION.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .map(|ws| ws.read_file(target))
+                        .unwrap_or_else(|| Err("Workspace session not initialized".into()))
+                });
+                match res {
+                    Ok(data) => {
+                        serde_json::json!({ "id": req_id, "action": action, "result": data, "error": null })
+                    }
+                    Err(_e) => {
+                        // Fallback to legacy workbench_dir read if within workbench
+                        handle_file_read(&req_id, &params, workbench_dir)
+                    }
+                }
+            } else if action == "WorkspaceSaveFile" || action == "FileWrite" {
+                let target = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let res = WORKSPACE_SESSION.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .map(|ws| ws.write_file(target, content))
+                        .unwrap_or_else(|| Err("Workspace session not initialized".into()))
+                });
+                match res {
+                    Ok(data) => {
+                        serde_json::json!({ "id": req_id, "action": action, "result": data, "error": null })
+                    }
+                    Err(_e) => {
+                        // Fallback to legacy workbench_dir write
+                        handle_file_write(&req_id, &params, workbench_dir)
+                    }
+                }
+            } else if action == "WorkspaceCreateFile" {
+                let target = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let res = WORKSPACE_SESSION.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .map(|ws| ws.create_file(target))
+                        .unwrap_or_else(|| Err("Workspace session not initialized".into()))
+                });
+                match res {
+                    Ok(data) => {
+                        serde_json::json!({ "id": req_id, "action": action, "result": data, "error": null })
+                    }
+                    Err(e) => {
+                        serde_json::json!({ "id": req_id, "action": action, "error": e, "result": null })
+                    }
+                }
+            } else if action == "WorkspaceCreateFolder" {
+                let target = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let res = WORKSPACE_SESSION.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .map(|ws| ws.create_directory(target))
+                        .unwrap_or_else(|| Err("Workspace session not initialized".into()))
+                });
+                match res {
+                    Ok(data) => {
+                        serde_json::json!({ "id": req_id, "action": action, "result": data, "error": null })
+                    }
+                    Err(e) => {
+                        serde_json::json!({ "id": req_id, "action": action, "error": e, "result": null })
+                    }
+                }
+            } else if action == "WorkspaceRenameEntry" {
+                let old_p = params
+                    .get("old_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let new_p = params
+                    .get("new_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let res = WORKSPACE_SESSION.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .map(|ws| ws.rename_entry(old_p, new_p))
+                        .unwrap_or_else(|| Err("Workspace session not initialized".into()))
+                });
+                match res {
+                    Ok(data) => {
+                        serde_json::json!({ "id": req_id, "action": action, "result": data, "error": null })
+                    }
+                    Err(e) => {
+                        serde_json::json!({ "id": req_id, "action": action, "error": e, "result": null })
+                    }
+                }
+            } else if action == "WorkspaceDeleteEntry" {
+                let target = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let res = WORKSPACE_SESSION.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .map(|ws| ws.delete_entry(target))
+                        .unwrap_or_else(|| Err("Workspace session not initialized".into()))
+                });
+                match res {
+                    Ok(data) => {
+                        serde_json::json!({ "id": req_id, "action": action, "result": data, "error": null })
+                    }
+                    Err(e) => {
+                        serde_json::json!({ "id": req_id, "action": action, "error": e, "result": null })
+                    }
+                }
+            } else if action == "WorkspaceRevealInExplorer" {
+                let target = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let res = WORKSPACE_SESSION.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .map(|ws| ws.reveal_in_explorer(target))
+                        .unwrap_or_else(|| Err("Workspace session not initialized".into()))
+                });
+                match res {
+                    Ok(data) => {
+                        serde_json::json!({ "id": req_id, "action": action, "result": data, "error": null })
+                    }
+                    Err(e) => {
+                        serde_json::json!({ "id": req_id, "action": action, "error": e, "result": null })
+                    }
+                }
+            } else if action == "WorkspaceSetTrust" {
+                let root = params.get("root").and_then(|v| v.as_str()).unwrap_or("");
+                let trusted = params
+                    .get("trusted")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let res = WORKSPACE_SESSION.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .map(|ws| ws.set_trust(root, trusted))
+                        .unwrap_or_else(|| Err("Workspace session not initialized".into()))
+                });
+                match res {
+                    Ok(data) => {
+                        serde_json::json!({ "id": req_id, "action": action, "result": data, "error": null })
+                    }
+                    Err(e) => {
+                        serde_json::json!({ "id": req_id, "action": action, "error": e, "result": null })
+                    }
+                }
             } else {
                 dispatch_ipc(
                     &req_id,
@@ -734,24 +1032,36 @@ pub mod native {
                     .unwrap_or_default()
                     .to_string(),
             },
-            "TerminalSpawn" => IpcRequest::TerminalSpawn {
-                shell: params
-                    .get("shell")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                cwd: params
+            "TerminalSpawn" => {
+                let cwd = params
                     .get("cwd")
                     .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                cols: params
-                    .get("cols")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as u16),
-                rows: params
-                    .get("rows")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as u16),
-            },
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        WORKSPACE_SESSION.with(|s| {
+                            s.borrow()
+                                .as_ref()
+                                .and_then(|ws| ws.primary_root())
+                                .map(|p| p.to_string_lossy().to_string())
+                        })
+                    });
+                IpcRequest::TerminalSpawn {
+                    shell: params
+                        .get("shell")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    cwd,
+                    cols: params
+                        .get("cols")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as u16),
+                    rows: params
+                        .get("rows")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as u16),
+                }
+            }
             "TerminalWrite" => IpcRequest::TerminalWrite {
                 session_id: params
                     .get("session_id")
@@ -984,6 +1294,7 @@ pub mod native {
                 session_token: Some("secret-token-123".to_string()),
                 peer_id: Some("owner-bootstrap-test".to_string()),
                 daemon_port: 44888,
+                initial_path: None,
             };
             assert_eq!(config.daemon_port, 44888);
             assert_eq!(config.session_token.as_deref(), Some("secret-token-123"));
@@ -1089,6 +1400,19 @@ pub mod native {
                 "SwarmGetMessages",
                 "ThreeWayMerge",
                 "ApplyMergeResolution",
+                "ShowOpenFolderDialog",
+                "ShowAddFolderDialog",
+                "ShowOpenFileDialog",
+                "ShowSaveFileDialog",
+                "WorkspaceGetTree",
+                "WorkspaceOpenFile",
+                "WorkspaceSaveFile",
+                "WorkspaceCreateFile",
+                "WorkspaceCreateFolder",
+                "WorkspaceRenameEntry",
+                "WorkspaceDeleteEntry",
+                "WorkspaceRevealInExplorer",
+                "WorkspaceSetTrust",
             ];
             assert!(allowed_actions.contains(&"LspCompletion"));
             assert!(allowed_actions.contains(&"FileWrite"));

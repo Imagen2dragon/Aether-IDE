@@ -969,6 +969,45 @@
       animation: none !important;
       transition: none !important;
     }
+  
+    /* Explorer Context Menu & Tree Styles */
+    .explorer-context-menu {
+      position: fixed;
+      z-index: 99999;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
+      padding: 4px 0;
+      min-width: 190px;
+      font-size: 12px;
+      color: #e2e8f0;
+      display: none;
+    }
+    .ctx-item {
+      padding: 6px 14px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .ctx-item:hover {
+      background: #0284c7;
+      color: #ffffff;
+    }
+    .ctx-separator {
+      height: 1px;
+      background: #334155;
+      margin: 4px 0;
+    }
+    .tree-children {
+      margin-left: 4px;
+      border-left: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .tree-item {
+      user-select: none;
+    }
+
   </style>
 </head>
 <body>
@@ -993,11 +1032,15 @@
         <div class="menu-item" id="menu-file">
           <button class="menu-btn" onclick="toggleMenu('menu-file')">File</button>
           <div class="dropdown-menu">
-            <div class="dropdown-entry" onclick="newProject()"><span>New File</span><span class="shortcut">Ctrl+N</span></div>
-            <div class="dropdown-entry" onclick="openFolder()"><span>Open Folder...</span><span class="shortcut">Ctrl+O</span></div>
+            <div class="dropdown-entry" onclick="newFileAction()"><span>New File</span><span class="shortcut">Ctrl+N</span></div>
+            <div class="dropdown-entry" onclick="newFolderAction()"><span>New Folder</span></div>
+            <div class="dropdown-separator"></div>
+            <div class="dropdown-entry" onclick="openFileDialog()"><span>Open File...</span><span class="shortcut">Ctrl+O</span></div>
+            <div class="dropdown-entry" onclick="openFolder()"><span>Open Folder...</span><span class="shortcut">Ctrl+K Ctrl+O</span></div>
+            <div class="dropdown-entry" onclick="addFolderToWorkspace()"><span>Add Folder to Workspace...</span></div>
             <div class="dropdown-separator"></div>
             <div class="dropdown-entry" onclick="saveActiveFile()"><span>Save</span><span class="shortcut">Ctrl+S</span></div>
-            <div class="dropdown-entry" onclick="saveActiveFile()"><span>Save All</span><span class="shortcut">Ctrl+Shift+S</span></div>
+            <div class="dropdown-entry" onclick="saveAsFile()"><span>Save As...</span><span class="shortcut">Ctrl+Shift+S</span></div>
             <div class="dropdown-separator"></div>
             <div class="dropdown-entry" onclick="window.close()"><span>Exit</span><span class="shortcut">Alt+F4</span></div>
           </div>
@@ -1206,15 +1249,16 @@
       <div class="sidebar-header-bar">
         <span id="sidebar-title" class="sidebar-title">EXPLORER</span>
         <div id="sidebar-actions" class="sidebar-actions">
-          <button class="tool-icon-btn" onclick="newProject()" title="New File">📄</button>
-          <button class="tool-icon-btn" onclick="openFolder()" title="Open Folder">📁</button>
-          <button class="tool-icon-btn" onclick="refreshTree()" title="Refresh">↻</button>
+          <button class="tool-icon-btn" onclick="newFileAction()" title="New File">📄</button>
+          <button class="tool-icon-btn" onclick="newFolderAction()" title="New Folder">📁+</button>
+          <button class="tool-icon-btn" onclick="openFolder()" title="Open Folder">📂</button>
+          <button class="tool-icon-btn" onclick="refreshTree()" title="Refresh Explorer">↻</button>
         </div>
       </div>
 
       <!-- Sideview: Explorer -->
       <div id="sideview-explorer" class="sideview-content active">
-        <div class="section-header">Workspace: Aether-IDE</div>
+        <div class="section-header" id="workspace-header-title">Workspace: (None)</div>
         <div class="tree-view" id="file-tree"></div>
         <div class="section-header" style="margin-top: auto;">Open Editors</div>
         <div id="open-editors-list" class="tree-view" style="max-height: 120px; flex: none;"></div>
@@ -1524,6 +1568,9 @@ Connected to daemon at 127.0.0.1:44888 via IPC protocol.</pre>
       </div>
       <div class="sb-cell" id="sb-terminals" onclick="toggleBottomPanel()" title="Terminal Sessions">
         <span>Terminals: 1</span>
+      </div>
+      <div class="sb-cell" id="sb-trust" onclick="toggleWorkspaceTrust()" title="Workspace Trust State (Restricted / Trusted)">
+        <span>🛡️ Trusted</span>
       </div>
     </div>
 
@@ -2115,15 +2162,20 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
       }
     }
 
-    function saveActiveFile() {
+    async function saveActiveFile() {
       if (!activeFilePath || !editor) return;
       const tab = openTabs.find(t => t.path === activeFilePath);
       if (!tab) return;
       const content = editor.getValue();
-      callIpc('FileWrite', { path: activeFilePath, content: content }).catch(() => {});
-      tab.dirty = false;
-      renderTabs();
-      console.log(`[AetherIDE] Saved: ${activeFilePath}`);
+      try {
+        await callIpc('WorkspaceSaveFile', { path: activeFilePath, content: content });
+        tab.dirty = false;
+        renderTabs();
+        notify(`Saved ${tab.name}`, 'success');
+        console.log(`[AetherIDE] Saved: ${activeFilePath}`);
+      } catch (e) {
+        notify(`Save failed: ${e}`, 'error');
+      }
     }
 
     let changeTimer = null;
@@ -2880,6 +2932,45 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
       transition: none !important;
     }
 
+  
+    /* Explorer Context Menu & Tree Styles */
+    .explorer-context-menu {
+      position: fixed;
+      z-index: 99999;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
+      padding: 4px 0;
+      min-width: 190px;
+      font-size: 12px;
+      color: #e2e8f0;
+      display: none;
+    }
+    .ctx-item {
+      padding: 6px 14px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .ctx-item:hover {
+      background: #0284c7;
+      color: #ffffff;
+    }
+    .ctx-separator {
+      height: 1px;
+      background: #334155;
+      margin: 4px 0;
+    }
+    .tree-children {
+      margin-left: 4px;
+      border-left: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .tree-item {
+      user-select: none;
+    }
+
   </style>
         </head>
         <body>
@@ -3245,16 +3336,444 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
       if (e.target.id === modalId) closeModal(modalId);
     }
 
+    // Workspace & Filesystem Controller State
+    let currentWorkspace = {
+      roots: [],
+      root_count: 0,
+      primary_path: null
+    };
+
     function newProject() {
-      closeAllMenus();
-      notify('New Project wizard opened. Select project template.', 'info');
-      switchTab('editor');
+      newFileAction();
     }
 
-    function openFolder() {
+    async function openFolder() {
       closeAllMenus();
-      notify('Opening native folder picker...', 'info');
-      switchTab('editor');
+      try {
+        notify('Opening Windows native folder dialog...', 'info');
+        const res = await callIpc('ShowOpenFolderDialog', {});
+        if (res && res.roots) {
+          currentWorkspace = res;
+          renderWorkspaceTree(res);
+          const rootName = res.roots[0] ? res.roots[0].name : 'Project';
+          notify(`Opened workspace folder: ${rootName}`, 'success');
+          if (res.roots[0] && res.roots[0].tree && res.roots[0].tree.length > 0) {
+            const firstFile = findFirstFileNode(res.roots[0].tree);
+            if (firstFile) {
+              openWorkspaceFile(firstFile.full_path, firstFile.name);
+            }
+          }
+        } else if (res && res.cancelled) {
+          // Cancelled by user
+        }
+      } catch (err) {
+        notify(`Open folder failed: ${err}`, 'error');
+      }
+    }
+
+    async function addFolderToWorkspace() {
+      closeAllMenus();
+      try {
+        notify('Opening folder dialog to add to workspace...', 'info');
+        const res = await callIpc('ShowAddFolderDialog', {});
+        if (res && res.roots) {
+          currentWorkspace = res;
+          renderWorkspaceTree(res);
+          const added = res.roots[res.roots.length - 1];
+          notify(`Added folder to workspace: ${added.name}`, 'success');
+        }
+      } catch (err) {
+        notify(`Add folder failed: ${err}`, 'error');
+      }
+    }
+
+    async function openFileDialog() {
+      closeAllMenus();
+      try {
+        const res = await callIpc('ShowOpenFileDialog', {});
+        if (res && res.path) {
+          openWorkspaceFile(res.path, res.path.split(/[\\/]/).pop(), res.content);
+          notify(`Opened file: ${res.path.split(/[\\/]/).pop()}`, 'success');
+        }
+      } catch (err) {
+        notify(`Open file failed: ${err}`, 'error');
+      }
+    }
+
+    async function saveAsFile() {
+      closeAllMenus();
+      if (!editor) return;
+      const content = editor.getValue();
+      const defaultName = activeFilePath ? activeFilePath.split(/[\\/]/).pop() : 'untitled.txt';
+      try {
+        const res = await callIpc('ShowSaveFileDialog', { default_name: defaultName, content: content });
+        if (res && res.saved_path) {
+          const fileName = res.saved_path.split(/[\\/]/).pop();
+          openWorkspaceFile(res.saved_path, fileName, content);
+          notify(`Saved as: ${fileName}`, 'success');
+          refreshTree();
+        }
+      } catch (err) {
+        notify(`Save As failed: ${err}`, 'error');
+      }
+    }
+
+    async function newFileAction() {
+      closeAllMenus();
+      const fileName = prompt('Enter new file path (e.g. src/index.ts or main.rs):');
+      if (!fileName || !fileName.trim()) return;
+      try {
+        await callIpc('WorkspaceCreateFile', { path: fileName.trim() });
+        notify(`Created file: ${fileName.trim()}`, 'success');
+        await refreshTree();
+        openWorkspaceFile(fileName.trim(), fileName.trim().split(/[\\/]/).pop(), '');
+      } catch (e) {
+        notify(`Create file failed: ${e}`, 'error');
+      }
+    }
+
+    async function newFolderAction() {
+      closeAllMenus();
+      const folderName = prompt('Enter new directory path (e.g. src/components):');
+      if (!folderName || !folderName.trim()) return;
+      try {
+        await callIpc('WorkspaceCreateFolder', { path: folderName.trim() });
+        notify(`Created folder: ${folderName.trim()}`, 'success');
+        refreshTree();
+      } catch (e) {
+        notify(`Create folder failed: ${e}`, 'error');
+      }
+    }
+
+    async function refreshTree() {
+      try {
+        const res = await callIpc('WorkspaceGetTree', {});
+        if (res && res.roots) {
+          currentWorkspace = res;
+          renderWorkspaceTree(res);
+        }
+      } catch (e) {
+        console.warn('Workspace tree refresh notice:', e);
+      }
+    }
+
+    function findFirstFileNode(nodes) {
+      if (!nodes) return null;
+      for (const node of nodes) {
+        if (!node.is_dir) return node;
+        if (node.children) {
+          const found = findFirstFileNode(node.children);
+          if (found) return found;
+        }
+      }
+      return null;
+    }
+
+    function detectLanguage(filePath) {
+      const ext = filePath.split('.').pop().toLowerCase();
+      switch (ext) {
+        case 'rs': return 'rust';
+        case 'ts': case 'tsx': return 'typescript';
+        case 'js': case 'jsx': return 'javascript';
+        case 'html': return 'html';
+        case 'css': return 'css';
+        case 'json': return 'json';
+        case 'md': return 'markdown';
+        case 'toml': return 'toml';
+        case 'iss': return 'ini';
+        case 'py': return 'python';
+        case 'sh': return 'shell';
+        case 'bat': case 'cmd': return 'bat';
+        case 'c': case 'h': return 'c';
+        case 'cpp': case 'hpp': return 'cpp';
+        default: return 'plaintext';
+      }
+    }
+
+    function getFileIcon(fileName) {
+      const ext = fileName.split('.').pop().toLowerCase();
+      switch (ext) {
+        case 'rs': return '🦀';
+        case 'ts': case 'tsx': return '🔷';
+        case 'js': case 'jsx': return '🟨';
+        case 'html': return '🌐';
+        case 'css': return '🎨';
+        case 'json': return '📋';
+        case 'md': return '📝';
+        case 'toml': return '⚙️';
+        case 'iss': return '📦';
+        case 'py': return '🐍';
+        default: return '📄';
+      }
+    }
+
+    async function openWorkspaceFile(filePath, fileName, optContent) {
+      activeFilePath = filePath;
+      let tab = openTabs.find(t => t.path === filePath);
+
+      if (!tab) {
+        let content = optContent;
+        if (content === undefined || content === null) {
+          try {
+            const readRes = await callIpc('WorkspaceOpenFile', { path: filePath });
+            content = (readRes && readRes.content !== undefined) ? readRes.content : (sampleFiles[filePath] ? sampleFiles[filePath].content : `// File: ${filePath}\n`);
+          } catch (e) {
+            content = sampleFiles[filePath] ? sampleFiles[filePath].content : `// File: ${filePath}\n`;
+          }
+        }
+
+        const lang = detectLanguage(filePath);
+        const uri = monaco.Uri.parse(`aether://workspace/${encodeURIComponent(filePath.replace(/\\/g, '/'))}`);
+        let model = monaco.editor.getModel(uri);
+        if (!model) {
+          model = monaco.editor.createModel(content, lang, uri);
+        }
+        tab = { path: filePath, name: fileName || filePath.split(/[\\/]/).pop(), model: model, lang: lang, dirty: false };
+        openTabs.push(tab);
+
+        callIpc('LspOpenDocument', { path: filePath, content: content, language_id: lang }).catch(() => {});
+      }
+
+      if (editor) {
+        editor.setModel(tab.model);
+        const emptyState = document.getElementById('empty-editor-state');
+        if (emptyState) emptyState.style.display = 'none';
+      }
+
+      const displayName = fileName || filePath.split(/[\\/]/).pop();
+      const breadcrumbEl = document.getElementById('active-breadcrumb-filename');
+      if (breadcrumbEl) breadcrumbEl.innerText = displayName;
+      const langEl = document.getElementById('sb-lang');
+      if (langEl) langEl.innerText = tab.lang.toUpperCase();
+
+      renderTabs();
+      renderOpenEditorsList();
+    }
+
+    function renderWorkspaceTree(workspaceData) {
+      const treeContainer = document.getElementById('file-tree');
+      if (!treeContainer) return;
+      treeContainer.innerHTML = '';
+
+      const headerTitle = document.getElementById('workspace-header-title');
+
+      if (!workspaceData.roots || workspaceData.roots.length === 0) {
+        if (headerTitle) headerTitle.innerText = 'No Folder Open';
+        treeContainer.innerHTML = `
+          <div style="padding:16px 8px; text-align:center; color:#64748b; font-size:12px;">
+            <p>No folder currently open.</p>
+            <button class="side-btn" style="margin-top:10px;" onclick="openFolder()">Open Folder...</button>
+          </div>
+        `;
+        return;
+      }
+
+      if (workspaceData.roots.length === 1) {
+        const root = workspaceData.roots[0];
+        if (headerTitle) headerTitle.innerText = `Workspace: ${root.name}`;
+        renderNodes(root.tree, treeContainer, 0, root.path);
+      } else {
+        if (headerTitle) headerTitle.innerText = `Workspace (${workspaceData.root_count} roots)`;
+        workspaceData.roots.forEach((root) => {
+          const rootHeader = document.createElement('div');
+          rootHeader.className = 'tree-item folder-item';
+          rootHeader.style.fontWeight = '600';
+          rootHeader.innerHTML = `
+            <span class="tree-arrow">▼</span>
+            <span class="tree-icon">📁</span>
+            <span class="tree-label">${root.name}</span>
+          `;
+          treeContainer.appendChild(rootHeader);
+
+          const childrenContainer = document.createElement('div');
+          childrenContainer.className = 'tree-children';
+          renderNodes(root.tree, childrenContainer, 1, root.path);
+          treeContainer.appendChild(childrenContainer);
+
+          rootHeader.onclick = () => {
+            const isCollapsed = childrenContainer.style.display === 'none';
+            childrenContainer.style.display = isCollapsed ? 'block' : 'none';
+            rootHeader.querySelector('.tree-arrow').innerText = isCollapsed ? '▼' : '▶';
+          };
+        });
+      }
+    }
+
+    function renderNodes(nodes, container, depth, rootPath) {
+      if (!nodes || nodes.length === 0) return;
+
+      nodes.forEach(node => {
+        const item = document.createElement('div');
+        item.className = 'tree-item' + (node.is_dir ? ' folder-item' : ' file-item');
+        item.style.paddingLeft = (12 + depth * 14) + 'px';
+
+        if (node.is_dir) {
+          item.innerHTML = `
+            <span class="tree-arrow">▶</span>
+            <span class="tree-icon">📁</span>
+            <span class="tree-label">${node.name}</span>
+          `;
+          container.appendChild(item);
+
+          const subContainer = document.createElement('div');
+          subContainer.className = 'tree-children';
+          subContainer.style.display = 'none';
+          container.appendChild(subContainer);
+
+          let loaded = false;
+          item.onclick = (e) => {
+            e.stopPropagation();
+            const isCollapsed = subContainer.style.display === 'none';
+            if (isCollapsed && !loaded && node.children) {
+              renderNodes(node.children, subContainer, depth + 1, rootPath);
+              loaded = true;
+            }
+            subContainer.style.display = isCollapsed ? 'block' : 'none';
+            item.querySelector('.tree-arrow').innerText = isCollapsed ? '▼' : '▶';
+            item.querySelector('.tree-icon').innerText = isCollapsed ? '📂' : '📁';
+          };
+
+          item.oncontextmenu = (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            showExplorerContextMenu(e.clientX, e.clientY, node);
+          };
+        } else {
+          const icon = getFileIcon(node.name);
+          item.innerHTML = `
+            <span style="display:inline-block; width:12px;"></span>
+            <span class="tree-icon">${icon}</span>
+            <span class="tree-label">${node.name}</span>
+          `;
+          item.onclick = (e) => {
+            e.stopPropagation();
+            openWorkspaceFile(node.full_path, node.name);
+          };
+          item.oncontextmenu = (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            showExplorerContextMenu(e.clientX, e.clientY, node);
+          };
+          container.appendChild(item);
+        }
+      });
+    }
+
+    function showExplorerContextMenu(x, y, node) {
+      let menu = document.getElementById('explorer-context-menu');
+      if (!menu) {
+        menu = document.createElement('div');
+        menu.id = 'explorer-context-menu';
+        menu.className = 'explorer-context-menu';
+        document.body.appendChild(menu);
+      }
+
+      menu.innerHTML = `
+        <div class="ctx-item" onclick="newFileInNode('${node.full_path.replace(/\\/g, '/')}', ${node.is_dir})">📄 New File</div>
+        <div class="ctx-item" onclick="newFolderInNode('${node.full_path.replace(/\\/g, '/')}', ${node.is_dir})">📁 New Folder</div>
+        <div class="ctx-separator"></div>
+        <div class="ctx-item" onclick="renameNodeAction('${node.full_path.replace(/\\/g, '/')}', '${node.name}')">✏️ Rename</div>
+        <div class="ctx-item" onclick="deleteNodeAction('${node.full_path.replace(/\\/g, '/')}', '${node.name}')" style="color:#ef4444;">🗑️ Delete</div>
+        <div class="ctx-separator"></div>
+        <div class="ctx-item" onclick="revealInExplorerAction('${node.full_path.replace(/\\/g, '/')}')">🪟 Reveal in File Explorer</div>
+        <div class="ctx-item" onclick="copyPathAction('${node.full_path.replace(/\\/g, '/')}')">📋 Copy Path</div>
+      `;
+
+      menu.style.display = 'block';
+      menu.style.left = Math.min(x, window.innerWidth - 210) + 'px';
+      menu.style.top = Math.min(y, window.innerHeight - 260) + 'px';
+
+      const closeCtx = (e) => {
+        if (!menu.contains(e.target)) {
+          menu.style.display = 'none';
+          document.removeEventListener('click', closeCtx);
+        }
+      };
+      setTimeout(() => document.addEventListener('click', closeCtx), 20);
+    }
+
+    async function newFileInNode(parentPath, isDir) {
+      const dir = isDir ? parentPath : parentPath.substring(0, parentPath.lastIndexOf('/'));
+      const name = prompt(`Create new file in ${dir}:`);
+      if (!name || !name.trim()) return;
+      const target = dir + '/' + name.trim();
+      try {
+        await callIpc('WorkspaceCreateFile', { path: target });
+        notify(`Created ${name.trim()}`, 'success');
+        await refreshTree();
+        openWorkspaceFile(target, name.trim(), '');
+      } catch (e) {
+        notify(`Create file error: ${e}`, 'error');
+      }
+    }
+
+    async function newFolderInNode(parentPath, isDir) {
+      const dir = isDir ? parentPath : parentPath.substring(0, parentPath.lastIndexOf('/'));
+      const name = prompt(`Create new folder in ${dir}:`);
+      if (!name || !name.trim()) return;
+      const target = dir + '/' + name.trim();
+      try {
+        await callIpc('WorkspaceCreateFolder', { path: target });
+        notify(`Created folder ${name.trim()}`, 'success');
+        refreshTree();
+      } catch (e) {
+        notify(`Create folder error: ${e}`, 'error');
+      }
+    }
+
+    async function renameNodeAction(fullPath, currentName) {
+      const newName = prompt(`Rename ${currentName} to:`, currentName);
+      if (!newName || !newName.trim() || newName.trim() === currentName) return;
+      const parentDir = fullPath.substring(0, fullPath.lastIndexOf('/'));
+      const newPath = parentDir + '/' + newName.trim();
+      try {
+        await callIpc('WorkspaceRenameEntry', { old_path: fullPath, new_path: newPath });
+        notify(`Renamed to ${newName.trim()}`, 'success');
+        refreshTree();
+      } catch (e) {
+        notify(`Rename failed: ${e}`, 'error');
+      }
+    }
+
+    async function deleteNodeAction(fullPath, name) {
+      if (!confirm(`Are you sure you want to permanently delete '${name}'?`)) return;
+      try {
+        await callIpc('WorkspaceDeleteEntry', { path: fullPath });
+        notify(`Deleted ${name}`, 'info');
+        closeTab(new Event('click'), fullPath);
+        refreshTree();
+      } catch (e) {
+        notify(`Delete failed: ${e}`, 'error');
+      }
+    }
+
+    async function revealInExplorerAction(fullPath) {
+      try {
+        await callIpc('WorkspaceRevealInExplorer', { path: fullPath });
+      } catch (e) {
+        notify(`Reveal failed: ${e}`, 'error');
+      }
+    }
+
+    function copyPathAction(fullPath) {
+      navigator.clipboard.writeText(fullPath).then(() => {
+        notify('Copied path to clipboard', 'info');
+      }).catch(() => {
+        prompt('Copy path:', fullPath);
+      });
+    }
+
+    let isWorkspaceTrusted = true;
+    async function toggleWorkspaceTrust() {
+      isWorkspaceTrusted = !isWorkspaceTrusted;
+      const pill = document.getElementById('sb-trust');
+      if (pill) {
+        pill.innerHTML = isWorkspaceTrusted ? '<span>🛡️ Trusted</span>' : '<span style="color:#f59e0b;">⚠️ Restricted Mode</span>';
+      }
+      if (currentWorkspace.primary_path) {
+        await callIpc('WorkspaceSetTrust', { root: currentWorkspace.primary_path, trusted: isWorkspaceTrusted }).catch(() => {});
+      }
+      notify(isWorkspaceTrusted ? 'Workspace is now Trusted (Full Execution Permitted)' : 'Workspace switched to Restricted Mode (Scripts & Terminal Gated)', 'info');
     }
 
     function triggerEditorAction(action) {
@@ -3560,8 +4079,8 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
           const state = JSON.parse(saved);
           if (state.sidebarWidth) document.getElementById('primary-sidebar').style.width = state.sidebarWidth;
           if (state.panelHeight) document.getElementById('bottom-panel').style.height = state.panelHeight;
-          if (state.currentActivity) selectActivity(state.currentActivity);
-          if (!state.isPrimarySidebarOpen) togglePrimarySidebar();
+          if (state.currentActivity && state.currentActivity !== 'mobile') selectActivity(state.currentActivity); else selectActivity('explorer');
+          if (typeof state.isPrimarySidebarOpen === 'boolean' && state.isPrimarySidebarOpen !== isPrimarySidebarOpen) togglePrimarySidebar();
           if (state.isSecondarySidebarOpen) toggleSecondarySidebar();
           if (!state.isBottomPanelOpen) toggleBottomPanel();
         }
@@ -3615,15 +4134,38 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
       setupSplitters();
       restoreLayoutState();
       setTimeout(() => {
+        refreshTree();
+      }, 100);
+      setTimeout(() => {
         if (editor) editor.layout();
       }, 200);
     });
 
     function setupShortcuts() {
       window.addEventListener('keydown', e => {
-        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's' && !e.shiftKey) {
           e.preventDefault();
           saveActiveFile();
+        }
+        if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 's') {
+          e.preventDefault();
+          saveAsFile();
+        }
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'o') {
+          e.preventDefault();
+          openFileDialog();
+        }
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n') {
+          e.preventDefault();
+          newFileAction();
+        }
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b' && !e.altKey) {
+          e.preventDefault();
+          togglePrimarySidebar();
+        }
+        if ((e.ctrlKey || e.metaKey) && e.altKey && e.key.toLowerCase() === 'b') {
+          e.preventDefault();
+          toggleSecondarySidebar();
         }
         if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'p' && !e.shiftKey) {
           e.preventDefault();

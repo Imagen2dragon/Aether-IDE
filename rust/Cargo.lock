@@ -67,9 +67,11 @@ name = "aether-launcher"
 version = "0.1.0"
 dependencies = [
  "application-core",
+ "chrono",
  "filesystem-engine",
  "ipc-protocol",
  "security-core",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

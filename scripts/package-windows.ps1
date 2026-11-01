@@ -102,6 +102,34 @@ endlocal
 "@
 Set-Content -Path "$STAGE_DIR\AetherIDE.cmd" -Value $LAUNCHER_BAT
 
+$CLI_WRAPPER_BAT = @"
+@echo off
+setlocal
+set "AETHER_ROOT=%~dp0..\"
+if "%~1"=="doctor" goto run_cli
+if "%~1"=="ping" goto run_cli
+if "%~1"=="status" goto run_cli
+if "%~1"=="index" goto run_cli
+if "%~1"=="search" goto run_cli
+if "%~1"=="agent" goto run_cli
+if "%~1"=="mobile" goto run_cli
+if "%~1"=="--help" goto run_cli
+if "%~1"=="-h" goto run_cli
+if "%~1"=="--version" goto run_cli
+if "%~1"=="-v" goto run_cli
+
+start "" "%AETHER_ROOT%AetherIDE.exe" %*
+goto end
+
+:run_cli
+"%AETHER_ROOT%bin\aether-cli.exe" %*
+
+:end
+endlocal
+"@
+Set-Content -Path "$STAGE_DIR\bin\aetheride.cmd" -Value $CLI_WRAPPER_BAT
+Set-Content -Path "$STAGE_DIR\bin\aether.cmd" -Value $CLI_WRAPPER_BAT
+
 # Metadata descriptor
 $RELEASE_INFO = @{
     name = "AetherIDE"
