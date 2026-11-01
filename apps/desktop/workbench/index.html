@@ -1912,7 +1912,22 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
 
         pendingIpc.set(id, { resolve, action, params });
 
-        if (isNativeHost && window.chrome && window.chrome.webview) {
+        if (window.__TAURI__ && window.__TAURI__.core) {
+          window.__TAURI__.core.invoke('ide_dispatch', { action: action, payload: params || {} })
+            .then((resp) => {
+              if (pendingIpc.has(id)) {
+                pendingIpc.delete(id);
+                resolve(resp);
+              }
+            })
+            .catch((err) => {
+              console.error('Tauri IPC error for ' + action + ':', err);
+              if (pendingIpc.has(id)) {
+                pendingIpc.delete(id);
+                resolve(getFallbackData(action, params));
+              }
+            });
+        } else if (isNativeHost && window.chrome && window.chrome.webview) {
           window.chrome.webview.postMessage(payload);
         } else if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify(payload) + '\n');
@@ -1937,6 +1952,15 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
     }
 
     function handleIpcMessage(msg) {
+      if (!window.__tauriListenerAttached && window.__TAURI__ && window.__TAURI__.event) {
+        window.__tauriListenerAttached = true;
+        window.__TAURI__.event.listen('terminal-output', (event) => {
+          const d = event.payload && event.payload.data;
+          if (d && activeTerminalId && terminals.has(activeTerminalId)) {
+            terminals.get(activeTerminalId).term.write(d);
+          }
+        });
+      }
       if (!msg) return;
       if (msg.id && pendingIpc.has(msg.id)) {
         const { resolve } = pendingIpc.get(msg.id);
