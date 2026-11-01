@@ -258,6 +258,24 @@ impl WorkspaceSession {
             let arg = format!("/select,\"{}\"", resolved.to_string_lossy());
             let _ = std::process::Command::new("explorer").raw_arg(&arg).spawn();
         }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open")
+                .arg("-R")
+                .arg(&resolved)
+                .spawn();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let show_path = if resolved.is_dir() {
+                &resolved
+            } else {
+                resolved.parent().unwrap_or(&resolved)
+            };
+            let _ = std::process::Command::new("xdg-open")
+                .arg(show_path)
+                .spawn();
+        }
 
         Ok(serde_json::json!({
             "path": target_path,

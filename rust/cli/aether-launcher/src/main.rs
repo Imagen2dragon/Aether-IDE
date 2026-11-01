@@ -229,7 +229,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Launch Standalone Desktop Workbench
     println!(" [*] Launching AetherIDE Standalone Desktop Workbench...");
     let workbench_dir = exe_dir.join("workbench");
-    let workbench_html = workbench_dir.join("index.html");
     let electron_exe = workbench_dir.join("electron.exe");
     let electron_main = workbench_dir.join("dist").join("main.js");
 
@@ -326,6 +325,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 " [✓] Starting Fallback Microsoft WebView2 App Host (version: {})...",
                 ver
             );
+            let workbench_html = workbench_dir.join("index.html");
             match webview2_runtime::launch_webview2_host(&webview2, &workbench_html, &data_dir) {
                 Ok(_) => {
                     println!(
