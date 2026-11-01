@@ -26,6 +26,7 @@ pub mod native {
     use windows::Win32::UI::HiDpi::{
         SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
+    use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     thread_local! {
@@ -57,6 +58,10 @@ pub mod native {
 
         pub fn run(&self) -> Result<()> {
             unsafe {
+                // 0. Configure stable Windows Application User Model ID for shell & taskbar grouping
+                let app_id = w!("AetherIDE.Desktop");
+                let _ = SetCurrentProcessExplicitAppUserModelID(app_id);
+
                 // 1. Enable Per-Monitor V2 DPI awareness for sharp UI
                 let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
@@ -66,9 +71,36 @@ pub mod native {
                 // Store host config for message bridge
                 HOST_CONFIG.with(|c| *c.borrow_mut() = Some(self.config.clone()));
 
-                // 3. Register Win32 Window Class
+                // 3. Register Win32 Window Class & Embedded AetherIDE Icons
                 let hinstance: HMODULE = GetModuleHandleW(PCWSTR::null())?;
                 let class_name = w!("AetherIDEWindowClass");
+
+                // Load embedded icon resource (ID 1) with fallback to standard application icon
+                let h_icon = LoadImageW(
+                    hinstance,
+                    PCWSTR(1 as *const u16),
+                    IMAGE_ICON,
+                    32,
+                    32,
+                    LR_DEFAULTCOLOR,
+                )
+                .map(|handle| HICON(handle.0))
+                .unwrap_or_else(|_| {
+                    LoadIconW(HMODULE::default(), IDI_APPLICATION).unwrap_or_default()
+                });
+
+                let h_icon_sm = LoadImageW(
+                    hinstance,
+                    PCWSTR(1 as *const u16),
+                    IMAGE_ICON,
+                    16,
+                    16,
+                    LR_DEFAULTCOLOR,
+                )
+                .map(|handle| HICON(handle.0))
+                .unwrap_or_else(|_| {
+                    LoadIconW(HMODULE::default(), IDI_APPLICATION).unwrap_or_default()
+                });
 
                 let wc = WNDCLASSEXW {
                     cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -77,12 +109,12 @@ pub mod native {
                     cbClsExtra: 0,
                     cbWndExtra: 0,
                     hInstance: hinstance.into(),
-                    hIcon: HICON::default(),
+                    hIcon: h_icon,
                     hCursor: LoadCursorW(HMODULE::default(), IDC_ARROW)?,
                     hbrBackground: HBRUSH::default(),
                     lpszMenuName: PCWSTR::null(),
                     lpszClassName: class_name,
-                    hIconSm: HICON::default(),
+                    hIconSm: h_icon_sm,
                 };
 
                 let atom = RegisterClassExW(&wc);
@@ -109,6 +141,20 @@ pub mod native {
                     hinstance,
                     None,
                 )?;
+
+                // Explicitly send WM_SETICON (big and small) for Alt+Tab and taskbar recognition
+                let _ = SendMessageW(
+                    hwnd,
+                    WM_SETICON,
+                    WPARAM(ICON_BIG as usize),
+                    LPARAM(h_icon.0 as isize),
+                );
+                let _ = SendMessageW(
+                    hwnd,
+                    WM_SETICON,
+                    WPARAM(ICON_SMALL as usize),
+                    LPARAM(h_icon_sm.0 as isize),
+                );
 
                 let _ = ShowWindow(hwnd, SW_SHOW);
                 let _ = UpdateWindow(hwnd);

@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" width="1200" height="360">
+  <defs>
+    <linearGradient id="logoBgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1E293B" />
+      <stop offset="100%" stop-color="#0F172A" />
+    </linearGradient>
+    <linearGradient id="logoBorderGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38BDF8" />
+      <stop offset="50%" stop-color="#6366F1" />
+      <stop offset="100%" stop-color="#0EA5E9" />
+    </linearGradient>
+    <linearGradient id="logoLeftBeam" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38BDF8" />
+      <stop offset="100%" stop-color="#0284C7" />
+    </linearGradient>
+    <linearGradient id="logoRightBeam" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#818CF8" />
+      <stop offset="100%" stop-color="#4F46E5" />
+    </linearGradient>
+    <linearGradient id="textGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="70%" stop-color="#F8FAFC" />
+      <stop offset="100%" stop-color="#38BDF8" />
+    </linearGradient>
+    <filter id="logoGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="8" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Left: Symbol (scaled to 260x260 centered in 320px box) -->
+  <g transform="translate(40, 50)">
+    <rect x="0" y="0" width="260" height="260" rx="58" fill="url(#logoBgGrad)" stroke="url(#logoBorderGrad)" stroke-width="7" />
+    <!-- Background grid -->
+    <path d="M54 130 L130 54 L206 130 L130 206 Z" fill="none" stroke="#334155" stroke-width="2" stroke-dasharray="4 4" opacity="0.6" />
+    <!-- Wings -->
+    <polygon points="130,42 48,218 86,218 130,126 130,42" fill="url(#logoLeftBeam)" />
+    <polygon points="130,42 212,218 174,218 130,126 130,42" fill="url(#logoRightBeam)" />
+    <!-- Bridge -->
+    <polygon points="94,168 166,168 156,186 104,186" fill="#38BDF8" />
+    <!-- Core Prism -->
+    <polygon points="130,102 146,138 130,174 114,138" fill="#FFFFFF" filter="url(#logoGlow)" />
+    <!-- Apex Spark -->
+    <circle cx="130" cy="42" r="10" fill="#38BDF8" />
+    <circle cx="130" cy="42" r="5" fill="#FFFFFF" />
+  </g>
+
+  <!-- Right: Typography Wordmark & Product Positioning -->
+  <g transform="translate(350, 0)">
+    <!-- Wordmark -->
+    <text x="0" y="195" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-weight="800" font-size="118" fill="url(#textGrad)" letter-spacing="-2">Aether<tspan fill="#38BDF8">IDE</tspan></text>
+    
+    <!-- Version / Status Badge -->
+    <rect x="680" y="105" width="130" height="38" rx="8" fill="#1E293B" stroke="#38BDF8" stroke-width="2" />
+    <text x="745" y="130" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" font-size="16" fill="#38BDF8" text-anchor="middle">BETA.2</text>
+
+    <!-- Tagline / Subtitle -->
+    <text x="5" y="255" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="500" font-size="28" fill="#94A3B8" letter-spacing="3">AI-NATIVE ENGINEERING ENVIRONMENT</text>
+  </g>
+</svg>

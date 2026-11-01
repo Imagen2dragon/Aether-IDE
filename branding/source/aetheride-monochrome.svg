@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Monochromatic / Single-color Flat Glyph for Print, Stencils, High-Contrast Modes -->
+  <rect x="24" y="24" width="464" height="464" rx="104" fill="none" stroke="#FFFFFF" stroke-width="16" />
+  <polygon points="256,96 120,400 184,400 256,236 256,96" fill="#FFFFFF" />
+  <polygon points="256,96 392,400 328,400 256,236 256,96" fill="#FFFFFF" opacity="0.8" />
+  <polygon points="196,312 316,312 300,344 212,344" fill="#FFFFFF" />
+  <polygon points="256,192 284,256 256,320 228,256" fill="#000000" />
+  <circle cx="256" cy="96" r="14" fill="#FFFFFF" />
+</svg>

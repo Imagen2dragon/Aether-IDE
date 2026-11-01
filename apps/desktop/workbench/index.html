@@ -683,16 +683,354 @@
       background: #1e293b;
       color: #38bdf8;
     }
+  
+    /* Desktop Application Menu Bar */
+    .menubar {
+      display: flex;
+      background: #080d1a;
+      border-bottom: 1px solid var(--border-color);
+      padding: 0 8px;
+      font-size: 12px;
+      user-select: none;
+      position: relative;
+      z-index: 200;
+    }
+    .menu-item {
+      position: relative;
+    }
+    .menu-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      padding: 4px 10px;
+      cursor: pointer;
+      font-size: 12px;
+      border-radius: 4px;
+      transition: background 0.12s, color 0.12s;
+    }
+    .menu-btn:hover, .menu-item.open .menu-btn {
+      background: var(--border-color);
+      color: var(--text-primary);
+    }
+    .dropdown-menu {
+      display: none;
+      position: absolute;
+      top: 100%;
+      left: 0;
+      background: #0f172a;
+      border: 1px solid var(--border-light);
+      border-radius: 6px;
+      min-width: 220px;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.6);
+      padding: 4px 0;
+      z-index: 300;
+    }
+    .menu-item.open .dropdown-menu {
+      display: block;
+    }
+    .dropdown-entry {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 14px;
+      color: var(--text-primary);
+      cursor: pointer;
+      font-size: 12px;
+      transition: background 0.1s;
+    }
+    .dropdown-entry:hover {
+      background: #1e293b;
+      color: var(--accent);
+    }
+    .dropdown-entry .shortcut {
+      color: var(--text-dim);
+      font-size: 11px;
+      margin-left: 16px;
+    }
+    .dropdown-separator {
+      height: 1px;
+      background: var(--border-color);
+      margin: 4px 0;
+    }
+
+    /* Resource Mode Toggle Button in Header */
+    .mode-badge {
+      background: #1e293b;
+      border: 1px solid #334155;
+      color: #38bdf8;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 12px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s ease-out;
+    }
+    .mode-badge:hover {
+      background: #334155;
+      border-color: #38bdf8;
+    }
+    .mode-badge.low-res {
+      background: rgba(34, 197, 94, 0.15);
+      border-color: #22c55e;
+      color: #4ade80;
+    }
+
+    /* Welcome Dashboard Tab */
+    .welcome-container {
+      flex: 1;
+      overflow-y: auto;
+      padding: 48px;
+      background: radial-gradient(circle at 50% 20%, #172235 0%, #070a12 70%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .welcome-hero {
+      text-align: center;
+      max-width: 800px;
+      margin-bottom: 40px;
+    }
+    .welcome-hero h1 {
+      font-size: 38px;
+      font-weight: 800;
+      letter-spacing: -1px;
+      margin: 16px 0 8px 0;
+      color: #f8fafc;
+    }
+    .welcome-hero h1 span {
+      color: #38bdf8;
+    }
+    .welcome-hero p {
+      font-size: 16px;
+      color: #94a3b8;
+      line-height: 1.6;
+    }
+    .welcome-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 20px;
+      width: 100%;
+      max-width: 960px;
+      margin-bottom: 32px;
+    }
+    .welcome-card {
+      background: rgba(30, 41, 59, 0.7);
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 24px;
+      backdrop-filter: blur(8px);
+      transition: transform 0.15s ease-out, border-color 0.15s ease-out;
+      cursor: pointer;
+    }
+    .welcome-card:hover {
+      transform: translateY(-2px);
+      border-color: #38bdf8;
+    }
+    .welcome-card h3 {
+      font-size: 16px;
+      margin-bottom: 8px;
+      color: #f8fafc;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .welcome-card p {
+      font-size: 13px;
+      color: #94a3b8;
+      line-height: 1.5;
+    }
+
+    /* Modal Dialogs (About & Health) */
+    .dialog-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.75);
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+      backdrop-filter: blur(4px);
+    }
+    .dialog-modal.active {
+      display: flex;
+    }
+    .dialog-box {
+      background: #0f172a;
+      border: 1px solid #38bdf8;
+      border-radius: 14px;
+      width: 520px;
+      max-width: 90vw;
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.8);
+      overflow: hidden;
+      animation: modalFadeIn 0.15s ease-out;
+    }
+    @keyframes modalFadeIn {
+      from { opacity: 0; transform: scale(0.96); }
+      to { opacity: 1; transform: scale(1); }
+    }
+    .dialog-header {
+      padding: 20px 24px;
+      background: #1e293b;
+      border-bottom: 1px solid #334155;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .dialog-header h2 {
+      font-size: 18px;
+      color: #f8fafc;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .dialog-body {
+      padding: 24px;
+      font-size: 13px;
+      color: #cbd5e1;
+      line-height: 1.6;
+    }
+    .dialog-footer {
+      padding: 16px 24px;
+      background: #1e293b;
+      border-top: 1px solid #334155;
+      display: flex;
+      justify-content: flex-end;
+    }
+    .dialog-btn {
+      background: #38bdf8;
+      color: #0f172a;
+      border: none;
+      padding: 8px 18px;
+      border-radius: 6px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background 0.12s;
+    }
+    .dialog-btn:hover {
+      background: #0284c7;
+    }
+
+    /* Accessibility: Reduced Motion & Low Resource Mode suppression */
+    @media (prefers-reduced-motion: reduce) {
+      * {
+        animation: none !important;
+        transition: none !important;
+      }
+    }
+    body.low-resource-mode * {
+      animation: none !important;
+      transition: none !important;
+    }
+
   </style>
 </head>
 <body>
+  <!-- Native Desktop Menu Bar -->
+  <div class="menubar">
+    <div class="menu-item" id="menu-file">
+      <button class="menu-btn" onclick="toggleMenu('menu-file')">File</button>
+      <div class="dropdown-menu">
+        <div class="dropdown-entry" onclick="switchTab('welcome')"><span>Welcome Dashboard</span></div>
+        <div class="dropdown-separator"></div>
+        <div class="dropdown-entry" onclick="newProject()"><span>New Project...</span><span class="shortcut">Ctrl+N</span></div>
+        <div class="dropdown-entry" onclick="openFolder()"><span>Open Folder...</span><span class="shortcut">Ctrl+O</span></div>
+        <div class="dropdown-separator"></div>
+        <div class="dropdown-entry" onclick="saveActiveFile()"><span>Save</span><span class="shortcut">Ctrl+S</span></div>
+        <div class="dropdown-entry" onclick="saveActiveFile()"><span>Save All</span><span class="shortcut">Ctrl+Shift+S</span></div>
+        <div class="dropdown-separator"></div>
+        <div class="dropdown-entry" onclick="window.close()"><span>Exit AetherIDE</span><span class="shortcut">Alt+F4</span></div>
+      </div>
+    </div>
+    <div class="menu-item" id="menu-edit">
+      <button class="menu-btn" onclick="toggleMenu('menu-edit')">Edit</button>
+      <div class="dropdown-menu">
+        <div class="dropdown-entry" onclick="triggerEditorAction('undo')"><span>Undo</span><span class="shortcut">Ctrl+Z</span></div>
+        <div class="dropdown-entry" onclick="triggerEditorAction('redo')"><span>Redo</span><span class="shortcut">Ctrl+Y</span></div>
+        <div class="dropdown-separator"></div>
+        <div class="dropdown-entry" onclick="triggerEditorAction('find')"><span>Find in File</span><span class="shortcut">Ctrl+F</span></div>
+        <div class="dropdown-entry" onclick="triggerEditorAction('replace')"><span>Replace</span><span class="shortcut">Ctrl+H</span></div>
+      </div>
+    </div>
+    <div class="menu-item" id="menu-view">
+      <button class="menu-btn" onclick="toggleMenu('menu-view')">View</button>
+      <div class="dropdown-menu">
+        <div class="dropdown-entry" onclick="switchTab('welcome')"><span>Welcome Overview</span></div>
+        <div class="dropdown-entry" onclick="switchTab('editor')"><span>Code Studio</span><span class="shortcut">Alt+1</span></div>
+        <div class="dropdown-entry" onclick="switchTab('terminal')"><span>Terminal Studio</span><span class="shortcut">Alt+2</span></div>
+        <div class="dropdown-entry" onclick="switchTab('brain')"><span>Project Brain</span><span class="shortcut">Alt+3</span></div>
+        <div class="dropdown-entry" onclick="switchTab('agents')"><span>AI Engineering Team</span><span class="shortcut">Alt+4</span></div>
+        <div class="dropdown-entry" onclick="switchTab('mobile')"><span>Mobile Studio</span><span class="shortcut">Alt+5</span></div>
+        <div class="dropdown-entry" onclick="switchTab('diagnostics')"><span>Diagnostics Doctor</span><span class="shortcut">Alt+6</span></div>
+        <div class="dropdown-separator"></div>
+        <div class="dropdown-entry" onclick="toggleResourceMode()"><span>Toggle Low Resource Mode</span></div>
+      </div>
+    </div>
+    <div class="menu-item" id="menu-go">
+      <button class="menu-btn" onclick="toggleMenu('menu-go')">Go</button>
+      <div class="dropdown-menu">
+        <div class="dropdown-entry" onclick="openQuickOpen()"><span>Quick Open File...</span><span class="shortcut">Ctrl+P</span></div>
+        <div class="dropdown-entry" onclick="openCommandPalette()"><span>Command Palette...</span><span class="shortcut">Ctrl+Shift+P</span></div>
+      </div>
+    </div>
+    <div class="menu-item" id="menu-run">
+      <button class="menu-btn" onclick="toggleMenu('menu-run')">Run</button>
+      <div class="dropdown-menu">
+        <div class="dropdown-entry" onclick="switchTab('terminal'); splitTerminal('horizontal');"><span>Run Build Task</span><span class="shortcut">F5</span></div>
+        <div class="dropdown-entry" onclick="switchTab('terminal');"><span>Run Tests</span><span class="shortcut">Ctrl+F5</span></div>
+        <div class="dropdown-entry" onclick="switchTab('terminal');"><span>Stop Process</span><span class="shortcut">Shift+F5</span></div>
+      </div>
+    </div>
+    <div class="menu-item" id="menu-ai">
+      <button class="menu-btn" onclick="toggleMenu('menu-ai')">AI</button>
+      <div class="dropdown-menu">
+        <div class="dropdown-entry" onclick="switchTab('agents')"><span>Autonomous Agent Hub</span></div>
+        <div class="dropdown-entry" onclick="switchTab('diagnostics')"><span>AI Provider Diagnostics</span></div>
+        <div class="dropdown-separator"></div>
+        <div class="dropdown-entry" onclick="switchTab('brain'); analyzeChangeImpact();"><span>Impact Radar Analysis</span></div>
+      </div>
+    </div>
+    <div class="menu-item" id="menu-tools">
+      <button class="menu-btn" onclick="toggleMenu('menu-tools')">Tools</button>
+      <div class="dropdown-menu">
+        <div class="dropdown-entry" onclick="openHealthModal()"><span>System Health & Memory</span></div>
+        <div class="dropdown-entry" onclick="switchTab('storage')"><span>Checkpoints & Storage</span></div>
+        <div class="dropdown-entry" onclick="switchTab('diagnostics')"><span>Doctor Diagnostics</span></div>
+      </div>
+    </div>
+    <div class="menu-item" id="menu-help">
+      <button class="menu-btn" onclick="toggleMenu('menu-help')">Help</button>
+      <div class="dropdown-menu">
+        <div class="dropdown-entry" onclick="switchTab('welcome')"><span>Welcome Guide</span></div>
+        <div class="dropdown-entry" onclick="openShortcutsModal()"><span>Keyboard Shortcuts</span></div>
+        <div class="dropdown-entry" onclick="window.open('https://github.com/Imagen2dragon/Aether-IDE', '_blank')"><span>Documentation & Repository</span></div>
+        <div class="dropdown-separator"></div>
+        <div class="dropdown-entry" onclick="openAboutModal()"><span>About AetherIDE...</span></div>
+      </div>
+    </div>
+  </div>
+
   <!-- Global Application Header -->
   <header>
-    <div class="brand">
-      <span>AETHER // IDE</span>
-      <span class="badge">v0.1.0-beta.2 Sprint 10</span>
+    <div class="brand" onclick="switchTab('welcome')" style="cursor: pointer;">
+      <!-- Official AetherIDE Vector Glyph -->
+      <svg width="24" height="24" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect x="24" y="24" width="464" height="464" rx="104" fill="#0F172A" stroke="#38BDF8" stroke-width="24" />
+        <polygon points="256,96 120,400 184,400 256,236 256,96" fill="#38BDF8" />
+        <polygon points="256,96 392,400 328,400 256,236 256,96" fill="#6366F1" />
+        <polygon points="196,312 316,312 300,344 212,344" fill="#38BDF8" />
+        <polygon points="256,192 284,256 256,320 228,256" fill="#FFFFFF" />
+        <circle cx="256" cy="96" r="20" fill="#38BDF8" />
+      </svg>
+      <span>Aether<span style="color:#38bdf8;">IDE</span></span>
+      <span class="badge" style="background:#1e293b; color:#38bdf8; border:1px solid #38bdf8;">BETA.2</span>
     </div>
     <nav>
+      <button id="nav-welcome" onclick="switchTab('welcome')">
+        <span>✨</span> Welcome
+      </button>
       <button id="nav-editor" class="active" onclick="switchTab('editor')">
         <span>💻</span> Code Studio
       </button>
@@ -715,13 +1053,61 @@
         <span>🩺</span> Diagnostics Doctor
       </button>
     </nav>
-    <div class="status-badge">
-      <div class="status-dot"></div>
-      <span id="daemon-status">Daemon Online (44888)</span>
+    <div style="display: flex; align-items: center; gap: 12px;">
+      <button id="btn-resource-mode" class="mode-badge" onclick="toggleResourceMode()" title="Toggle Low Resource Mode for low-end hardware">
+        <span>⚡</span> Standard Mode
+      </button>
+      <div class="status-badge" onclick="openHealthModal()" style="cursor:pointer;" title="View System Health">
+        <div class="status-dot"></div>
+        <span id="daemon-status">Daemon Online</span>
+      </div>
     </div>
   </header>
 
   <div class="container">
+    <!-- Tab 0: Welcome Dashboard -->
+    <div id="tab-welcome" class="welcome-container" style="display: none;">
+      <div class="welcome-hero">
+        <svg width="84" height="84" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="24" y="24" width="464" height="464" rx="104" fill="#0F172A" stroke="#38BDF8" stroke-width="20" />
+          <polygon points="256,96 120,400 184,400 256,236 256,96" fill="#38BDF8" />
+          <polygon points="256,96 392,400 328,400 256,236 256,96" fill="#6366F1" />
+          <polygon points="196,312 316,312 300,344 212,344" fill="#38BDF8" />
+          <polygon points="256,192 284,256 256,320 228,256" fill="#FFFFFF" />
+          <circle cx="256" cy="96" r="22" fill="#38BDF8" />
+        </svg>
+        <h1>Aether<span>IDE</span></h1>
+        <p>Your AI-Native Software Engineering Studio. High-speed systems performance in Rust, Monaco code intelligence, capability-sandboxed filesystem, and autonomous agent collaboration.</p>
+      </div>
+
+      <div class="welcome-grid">
+        <div class="welcome-card" onclick="openFolder()">
+          <h3>📂 Open Workspace</h3>
+          <p>Open an existing project folder from your local disk with strict capability sandbox containment.</p>
+        </div>
+        <div class="welcome-card" onclick="newProject()">
+          <h3>✨ New Project</h3>
+          <p>Initialize a new Rust, TypeScript, or Python project with structured architecture scaffolding.</p>
+        </div>
+        <div class="welcome-card" onclick="switchTab('editor')">
+          <h3>💻 Resume Editing</h3>
+          <p>Jump directly into the Monaco Code Studio with multi-cursor, AST syntax trees, and LSP diagnostics.</p>
+        </div>
+        <div class="welcome-card" onclick="switchTab('agents')">
+          <h3>🤖 AI Autonomous Agents</h3>
+          <p>Engage specialized personas: Systems Architect, Security Sentinel, QA Specialist, and Performance Engineer.</p>
+        </div>
+        <div class="welcome-card" onclick="toggleResourceMode()">
+          <h3>🌱 Resource Profile</h3>
+          <p>Switch between Standard Mode and Low-Resource Mode (tailored for 2 vCPU / 4 GB RAM machines).</p>
+        </div>
+        <div class="welcome-card" onclick="openHealthModal()">
+          <h3>🩺 System Diagnostics</h3>
+          <p>Audit background daemon connectivity, memory consumption, credential vaults, and toolchains.</p>
+        </div>
+      </div>
+    </div>
+
     <!-- Left Workspace Sidebar -->
     <aside>
       <div class="sidebar-header">
@@ -2243,9 +2629,335 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
             p { font-size:12px; color:#94a3b8; margin:0; }
             .card { margin:14px; background:#1e293b; border-radius:12px; padding:16px; border:1px solid #334155; }
             .btn { background:#38bdf8; color:#000; font-weight:700; border:none; padding:10px; width:100%; border-radius:8px; }
-          </style>
+          
+    /* Desktop Application Menu Bar */
+    .menubar {
+      display: flex;
+      background: #080d1a;
+      border-bottom: 1px solid var(--border-color);
+      padding: 0 8px;
+      font-size: 12px;
+      user-select: none;
+      position: relative;
+      z-index: 200;
+    }
+    .menu-item {
+      position: relative;
+    }
+    .menu-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      padding: 4px 10px;
+      cursor: pointer;
+      font-size: 12px;
+      border-radius: 4px;
+      transition: background 0.12s, color 0.12s;
+    }
+    .menu-btn:hover, .menu-item.open .menu-btn {
+      background: var(--border-color);
+      color: var(--text-primary);
+    }
+    .dropdown-menu {
+      display: none;
+      position: absolute;
+      top: 100%;
+      left: 0;
+      background: #0f172a;
+      border: 1px solid var(--border-light);
+      border-radius: 6px;
+      min-width: 220px;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.6);
+      padding: 4px 0;
+      z-index: 300;
+    }
+    .menu-item.open .dropdown-menu {
+      display: block;
+    }
+    .dropdown-entry {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 14px;
+      color: var(--text-primary);
+      cursor: pointer;
+      font-size: 12px;
+      transition: background 0.1s;
+    }
+    .dropdown-entry:hover {
+      background: #1e293b;
+      color: var(--accent);
+    }
+    .dropdown-entry .shortcut {
+      color: var(--text-dim);
+      font-size: 11px;
+      margin-left: 16px;
+    }
+    .dropdown-separator {
+      height: 1px;
+      background: var(--border-color);
+      margin: 4px 0;
+    }
+
+    /* Resource Mode Toggle Button in Header */
+    .mode-badge {
+      background: #1e293b;
+      border: 1px solid #334155;
+      color: #38bdf8;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 12px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s ease-out;
+    }
+    .mode-badge:hover {
+      background: #334155;
+      border-color: #38bdf8;
+    }
+    .mode-badge.low-res {
+      background: rgba(34, 197, 94, 0.15);
+      border-color: #22c55e;
+      color: #4ade80;
+    }
+
+    /* Welcome Dashboard Tab */
+    .welcome-container {
+      flex: 1;
+      overflow-y: auto;
+      padding: 48px;
+      background: radial-gradient(circle at 50% 20%, #172235 0%, #070a12 70%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .welcome-hero {
+      text-align: center;
+      max-width: 800px;
+      margin-bottom: 40px;
+    }
+    .welcome-hero h1 {
+      font-size: 38px;
+      font-weight: 800;
+      letter-spacing: -1px;
+      margin: 16px 0 8px 0;
+      color: #f8fafc;
+    }
+    .welcome-hero h1 span {
+      color: #38bdf8;
+    }
+    .welcome-hero p {
+      font-size: 16px;
+      color: #94a3b8;
+      line-height: 1.6;
+    }
+    .welcome-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 20px;
+      width: 100%;
+      max-width: 960px;
+      margin-bottom: 32px;
+    }
+    .welcome-card {
+      background: rgba(30, 41, 59, 0.7);
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 24px;
+      backdrop-filter: blur(8px);
+      transition: transform 0.15s ease-out, border-color 0.15s ease-out;
+      cursor: pointer;
+    }
+    .welcome-card:hover {
+      transform: translateY(-2px);
+      border-color: #38bdf8;
+    }
+    .welcome-card h3 {
+      font-size: 16px;
+      margin-bottom: 8px;
+      color: #f8fafc;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .welcome-card p {
+      font-size: 13px;
+      color: #94a3b8;
+      line-height: 1.5;
+    }
+
+    /* Modal Dialogs (About & Health) */
+    .dialog-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.75);
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+      backdrop-filter: blur(4px);
+    }
+    .dialog-modal.active {
+      display: flex;
+    }
+    .dialog-box {
+      background: #0f172a;
+      border: 1px solid #38bdf8;
+      border-radius: 14px;
+      width: 520px;
+      max-width: 90vw;
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.8);
+      overflow: hidden;
+      animation: modalFadeIn 0.15s ease-out;
+    }
+    @keyframes modalFadeIn {
+      from { opacity: 0; transform: scale(0.96); }
+      to { opacity: 1; transform: scale(1); }
+    }
+    .dialog-header {
+      padding: 20px 24px;
+      background: #1e293b;
+      border-bottom: 1px solid #334155;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .dialog-header h2 {
+      font-size: 18px;
+      color: #f8fafc;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .dialog-body {
+      padding: 24px;
+      font-size: 13px;
+      color: #cbd5e1;
+      line-height: 1.6;
+    }
+    .dialog-footer {
+      padding: 16px 24px;
+      background: #1e293b;
+      border-top: 1px solid #334155;
+      display: flex;
+      justify-content: flex-end;
+    }
+    .dialog-btn {
+      background: #38bdf8;
+      color: #0f172a;
+      border: none;
+      padding: 8px 18px;
+      border-radius: 6px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background 0.12s;
+    }
+    .dialog-btn:hover {
+      background: #0284c7;
+    }
+
+    /* Accessibility: Reduced Motion & Low Resource Mode suppression */
+    @media (prefers-reduced-motion: reduce) {
+      * {
+        animation: none !important;
+        transition: none !important;
+      }
+    }
+    body.low-resource-mode * {
+      animation: none !important;
+      transition: none !important;
+    }
+
+  </style>
         </head>
         <body>
+  <!-- Native Desktop Menu Bar -->
+  <div class="menubar">
+    <div class="menu-item" id="menu-file">
+      <button class="menu-btn" onclick="toggleMenu('menu-file')">File</button>
+      <div class="dropdown-menu">
+        <div class="dropdown-entry" onclick="switchTab('welcome')"><span>Welcome Dashboard</span></div>
+        <div class="dropdown-separator"></div>
+        <div class="dropdown-entry" onclick="newProject()"><span>New Project...</span><span class="shortcut">Ctrl+N</span></div>
+        <div class="dropdown-entry" onclick="openFolder()"><span>Open Folder...</span><span class="shortcut">Ctrl+O</span></div>
+        <div class="dropdown-separator"></div>
+        <div class="dropdown-entry" onclick="saveActiveFile()"><span>Save</span><span class="shortcut">Ctrl+S</span></div>
+        <div class="dropdown-entry" onclick="saveActiveFile()"><span>Save All</span><span class="shortcut">Ctrl+Shift+S</span></div>
+        <div class="dropdown-separator"></div>
+        <div class="dropdown-entry" onclick="window.close()"><span>Exit AetherIDE</span><span class="shortcut">Alt+F4</span></div>
+      </div>
+    </div>
+    <div class="menu-item" id="menu-edit">
+      <button class="menu-btn" onclick="toggleMenu('menu-edit')">Edit</button>
+      <div class="dropdown-menu">
+        <div class="dropdown-entry" onclick="triggerEditorAction('undo')"><span>Undo</span><span class="shortcut">Ctrl+Z</span></div>
+        <div class="dropdown-entry" onclick="triggerEditorAction('redo')"><span>Redo</span><span class="shortcut">Ctrl+Y</span></div>
+        <div class="dropdown-separator"></div>
+        <div class="dropdown-entry" onclick="triggerEditorAction('find')"><span>Find in File</span><span class="shortcut">Ctrl+F</span></div>
+        <div class="dropdown-entry" onclick="triggerEditorAction('replace')"><span>Replace</span><span class="shortcut">Ctrl+H</span></div>
+      </div>
+    </div>
+    <div class="menu-item" id="menu-view">
+      <button class="menu-btn" onclick="toggleMenu('menu-view')">View</button>
+      <div class="dropdown-menu">
+        <div class="dropdown-entry" onclick="switchTab('welcome')"><span>Welcome Overview</span></div>
+        <div class="dropdown-entry" onclick="switchTab('editor')"><span>Code Studio</span><span class="shortcut">Alt+1</span></div>
+        <div class="dropdown-entry" onclick="switchTab('terminal')"><span>Terminal Studio</span><span class="shortcut">Alt+2</span></div>
+        <div class="dropdown-entry" onclick="switchTab('brain')"><span>Project Brain</span><span class="shortcut">Alt+3</span></div>
+        <div class="dropdown-entry" onclick="switchTab('agents')"><span>AI Engineering Team</span><span class="shortcut">Alt+4</span></div>
+        <div class="dropdown-entry" onclick="switchTab('mobile')"><span>Mobile Studio</span><span class="shortcut">Alt+5</span></div>
+        <div class="dropdown-entry" onclick="switchTab('diagnostics')"><span>Diagnostics Doctor</span><span class="shortcut">Alt+6</span></div>
+        <div class="dropdown-separator"></div>
+        <div class="dropdown-entry" onclick="toggleResourceMode()"><span>Toggle Low Resource Mode</span></div>
+      </div>
+    </div>
+    <div class="menu-item" id="menu-go">
+      <button class="menu-btn" onclick="toggleMenu('menu-go')">Go</button>
+      <div class="dropdown-menu">
+        <div class="dropdown-entry" onclick="openQuickOpen()"><span>Quick Open File...</span><span class="shortcut">Ctrl+P</span></div>
+        <div class="dropdown-entry" onclick="openCommandPalette()"><span>Command Palette...</span><span class="shortcut">Ctrl+Shift+P</span></div>
+      </div>
+    </div>
+    <div class="menu-item" id="menu-run">
+      <button class="menu-btn" onclick="toggleMenu('menu-run')">Run</button>
+      <div class="dropdown-menu">
+        <div class="dropdown-entry" onclick="switchTab('terminal'); splitTerminal('horizontal');"><span>Run Build Task</span><span class="shortcut">F5</span></div>
+        <div class="dropdown-entry" onclick="switchTab('terminal');"><span>Run Tests</span><span class="shortcut">Ctrl+F5</span></div>
+        <div class="dropdown-entry" onclick="switchTab('terminal');"><span>Stop Process</span><span class="shortcut">Shift+F5</span></div>
+      </div>
+    </div>
+    <div class="menu-item" id="menu-ai">
+      <button class="menu-btn" onclick="toggleMenu('menu-ai')">AI</button>
+      <div class="dropdown-menu">
+        <div class="dropdown-entry" onclick="switchTab('agents')"><span>Autonomous Agent Hub</span></div>
+        <div class="dropdown-entry" onclick="switchTab('diagnostics')"><span>AI Provider Diagnostics</span></div>
+        <div class="dropdown-separator"></div>
+        <div class="dropdown-entry" onclick="switchTab('brain'); analyzeChangeImpact();"><span>Impact Radar Analysis</span></div>
+      </div>
+    </div>
+    <div class="menu-item" id="menu-tools">
+      <button class="menu-btn" onclick="toggleMenu('menu-tools')">Tools</button>
+      <div class="dropdown-menu">
+        <div class="dropdown-entry" onclick="openHealthModal()"><span>System Health & Memory</span></div>
+        <div class="dropdown-entry" onclick="switchTab('storage')"><span>Checkpoints & Storage</span></div>
+        <div class="dropdown-entry" onclick="switchTab('diagnostics')"><span>Doctor Diagnostics</span></div>
+      </div>
+    </div>
+    <div class="menu-item" id="menu-help">
+      <button class="menu-btn" onclick="toggleMenu('menu-help')">Help</button>
+      <div class="dropdown-menu">
+        <div class="dropdown-entry" onclick="switchTab('welcome')"><span>Welcome Guide</span></div>
+        <div class="dropdown-entry" onclick="openShortcutsModal()"><span>Keyboard Shortcuts</span></div>
+        <div class="dropdown-entry" onclick="window.open('https://github.com/Imagen2dragon/Aether-IDE', '_blank')"><span>Documentation & Repository</span></div>
+        <div class="dropdown-separator"></div>
+        <div class="dropdown-entry" onclick="openAboutModal()"><span>About AetherIDE...</span></div>
+      </div>
+    </div>
+  </div>
+
           <header>
             <h1>AetherMobile</h1>
             <p>React Native Expo 52 • Fast Refresh Active</p>
@@ -2255,7 +2967,60 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
             <p style="margin-bottom:12px;">Isolated sandboxed origin. Real-time updates via Metro bundler.</p>
             <button class="btn" onclick="alert('Expo Mobile Button Clicked!')">Interactive Native Component</button>
           </div>
-        </body>
+          <!-- About AetherIDE Modal -->
+  <div id="about-modal" class="dialog-modal" onclick="closeModalOnBackdrop(event, 'about-modal')">
+    <div class="dialog-box">
+      <div class="dialog-header">
+        <h2>
+          <svg width="22" height="22" viewBox="0 0 512 512" fill="none">
+            <rect x="24" y="24" width="464" height="464" rx="104" fill="#0F172A" stroke="#38BDF8" stroke-width="28" />
+            <polygon points="256,96 120,400 184,400 256,236 256,96" fill="#38BDF8" />
+            <polygon points="256,96 392,400 328,400 256,236 256,96" fill="#6366F1" />
+          </svg>
+          About AetherIDE
+        </h2>
+        <button onclick="closeModal('about-modal')" style="background:transparent; border:none; color:#94a3b8; font-size:18px; cursor:pointer;">&times;</button>
+      </div>
+      <div class="dialog-body">
+        <p><strong>AetherIDE — AI-Native Engineering Environment</strong></p>
+        <p style="color:#94a3b8; margin: 4px 0 12px 0;">Release: <strong>v0.1.0-beta.2 (x64 MSVC)</strong></p>
+        <p>AetherIDE delivers high-performance developer workflows through a 24-crate Rust core architecture, Microsoft WebView2 native host, Monaco editor, ConPTY terminal manager, and capability-based filesystem sandboxing.</p>
+        <div style="margin-top: 14px; padding: 12px; background: #1e293b; border-radius: 8px; font-size: 11px; font-family: monospace;">
+          OS: Windows 10/11 x64<br>
+          Engine: Microsoft WebView2 Evergreen<br>
+          Filesystem: cap-std capability sandbox<br>
+          Telemetry: Absolutely Zero Remote Pings
+        </div>
+      </div>
+      <div class="dialog-footer">
+        <button class="dialog-btn" onclick="closeModal('about-modal')">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- System Health Modal -->
+  <div id="health-modal" class="dialog-modal" onclick="closeModalOnBackdrop(event, 'health-modal')">
+    <div class="dialog-box">
+      <div class="dialog-header">
+        <h2>🩺 System Health & Resource Monitor</h2>
+        <button onclick="closeModal('health-modal')" style="background:transparent; border:none; color:#94a3b8; font-size:18px; cursor:pointer;">&times;</button>
+      </div>
+      <div class="dialog-body">
+        <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
+          <tr style="border-bottom: 1px solid #334155;"><td style="padding: 8px 0; color: #94a3b8;">Daemon IPC:</td><td style="font-weight: 700; color: #22c55e;">Connected (127.0.0.1:44888)</td></tr>
+          <tr style="border-bottom: 1px solid #334155;"><td style="padding: 8px 0; color: #94a3b8;">Resource Profile:</td><td id="health-mode" style="font-weight: 700; color: #38bdf8;">Standard Mode</td></tr>
+          <tr style="border-bottom: 1px solid #334155;"><td style="padding: 8px 0; color: #94a3b8;">Filesystem Sandbox:</td><td style="font-weight: 700; color: #22c55e;">cap-std Enforced</td></tr>
+          <tr style="border-bottom: 1px solid #334155;"><td style="padding: 8px 0; color: #94a3b8;">Credential Vault:</td><td style="font-weight: 700; color: #22c55e;">Windows DPAPI Active</td></tr>
+          <tr style="border-bottom: 1px solid #334155;"><td style="padding: 8px 0; color: #94a3b8;">Telemetry State:</td><td style="font-weight: 700; color: #22c55e;">Zero Telemetry (Disabled)</td></tr>
+        </table>
+      </div>
+      <div class="dialog-footer">
+        <button class="dialog-btn" onclick="closeModal('health-modal')">Close</button>
+      </div>
+    </div>
+  </div>
+
+</body>
         </html>
       `;
     }
@@ -2413,6 +3178,86 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
       }
     }
 
+    
+    // Menubar Controller
+    function toggleMenu(menuId) {
+      const el = document.getElementById(menuId);
+      const isOpen = el.classList.contains('open');
+      closeAllMenus();
+      if (!isOpen) el.classList.add('open');
+    }
+
+    function closeAllMenus() {
+      document.querySelectorAll('.menu-item').forEach(m => m.classList.remove('open'));
+    }
+
+    window.addEventListener('click', e => {
+      if (!e.target.closest('.menu-item')) closeAllMenus();
+    });
+
+    // Resource Mode Toggle (Standard vs Low-Resource)
+    let isLowResource = false;
+    function toggleResourceMode() {
+      isLowResource = !isLowResource;
+      const btn = document.getElementById('btn-resource-mode');
+      const healthLabel = document.getElementById('health-mode');
+      if (isLowResource) {
+        document.body.classList.add('low-resource-mode');
+        btn.classList.add('low-res');
+        btn.innerHTML = '<span>🌱</span> Low-Resource Mode';
+        if (healthLabel) healthLabel.innerText = 'Low-Resource Mode (Reduced Motion & Memory)';
+        notify('Resource Mode: Switched to Low-Resource Mode (optimized for 2 vCPU / 4 GB RAM).', 'info');
+      } else {
+        document.body.classList.remove('low-resource-mode');
+        btn.classList.remove('low-res');
+        btn.innerHTML = '<span>⚡</span> Standard Mode';
+        if (healthLabel) healthLabel.innerText = 'Standard Mode';
+        notify('Resource Mode: Switched to Standard Mode.', 'info');
+      }
+    }
+
+    // Modal Dialog Helpers
+    function openAboutModal() {
+      closeAllMenus();
+      document.getElementById('about-modal').classList.add('active');
+    }
+    function openHealthModal() {
+      closeAllMenus();
+      document.getElementById('health-modal').classList.add('active');
+    }
+    function openShortcutsModal() {
+      closeAllMenus();
+      openCommandPalette();
+    }
+    function closeModal(modalId) {
+      document.getElementById(modalId).classList.remove('active');
+    }
+    function closeModalOnBackdrop(e, modalId) {
+      if (e.target.id === modalId) closeModal(modalId);
+    }
+
+    function newProject() {
+      closeAllMenus();
+      notify('New Project wizard opened. Select project template.', 'info');
+      switchTab('editor');
+    }
+
+    function openFolder() {
+      closeAllMenus();
+      notify('Opening native folder picker...', 'info');
+      switchTab('editor');
+    }
+
+    function triggerEditorAction(action) {
+      closeAllMenus();
+      if (editor) {
+        if (action === 'undo') editor.trigger('keyboard', 'undo', null);
+        if (action === 'redo') editor.trigger('keyboard', 'redo', null);
+        if (action === 'find') editor.trigger('keyboard', 'actions.find', null);
+        if (action === 'replace') editor.trigger('keyboard', 'editor.action.startFindReplaceAction', null);
+      }
+    }
+
     function setupShortcuts() {
       window.addEventListener('keydown', e => {
         if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
@@ -2515,5 +3360,58 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
       }
     }
   </script>
+  <!-- About AetherIDE Modal -->
+  <div id="about-modal" class="dialog-modal" onclick="closeModalOnBackdrop(event, 'about-modal')">
+    <div class="dialog-box">
+      <div class="dialog-header">
+        <h2>
+          <svg width="22" height="22" viewBox="0 0 512 512" fill="none">
+            <rect x="24" y="24" width="464" height="464" rx="104" fill="#0F172A" stroke="#38BDF8" stroke-width="28" />
+            <polygon points="256,96 120,400 184,400 256,236 256,96" fill="#38BDF8" />
+            <polygon points="256,96 392,400 328,400 256,236 256,96" fill="#6366F1" />
+          </svg>
+          About AetherIDE
+        </h2>
+        <button onclick="closeModal('about-modal')" style="background:transparent; border:none; color:#94a3b8; font-size:18px; cursor:pointer;">&times;</button>
+      </div>
+      <div class="dialog-body">
+        <p><strong>AetherIDE — AI-Native Engineering Environment</strong></p>
+        <p style="color:#94a3b8; margin: 4px 0 12px 0;">Release: <strong>v0.1.0-beta.2 (x64 MSVC)</strong></p>
+        <p>AetherIDE delivers high-performance developer workflows through a 24-crate Rust core architecture, Microsoft WebView2 native host, Monaco editor, ConPTY terminal manager, and capability-based filesystem sandboxing.</p>
+        <div style="margin-top: 14px; padding: 12px; background: #1e293b; border-radius: 8px; font-size: 11px; font-family: monospace;">
+          OS: Windows 10/11 x64<br>
+          Engine: Microsoft WebView2 Evergreen<br>
+          Filesystem: cap-std capability sandbox<br>
+          Telemetry: Absolutely Zero Remote Pings
+        </div>
+      </div>
+      <div class="dialog-footer">
+        <button class="dialog-btn" onclick="closeModal('about-modal')">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- System Health Modal -->
+  <div id="health-modal" class="dialog-modal" onclick="closeModalOnBackdrop(event, 'health-modal')">
+    <div class="dialog-box">
+      <div class="dialog-header">
+        <h2>🩺 System Health & Resource Monitor</h2>
+        <button onclick="closeModal('health-modal')" style="background:transparent; border:none; color:#94a3b8; font-size:18px; cursor:pointer;">&times;</button>
+      </div>
+      <div class="dialog-body">
+        <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
+          <tr style="border-bottom: 1px solid #334155;"><td style="padding: 8px 0; color: #94a3b8;">Daemon IPC:</td><td style="font-weight: 700; color: #22c55e;">Connected (127.0.0.1:44888)</td></tr>
+          <tr style="border-bottom: 1px solid #334155;"><td style="padding: 8px 0; color: #94a3b8;">Resource Profile:</td><td id="health-mode" style="font-weight: 700; color: #38bdf8;">Standard Mode</td></tr>
+          <tr style="border-bottom: 1px solid #334155;"><td style="padding: 8px 0; color: #94a3b8;">Filesystem Sandbox:</td><td style="font-weight: 700; color: #22c55e;">cap-std Enforced</td></tr>
+          <tr style="border-bottom: 1px solid #334155;"><td style="padding: 8px 0; color: #94a3b8;">Credential Vault:</td><td style="font-weight: 700; color: #22c55e;">Windows DPAPI Active</td></tr>
+          <tr style="border-bottom: 1px solid #334155;"><td style="padding: 8px 0; color: #94a3b8;">Telemetry State:</td><td style="font-weight: 700; color: #22c55e;">Zero Telemetry (Disabled)</td></tr>
+        </table>
+      </div>
+      <div class="dialog-footer">
+        <button class="dialog-btn" onclick="closeModal('health-modal')">Close</button>
+      </div>
+    </div>
+  </div>
+
 </body>
 </html>
