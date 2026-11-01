@@ -14,8 +14,12 @@ pub mod native {
         CreateCoreWebView2EnvironmentCompletedHandler, WebMessageReceivedEventHandler,
     };
     use windows::core::{w, Interface, Result, HSTRING, PCWSTR, PWSTR};
-    use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-    use windows::Win32::Graphics::Gdi::{UpdateWindow, HBRUSH};
+    use windows::Win32::Foundation::{COLORREF, HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+    use windows::Win32::Graphics::Gdi::{
+        BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, SetBkMode,
+        SetTextColor, UpdateWindow, DT_CENTER, DT_SINGLELINE, DT_VCENTER, HBRUSH, PAINTSTRUCT,
+        TRANSPARENT,
+    };
     use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::WinRT::EventRegistrationToken;
@@ -271,6 +275,38 @@ pub mod native {
         lparam: LPARAM,
     ) -> LRESULT {
         match msg {
+            WM_PAINT => {
+                let is_ready = CONTROLLER.with(|c| c.borrow().is_some());
+                if !is_ready {
+                    let mut ps = PAINTSTRUCT::default();
+                    let hdc = BeginPaint(hwnd, &mut ps);
+                    if !hdc.is_invalid() {
+                        let mut rect = RECT::default();
+                        let _ = GetClientRect(hwnd, &mut rect);
+                        // Dark theme splash background #0F172A (0x002A170F in BGR format)
+                        let brush = CreateSolidBrush(COLORREF(0x002A170F));
+                        let _ = FillRect(hdc, &rect, brush);
+                        let _ = DeleteObject(brush);
+
+                        let _ = SetBkMode(hdc, TRANSPARENT);
+                        let _ = SetTextColor(hdc, COLORREF(0x00F8BA38)); // Cyan #38BDF8 (0x00F8BA38 in BGR)
+
+                        let mut text: Vec<u16> = "AetherIDE — Initializing Native Studio..."
+                            .encode_utf16()
+                            .collect();
+                        let _ = DrawTextW(
+                            hdc,
+                            &mut text,
+                            &mut rect,
+                            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                        );
+                    }
+                    let _ = EndPaint(hwnd, &ps);
+                    LRESULT(0)
+                } else {
+                    DefWindowProcW(hwnd, msg, wparam, lparam)
+                }
+            }
             WM_SIZE => {
                 let mut rect = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rect);
