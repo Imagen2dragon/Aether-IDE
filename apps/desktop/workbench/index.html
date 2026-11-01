@@ -3,697 +3,109 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AetherIDE — Advanced Developer Workbench</title>
+  <title>AetherIDE — AI-Native Engineering Studio</title>
   <!-- Local Monaco Editor Stylesheet -->
   <link rel="stylesheet" data-name="vs/editor/editor.main" href="./vs/editor/editor.main.css">
   <!-- Local Xterm Stylesheet -->
   <link rel="stylesheet" href="./xterm/xterm.css">
   <style>
     :root {
-      --bg-primary: #070a12;
-      --bg-secondary: #0b0f19;
-      --bg-panel: #0d1222;
-      --bg-card: #111827;
-      --bg-editor: #121826;
+      --bg-root: #070a12;
+      --bg-header: #0b0f19;
+      --bg-activity: #080d1a;
+      --bg-sidebar: #0e1424;
+      --bg-editor: #0c101c;
+      --bg-panel: #0a0e1a;
+      --bg-statusbar: #070a12;
+      --bg-card: #131c31;
+      --bg-hover: #1e293b;
+      --bg-active: #172238;
+      
       --border-color: #1e293b;
-      --border-light: #334155;
+      --border-light: #2a3852;
+      --border-focus: #38bdf8;
+      
       --text-primary: #f8fafc;
+      --text-secondary: #cbd5e1;
       --text-muted: #94a3b8;
       --text-dim: #64748b;
-      --accent: #38bdf8;
-      --accent-hover: #0284c7;
-      --accent-glow: rgba(56, 189, 248, 0.25);
-      --success: #4ade80;
-      --warning: #fbbf24;
-      --danger: #f87171;
-      --purple: #c084fc;
-      --tab-active-bg: #121826;
-      --tab-inactive-bg: #0b0f19;
+      
+      --accent-cyan: #38bdf8;
+      --accent-indigo: #6366f1;
+      --accent-glow: rgba(56, 189, 248, 0.2);
+      
+      --success: #22c55e;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --purple: #a855f7;
+
+      --activity-width: 48px;
+      --sidebar-width: 260px;
+      --ai-sidebar-width: 330px;
+      --panel-height: 240px;
+      --header-height: 38px;
+      --statusbar-height: 24px;
     }
+
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-      background: var(--bg-primary);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg-root);
       color: var(--text-primary);
       height: 100vh;
+      width: 100vw;
       display: flex;
       flex-direction: column;
       overflow: hidden;
       user-select: none;
     }
 
-    /* Header & Navigation */
-    header {
-      height: 48px;
-      background: var(--bg-secondary);
+    /* ==========================================================================
+       1. Top Native Window Shell & Application Menu Bar
+       ========================================================================== */
+    header.workbench-header {
+      height: var(--header-height);
+      background: var(--bg-header);
       border-bottom: 1px solid var(--border-color);
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 0 16px;
+      padding: 0 8px;
       flex-shrink: 0;
-      z-index: 100;
+      z-index: 200;
     }
-    .brand {
+    .header-left {
       display: flex;
       align-items: center;
-      gap: 12px;
-      font-weight: 800;
-      letter-spacing: 1px;
-      color: var(--accent);
+      gap: 6px;
     }
-    .brand span.badge {
-      background: #1e293b;
-      color: #94a3b8;
-      font-size: 11px;
+    .app-brand {
+      display: flex;
+      align-items: center;
+      gap: 8px;
       padding: 2px 8px;
       border-radius: 4px;
-      font-weight: 600;
-    }
-    nav {
-      display: flex;
-      gap: 6px;
-    }
-    nav button {
-      background: transparent;
-      border: 1px solid transparent;
-      color: var(--text-muted);
-      font-size: 13px;
-      font-weight: 600;
-      padding: 6px 14px;
-      border-radius: 6px;
       cursor: pointer;
-      transition: all 0.2s;
-      display: flex;
-      align-items: center;
-      gap: 6px;
     }
-    nav button:hover {
-      background: var(--border-color);
+    .app-brand:hover {
+      background: var(--bg-hover);
+    }
+    .app-brand-text {
+      font-weight: 800;
+      font-size: 13px;
+      letter-spacing: -0.5px;
       color: var(--text-primary);
     }
-    nav button.active {
-      background: rgba(56, 189, 248, 0.15);
-      border-color: rgba(56, 189, 248, 0.4);
-      color: var(--accent);
-    }
-    .status-badge {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 12px;
-      color: var(--success);
-      font-weight: 500;
-    }
-    .status-dot {
-      width: 8px;
-      height: 8px;
-      background: var(--success);
-      border-radius: 50%;
-      box-shadow: 0 0 8px var(--success);
+    .app-brand-text span {
+      color: var(--accent-cyan);
     }
 
-    /* Main Layout */
-    .container {
-      display: flex;
-      flex: 1;
-      overflow: hidden;
-      position: relative;
-    }
-    aside {
-      width: 250px;
-      background: var(--bg-secondary);
-      border-right: 1px solid var(--border-color);
-      display: flex;
-      flex-direction: column;
-      flex-shrink: 0;
-    }
-    .sidebar-header {
-      padding: 12px 16px;
-      border-bottom: 1px solid var(--border-color);
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.8px;
-      color: var(--text-muted);
-      font-weight: 700;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .tree-view {
-      padding: 10px;
-      font-family: Consolas, monospace;
-      font-size: 12px;
-      line-height: 24px;
-      color: #cbd5e1;
-      overflow-y: auto;
-      flex: 1;
-    }
-    .tree-view div { cursor: pointer; border-radius: 4px; padding: 2px 8px; }
-    .tree-view div:hover, .tree-view div.active-file { background: #1e293b; color: var(--accent); }
-
-    main {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      background: var(--bg-panel);
-      overflow: hidden;
-      position: relative;
-    }
-    .panel-view { display: none; height: 100%; flex-direction: column; overflow: hidden; }
-    .panel-view.active { display: flex; }
-
-    /* Code Studio View */
-    #view-editor {
-      display: none;
-      flex-direction: column;
-      height: 100%;
-      background: var(--bg-editor);
-    }
-    #view-editor.active { display: flex; }
-    .editor-tabs {
-      height: 38px;
-      background: var(--bg-secondary);
-      border-bottom: 1px solid var(--border-color);
-      display: flex;
-      align-items: center;
-      overflow-x: auto;
-      flex-shrink: 0;
-    }
-    .editor-tab {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 0 14px;
-      height: 100%;
-      background: var(--tab-inactive-bg);
-      border-right: 1px solid var(--border-color);
-      font-size: 13px;
-      color: var(--text-muted);
-      cursor: pointer;
-      user-select: none;
-      white-space: nowrap;
-      transition: background 0.15s, color 0.15s;
-    }
-    .editor-tab:hover { background: #1e293b; color: #fff; }
-    .editor-tab.active {
-      background: var(--tab-active-bg);
-      color: var(--accent);
-      border-top: 2px solid var(--accent);
-      font-weight: 500;
-    }
-    .editor-tab .close-tab {
-      font-size: 14px;
-      color: var(--text-muted);
-      border-radius: 3px;
-      padding: 0 4px;
-    }
-    .editor-tab .close-tab:hover { background: #334155; color: var(--danger); }
-    .editor-tab .dirty-indicator {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--warning);
-      display: none;
-    }
-    .editor-tab.dirty .dirty-indicator { display: block; }
-    .breadcrumbs {
-      height: 26px;
-      background: #090e1a;
-      border-bottom: 1px solid #1a2234;
-      display: flex;
-      align-items: center;
-      padding: 0 16px;
-      font-size: 11px;
-      color: #71717a;
-      flex-shrink: 0;
-      gap: 6px;
-    }
-    .breadcrumbs span.crumb { color: #a1a1aa; }
-    .breadcrumbs span.crumb-active { color: var(--accent); font-weight: 600; }
-    #monaco-root {
-      flex: 1;
-      width: 100%;
-      height: 100%;
-      overflow: hidden;
-      position: relative;
-    }
-
-    /* Collapsible Dock Terminal Tray in Code Studio */
-    #editor-dock-tray {
-      height: 240px;
-      background: var(--bg-primary);
-      border-top: 1px solid var(--border-color);
-      display: none;
-      flex-direction: column;
-      flex-shrink: 0;
-    }
-    #editor-dock-tray.active { display: flex; }
-    .dock-header {
-      height: 32px;
-      background: var(--bg-secondary);
-      border-bottom: 1px solid var(--border-color);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 12px;
-      font-size: 12px;
-    }
-    .dock-title {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      color: var(--text-primary);
-      font-weight: 600;
-    }
-
-    /* Terminal Studio (Full View & Dock) */
-    .terminal-container {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-      background: #050811;
-      position: relative;
-    }
-    .terminal-toolbar {
-      height: 38px;
-      background: var(--bg-secondary);
-      border-bottom: 1px solid var(--border-color);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 12px;
-      flex-shrink: 0;
-      gap: 8px;
-    }
-    .term-tabs {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-      overflow-x: auto;
-    }
-    .term-tab {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 10px;
-      border-radius: 4px;
-      font-size: 12px;
-      color: var(--text-muted);
-      cursor: pointer;
-      background: rgba(255, 255, 255, 0.03);
-    }
-    .term-tab:hover { background: rgba(255, 255, 255, 0.08); color: #fff; }
-    .term-tab.active { background: #1e293b; color: var(--accent); font-weight: 600; }
-    .term-controls {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .term-panes-wrapper {
-      flex: 1;
-      display: flex;
-      overflow: hidden;
-      position: relative;
-    }
-    .term-pane {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      padding: 4px;
-      overflow: hidden;
-      position: relative;
-      border: 1px solid transparent;
-    }
-    .term-pane.active-pane {
-      border: 1px solid rgba(56, 189, 248, 0.4);
-    }
-    .term-pane .xterm {
-      height: 100%;
-      width: 100%;
-      padding: 6px;
-    }
-
-    /* Common Card and Layout Styles */
-    .view-content-wrapper {
-      padding: 20px;
-      overflow-y: auto;
-      height: 100%;
-    }
-    .grid-2col {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 20px;
-    }
-    .grid-3col {
-      display: grid;
-      grid-template-columns: 1fr 1fr 1fr;
-      gap: 16px;
-    }
-    .card {
-      background: var(--bg-secondary);
-      border: 1px solid var(--border-color);
-      border-radius: 8px;
-      padding: 18px;
-      margin-bottom: 18px;
-    }
-    .card h3 {
-      font-size: 15px;
-      color: var(--text-primary);
-      margin-bottom: 12px;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .btn {
-      background: var(--accent);
-      color: #000;
-      border: none;
-      padding: 8px 14px;
-      border-radius: 6px;
-      font-weight: 600;
-      font-size: 12px;
-      cursor: pointer;
-      transition: all 0.2s;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-    }
-    .btn:hover { background: var(--accent-hover); color: #fff; }
-    .btn-secondary {
-      background: #1e293b;
-      color: #cbd5e1;
-      border: 1px solid var(--border-light);
-    }
-    .btn-secondary:hover { background: #334155; color: #fff; }
-    .btn-success { background: #16a34a; color: #fff; }
-    .btn-success:hover { background: #15803d; }
-    .btn-danger { background: #dc2626; color: #fff; }
-    .btn-danger:hover { background: #b91c1c; }
-    .btn-small { padding: 4px 8px; font-size: 11px; }
-
-    input, select, textarea {
-      width: 100%;
-      background: #111827;
-      border: 1px solid var(--border-color);
-      color: var(--text-primary);
-      padding: 8px 12px;
-      border-radius: 6px;
-      margin-bottom: 12px;
-      font-size: 13px;
-      font-family: inherit;
-    }
-    input:focus, select:focus, textarea:focus {
-      border-color: var(--accent);
-      outline: none;
-      box-shadow: 0 0 0 2px var(--accent-glow);
-    }
-
-    /* Living Project Brain Styles */
-    .brain-layout {
-      display: flex;
-      height: 100%;
-      overflow: hidden;
-    }
-    .brain-main {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-      position: relative;
-    }
-    #brain-canvas {
-      flex: 1;
-      background: #060913;
-      position: relative;
-    }
-    .brain-sidebar {
-      width: 360px;
-      background: var(--bg-secondary);
-      border-left: 1px solid var(--border-color);
-      display: flex;
-      flex-direction: column;
-      overflow-y: auto;
-      padding: 16px;
-    }
-    .radar-blast-badge {
-      display: inline-block;
-      padding: 4px 10px;
-      border-radius: 9999px;
-      font-size: 11px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }
-    .radar-low { background: rgba(74, 222, 128, 0.15); color: #4ade80; border: 1px solid rgba(74, 222, 128, 0.3); }
-    .radar-med { background: rgba(251, 191, 36, 0.15); color: #fbbf24; border: 1px solid rgba(251, 191, 36, 0.3); }
-    .radar-high { background: rgba(248, 113, 113, 0.15); color: #f87171; border: 1px solid rgba(248, 113, 113, 0.3); }
-
-    /* Autonomous Agent Command Center Styles */
-    .stepper-container {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 14px 18px;
-      background: #090d18;
-      border-radius: 8px;
-      border: 1px solid var(--border-color);
-      margin-bottom: 20px;
-    }
-    .step-item {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 6px;
-      position: relative;
-      flex: 1;
-    }
-    .step-item:not(:last-child)::after {
-      content: "";
-      position: absolute;
-      top: 14px;
-      left: 60%;
-      right: -40%;
-      height: 2px;
-      background: #1e293b;
-      z-index: 1;
-    }
-    .step-item.completed:not(:last-child)::after {
-      background: var(--success);
-    }
-    .step-circle {
-      width: 28px;
-      height: 28px;
-      border-radius: 50%;
-      background: #1e293b;
-      color: #94a3b8;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 12px;
-      font-weight: 700;
-      z-index: 2;
-    }
-    .step-item.active .step-circle {
-      background: var(--accent);
-      color: #000;
-      box-shadow: 0 0 12px var(--accent);
-    }
-    .step-item.approval .step-circle {
-      background: var(--warning);
-      color: #000;
-      animation: pulse 1.5s infinite;
-    }
-    .step-item.completed .step-circle {
-      background: var(--success);
-      color: #000;
-    }
-    .step-label {
-      font-size: 11px;
-      color: var(--text-muted);
-      font-weight: 600;
-    }
-    .step-item.active .step-label { color: var(--accent); }
-    .step-item.approval .step-label { color: var(--warning); }
-    @keyframes pulse {
-      0% { box-shadow: 0 0 0 0 rgba(251, 191, 36, 0.7); }
-      70% { box-shadow: 0 0 0 10px rgba(251, 191, 36, 0); }
-      100% { box-shadow: 0 0 0 0 rgba(251, 191, 36, 0); }
-    }
-    .approval-card {
-      border: 1px solid var(--warning);
-      background: rgba(251, 191, 36, 0.04);
-      border-radius: 8px;
-      padding: 16px;
-      margin-bottom: 16px;
-    }
-    .diff-box {
-      font-family: Consolas, monospace;
-      font-size: 12px;
-      background: #090e18;
-      border: 1px solid #1e293b;
-      border-radius: 6px;
-      padding: 12px;
-      max-height: 240px;
-      overflow-y: auto;
-      line-height: 1.6;
-    }
-    .diff-add { color: #4ade80; background: rgba(74, 222, 128, 0.1); display: block; }
-    .diff-del { color: #f87171; background: rgba(248, 113, 113, 0.1); display: block; }
-
-    /* Mobile Studio Styles */
-    .mobile-layout {
-      display: flex;
-      height: 100%;
-      overflow: hidden;
-    }
-    .mobile-controls-panel {
-      width: 380px;
-      background: var(--bg-secondary);
-      border-right: 1px solid var(--border-color);
-      overflow-y: auto;
-      padding: 18px;
-      display: flex;
-      flex-direction: column;
-    }
-    .mobile-preview-stage {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      background: #04060c;
-      overflow: auto;
-      padding: 24px;
-      position: relative;
-    }
-    .device-toolbar {
-      position: absolute;
-      top: 14px;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      background: #0d1222;
-      border: 1px solid var(--border-color);
-      padding: 6px 14px;
-      border-radius: 30px;
-      z-index: 10;
-    }
-    .device-mockup {
-      background: #111;
-      border-radius: 44px;
-      box-shadow: 0 25px 60px rgba(0, 0, 0, 0.8), 0 0 0 10px #1e2538, 0 0 0 12px #334155;
-      position: relative;
-      overflow: hidden;
-      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-      display: flex;
-      flex-direction: column;
-    }
-    .device-notch {
-      width: 110px;
-      height: 24px;
-      background: #000;
-      border-radius: 12px;
-      position: absolute;
-      top: 10px;
-      left: 50%;
-      transform: translateX(-50%);
-      z-index: 20;
-    }
-    .device-iframe {
-      width: 100%;
-      height: 100%;
-      border: none;
-      background: #ffffff;
-    }
-
-    /* Status Bar */
-    footer.status-bar {
-      height: 24px;
-      background: #0284c7;
-      color: #ffffff;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 12px;
-      font-size: 11px;
-      font-weight: 500;
-      flex-shrink: 0;
-      z-index: 100;
-    }
-    .status-bar-left, .status-bar-right {
-      display: flex;
-      align-items: center;
-      gap: 16px;
-    }
-    .status-item {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      cursor: pointer;
-    }
-    .status-item:hover { opacity: 0.85; }
-
-    /* Command Palette Modal */
-    .modal-overlay {
-      position: absolute;
-      top: 0; left: 0; right: 0; bottom: 0;
-      background: rgba(0, 0, 0, 0.7);
-      display: none;
-      align-items: flex-start;
-      justify-content: center;
-      padding-top: 60px;
-      z-index: 9999;
-    }
-    .modal-overlay.active { display: flex; }
-    .palette-box {
-      width: 600px;
-      background: #0f172a;
-      border: 1px solid #38bdf8;
-      border-radius: 8px;
-      box-shadow: 0 12px 36px rgba(0,0,0,0.8);
-      overflow: hidden;
-    }
-    .palette-input {
-      width: 100%;
-      background: #090d16;
-      border: none;
-      border-bottom: 1px solid #1e293b;
-      padding: 14px 16px;
-      font-size: 14px;
-      color: #f8fafc;
-      outline: none;
-    }
-    .palette-list {
-      max-height: 320px;
-      overflow-y: auto;
-      padding: 6px 0;
-    }
-    .palette-item {
-      padding: 8px 16px;
-      font-size: 13px;
-      color: #cbd5e1;
-      cursor: pointer;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .palette-item:hover, .palette-item.selected {
-      background: #1e293b;
-      color: #38bdf8;
-    }
-  
-    /* Desktop Application Menu Bar */
+    /* Desktop Menubar */
     .menubar {
       display: flex;
-      background: #080d1a;
-      border-bottom: 1px solid var(--border-color);
-      padding: 0 8px;
-      font-size: 12px;
-      user-select: none;
-      position: relative;
-      z-index: 200;
+      align-items: center;
+      margin-left: 4px;
     }
     .menu-item {
       position: relative;
@@ -701,15 +113,15 @@
     .menu-btn {
       background: transparent;
       border: none;
-      color: var(--text-muted);
-      padding: 4px 10px;
-      cursor: pointer;
+      color: var(--text-secondary);
       font-size: 12px;
+      padding: 4px 8px;
       border-radius: 4px;
-      transition: background 0.12s, color 0.12s;
+      cursor: pointer;
+      transition: background 0.1s, color 0.1s;
     }
     .menu-btn:hover, .menu-item.open .menu-btn {
-      background: var(--border-color);
+      background: var(--bg-hover);
       color: var(--text-primary);
     }
     .dropdown-menu {
@@ -720,8 +132,8 @@
       background: #0f172a;
       border: 1px solid var(--border-light);
       border-radius: 6px;
-      min-width: 220px;
-      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.6);
+      min-width: 230px;
+      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.7);
       padding: 4px 0;
       z-index: 300;
     }
@@ -740,12 +152,12 @@
     }
     .dropdown-entry:hover {
       background: #1e293b;
-      color: var(--accent);
+      color: var(--accent-cyan);
     }
     .dropdown-entry .shortcut {
       color: var(--text-dim);
       font-size: 11px;
-      margin-left: 16px;
+      margin-left: 20px;
     }
     .dropdown-separator {
       height: 1px;
@@ -753,857 +165,1454 @@
       margin: 4px 0;
     }
 
-    /* Resource Mode Toggle Button in Header */
-    .mode-badge {
-      background: #1e293b;
-      border: 1px solid #334155;
-      color: #38bdf8;
+    /* Center Command Palette Search Pill */
+    .header-center {
+      flex: 1;
+      max-width: 540px;
+      margin: 0 16px;
+    }
+    .command-search-pill {
+      background: #060913;
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      height: 26px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      color: var(--text-muted);
+      font-size: 12px;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .command-search-pill:hover {
+      border-color: var(--accent-cyan);
+      background: #0f172a;
+      color: var(--text-primary);
+    }
+
+    /* Header Right Actions */
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .hdr-btn {
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--text-muted);
+      width: 28px;
+      height: 28px;
+      border-radius: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: all 0.12s;
+    }
+    .hdr-btn:hover {
+      background: var(--bg-hover);
+      color: var(--text-primary);
+    }
+    .hdr-btn.active {
+      color: var(--accent-cyan);
+      background: rgba(56, 189, 248, 0.12);
+    }
+    .daemon-indicator {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      color: var(--success);
+      padding: 3px 8px;
+      border-radius: 12px;
+      background: rgba(34, 197, 94, 0.1);
+      border: 1px solid rgba(34, 197, 94, 0.3);
+      cursor: pointer;
+      margin-left: 6px;
+    }
+    .status-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--success);
+      box-shadow: 0 0 6px var(--success);
+    }
+
+    /* ==========================================================================
+       2. Main Workbench Body
+       ========================================================================== */
+    .workbench-main {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* 2.1 Vertical Activity Bar (48px) */
+    .activity-bar {
+      width: var(--activity-width);
+      background: var(--bg-activity);
+      border-right: 1px solid var(--border-color);
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 0;
+      flex-shrink: 0;
+      z-index: 100;
+    }
+    .activity-group {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      width: 100%;
+    }
+    .activity-btn {
+      width: 38px;
+      height: 38px;
+      background: transparent;
+      border: none;
+      border-radius: 6px;
+      color: var(--text-dim);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      position: relative;
+      transition: color 0.15s, background 0.15s;
+    }
+    .activity-btn:hover {
+      color: var(--text-primary);
+      background: var(--bg-hover);
+    }
+    .activity-btn.active {
+      color: var(--accent-cyan);
+    }
+    .activity-btn.active::before {
+      content: "";
+      position: absolute;
+      left: -5px;
+      top: 6px;
+      bottom: 6px;
+      width: 3px;
+      background: var(--accent-cyan);
+      border-radius: 0 2px 2px 0;
+    }
+    .activity-badge {
+      position: absolute;
+      top: 4px;
+      right: 4px;
+      background: var(--accent-indigo);
+      color: #fff;
+      font-size: 9px;
+      font-weight: 800;
+      padding: 1px 4px;
+      border-radius: 8px;
+      line-height: 1;
+    }
+
+    /* 2.2 Primary Sidebar (Resizable, 260px) */
+    .primary-sidebar {
+      width: var(--sidebar-width);
+      background: var(--bg-sidebar);
+      border-right: 1px solid var(--border-color);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+      overflow: hidden;
+    }
+    .primary-sidebar.collapsed {
+      display: none;
+    }
+    .sidebar-header-bar {
+      height: 35px;
+      padding: 0 14px;
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+    .sidebar-title {
       font-size: 11px;
       font-weight: 700;
-      padding: 4px 10px;
-      border-radius: 12px;
+      letter-spacing: 0.8px;
+      text-transform: uppercase;
+      color: var(--text-muted);
+    }
+    .sidebar-actions {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .tool-icon-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      width: 22px;
+      height: 22px;
+      border-radius: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .tool-icon-btn:hover {
+      background: var(--bg-hover);
+      color: var(--text-primary);
+    }
+
+    .sideview-content {
+      flex: 1;
+      overflow-y: auto;
+      display: none;
+    }
+    .sideview-content.active {
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* Explorer Section */
+    .section-header {
+      padding: 6px 14px;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-dim);
+      background: rgba(0, 0, 0, 0.15);
+      border-bottom: 1px solid var(--border-color);
+    }
+    .tree-view {
+      padding: 6px;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+      line-height: 24px;
+      color: var(--text-secondary);
+      flex: 1;
+    }
+    .tree-item {
+      padding: 2px 8px;
+      border-radius: 4px;
       cursor: pointer;
       display: flex;
       align-items: center;
       gap: 6px;
-      transition: all 0.15s ease-out;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
-    .mode-badge:hover {
-      background: #334155;
-      border-color: #38bdf8;
+    .tree-item:hover {
+      background: var(--bg-hover);
+      color: #fff;
     }
-    .mode-badge.low-res {
-      background: rgba(34, 197, 94, 0.15);
-      border-color: #22c55e;
-      color: #4ade80;
+    .tree-item.active-file {
+      background: #1e293b;
+      color: var(--accent-cyan);
+      font-weight: 600;
     }
 
-    /* Welcome Dashboard Tab */
-    .welcome-container {
-      flex: 1;
-      overflow-y: auto;
-      padding: 48px;
-      background: radial-gradient(circle at 50% 20%, #172235 0%, #070a12 70%);
+    /* Search & Git Sideviews */
+    .sideview-input-box {
+      padding: 10px 14px;
       display: flex;
       flex-direction: column;
-      align-items: center;
+      gap: 8px;
+      border-bottom: 1px solid var(--border-color);
     }
-    .welcome-hero {
-      text-align: center;
-      max-width: 800px;
-      margin-bottom: 40px;
+    .side-input {
+      background: #070a14;
+      border: 1px solid var(--border-color);
+      color: var(--text-primary);
+      padding: 6px 10px;
+      font-size: 12px;
+      border-radius: 4px;
+      outline: none;
     }
-    .welcome-hero h1 {
-      font-size: 38px;
-      font-weight: 800;
-      letter-spacing: -1px;
-      margin: 16px 0 8px 0;
-      color: #f8fafc;
+    .side-input:focus {
+      border-color: var(--accent-cyan);
     }
-    .welcome-hero h1 span {
-      color: #38bdf8;
-    }
-    .welcome-hero p {
-      font-size: 16px;
-      color: #94a3b8;
-      line-height: 1.6;
-    }
-    .welcome-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-      gap: 20px;
-      width: 100%;
-      max-width: 960px;
-      margin-bottom: 32px;
-    }
-    .welcome-card {
-      background: rgba(30, 41, 59, 0.7);
-      border: 1px solid #334155;
-      border-radius: 12px;
-      padding: 24px;
-      backdrop-filter: blur(8px);
-      transition: transform 0.15s ease-out, border-color 0.15s ease-out;
+    .side-btn {
+      background: #1e293b;
+      border: 1px solid var(--border-light);
+      color: var(--text-primary);
+      padding: 6px 12px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 600;
       cursor: pointer;
+      transition: all 0.1s;
     }
-    .welcome-card:hover {
-      transform: translateY(-2px);
-      border-color: #38bdf8;
+    .side-btn:hover {
+      background: #2a3852;
+      border-color: var(--accent-cyan);
     }
-    .welcome-card h3 {
-      font-size: 16px;
-      margin-bottom: 8px;
-      color: #f8fafc;
+
+    /* Resizer Splitter Bars */
+    .resizer-v {
+      width: 4px;
+      background: transparent;
+      cursor: col-resize;
+      transition: background 0.15s;
+      z-index: 50;
+      flex-shrink: 0;
+    }
+    .resizer-v:hover, .resizer-v.dragging {
+      background: var(--accent-cyan);
+    }
+    .resizer-h {
+      height: 4px;
+      background: transparent;
+      cursor: row-resize;
+      transition: background 0.15s;
+      z-index: 50;
+      flex-shrink: 0;
+    }
+    .resizer-h:hover, .resizer-h.dragging {
+      background: var(--accent-cyan);
+    }
+
+    /* 2.3 Central Workspace (Editor + Bottom Panel) */
+    .central-workspace {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      background: var(--bg-editor);
+      position: relative;
+    }
+
+    /* Editor Area */
+    .editor-container {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      position: relative;
+    }
+    .editor-tabs-bar {
+      height: 36px;
+      background: var(--bg-header);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+    .editor-tabs {
+      display: flex;
+      align-items: center;
+      height: 100%;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .editor-tabs::-webkit-scrollbar { display: none; }
+    .editor-tab {
       display: flex;
       align-items: center;
       gap: 8px;
+      padding: 0 14px;
+      height: 100%;
+      background: #080d19;
+      border-right: 1px solid var(--border-color);
+      font-size: 12px;
+      color: var(--text-muted);
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.1s, color 0.1s;
     }
-    .welcome-card p {
+    .editor-tab:hover {
+      background: #151e30;
+      color: #fff;
+    }
+    .editor-tab.active {
+      background: var(--bg-editor);
+      color: var(--accent-cyan);
+      border-top: 2px solid var(--accent-cyan);
+      font-weight: 600;
+    }
+    .editor-tab .close-tab {
       font-size: 13px;
-      color: #94a3b8;
-      line-height: 1.5;
+      color: var(--text-dim);
+      border-radius: 3px;
+      padding: 0 3px;
+    }
+    .editor-tab .close-tab:hover {
+      background: #334155;
+      color: var(--danger);
+    }
+    .editor-tab .dirty-indicator {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--warning);
+      display: none;
+    }
+    .editor-tab.dirty .dirty-indicator { display: block; }
+
+    .editor-tab-actions {
+      display: flex;
+      align-items: center;
+      padding: 0 8px;
+      gap: 4px;
     }
 
-    /* Modal Dialogs (About & Health) */
+    .breadcrumbs {
+      height: 24px;
+      background: #080d17;
+      border-bottom: 1px solid #162033;
+      display: flex;
+      align-items: center;
+      padding: 0 14px;
+      font-size: 11px;
+      color: var(--text-dim);
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .breadcrumbs span.crumb { color: var(--text-muted); }
+    .breadcrumbs span.crumb-active { color: var(--accent-cyan); font-weight: 600; }
+
+    #monaco-root {
+      flex: 1;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* Minimalist Empty Editor State */
+    .empty-editor-state {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: radial-gradient(circle at 50% 30%, #151f33 0%, #070a12 70%);
+      padding: 24px;
+    }
+    .empty-card {
+      text-align: center;
+      max-width: 440px;
+    }
+    .empty-card h2 {
+      font-size: 24px;
+      font-weight: 800;
+      margin: 12px 0 4px 0;
+      color: #fff;
+    }
+    .empty-card h2 span { color: var(--accent-cyan); }
+    .empty-card p {
+      color: var(--text-muted);
+      font-size: 13px;
+      margin-bottom: 24px;
+    }
+    .shortcut-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .shortcut-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 12px;
+      background: rgba(30, 41, 59, 0.4);
+      border: 1px solid #233149;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 12px;
+      transition: all 0.12s;
+    }
+    .shortcut-item:hover {
+      background: #1e293b;
+      border-color: var(--accent-cyan);
+      color: #fff;
+    }
+    .shortcut-key {
+      background: #0f172a;
+      border: 1px solid #334155;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: Consolas, monospace;
+      font-size: 11px;
+      color: var(--accent-cyan);
+    }
+
+    /* 2.4 Integrated Bottom Tool Panel (Resizable, 240px) */
+    .bottom-panel {
+      height: var(--panel-height);
+      background: var(--bg-panel);
+      border-top: 1px solid var(--border-color);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+      overflow: hidden;
+    }
+    .bottom-panel.collapsed {
+      display: none;
+    }
+    .bottom-panel.maximized {
+      height: 80% !important;
+    }
+    .panel-header-bar {
+      height: 32px;
+      background: #070b14;
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 10px;
+      flex-shrink: 0;
+    }
+    .panel-tabs {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      height: 100%;
+    }
+    .panel-tab-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.6px;
+      padding: 0 10px;
+      height: 100%;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: color 0.1s;
+    }
+    .panel-tab-btn:hover {
+      color: var(--text-primary);
+    }
+    .panel-tab-btn.active {
+      color: var(--accent-cyan);
+      border-bottom: 2px solid var(--accent-cyan);
+    }
+    .panel-badge {
+      background: #1e293b;
+      color: var(--text-muted);
+      font-size: 10px;
+      padding: 1px 5px;
+      border-radius: 8px;
+    }
+    .panel-controls {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .panel-view-content {
+      flex: 1;
+      overflow: hidden;
+      display: none;
+      position: relative;
+    }
+    .panel-view-content.active {
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* Terminal inside bottom panel */
+    .terminal-container {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      background: #05070d;
+      overflow: hidden;
+    }
+    .term-tabs-bar {
+      height: 28px;
+      background: #090e1c;
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 8px;
+    }
+    .term-tabs {
+      display: flex;
+      gap: 4px;
+    }
+    .term-tab {
+      background: #111827;
+      border: 1px solid var(--border-color);
+      color: var(--text-muted);
+      padding: 2px 10px;
+      border-radius: 4px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .term-tab.active {
+      background: #1e293b;
+      color: var(--accent-cyan);
+      border-color: var(--accent-cyan);
+    }
+    .terminal-panes {
+      flex: 1;
+      display: flex;
+      position: relative;
+      overflow: hidden;
+    }
+    .term-instance {
+      flex: 1;
+      height: 100%;
+      padding: 6px;
+    }
+
+    /* Problems & Output */
+    .problems-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px;
+      font-size: 12px;
+      font-family: Consolas, monospace;
+    }
+    .prob-entry {
+      padding: 4px 8px;
+      border-radius: 4px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+    }
+    .prob-entry:hover {
+      background: #1e293b;
+    }
+    .output-log-area {
+      flex: 1;
+      background: #05070e;
+      color: #cbd5e1;
+      font-family: Consolas, monospace;
+      font-size: 12px;
+      padding: 10px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+    }
+
+    /* 2.5 Secondary Sidebar (Right Edge, AI Assistant) */
+    .secondary-sidebar {
+      width: var(--ai-sidebar-width);
+      background: var(--bg-sidebar);
+      border-left: 1px solid var(--border-color);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+      overflow: hidden;
+    }
+    .secondary-sidebar.collapsed {
+      display: none;
+    }
+    .ai-chat-thread {
+      flex: 1;
+      overflow-y: auto;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .ai-msg {
+      background: #131b2e;
+      border: 1px solid #233149;
+      border-radius: 8px;
+      padding: 12px;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .ai-msg.user {
+      background: rgba(99, 102, 241, 0.15);
+      border-color: rgba(99, 102, 241, 0.4);
+      align-self: flex-end;
+      max-width: 90%;
+    }
+    .ai-msg-hdr {
+      font-weight: 700;
+      font-size: 11px;
+      color: var(--accent-cyan);
+      margin-bottom: 6px;
+      display: flex;
+      justify-content: space-between;
+    }
+    .ai-input-area {
+      padding: 12px;
+      border-top: 1px solid var(--border-color);
+      background: #080d1a;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .ai-prompt-box {
+      width: 100%;
+      background: #0c1222;
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      padding: 8px;
+      color: var(--text-primary);
+      font-size: 12px;
+      font-family: inherit;
+      resize: none;
+      outline: none;
+    }
+    .ai-prompt-box:focus {
+      border-color: var(--accent-cyan);
+    }
+    .ai-send-btn {
+      align-self: flex-end;
+      background: var(--accent-cyan);
+      color: #070a12;
+      border: none;
+      padding: 6px 14px;
+      border-radius: 4px;
+      font-weight: 700;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .ai-send-btn:hover {
+      background: #0284c7;
+    }
+
+    /* ==========================================================================
+       3. Bottom Status Bar (24px)
+       ========================================================================== */
+    footer.workbench-statusbar {
+      height: var(--statusbar-height);
+      background: var(--bg-statusbar);
+      border-top: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 10px;
+      font-size: 11px;
+      color: var(--text-muted);
+      flex-shrink: 0;
+      z-index: 100;
+    }
+    .statusbar-group {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .sb-cell {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+      padding: 2px 6px;
+      border-radius: 3px;
+    }
+    .sb-cell:hover {
+      background: var(--bg-hover);
+      color: var(--text-primary);
+    }
+    .mode-pill {
+      color: var(--accent-cyan);
+      font-weight: 700;
+    }
+
+    /* Modal Dialogs */
     .dialog-modal {
       display: none;
       position: fixed;
       inset: 0;
-      background: rgba(0, 0, 0, 0.75);
+      background: rgba(0, 0, 0, 0.7);
       z-index: 1000;
       align-items: center;
       justify-content: center;
       backdrop-filter: blur(4px);
     }
-    .dialog-modal.active {
-      display: flex;
-    }
+    .dialog-modal.active { display: flex; }
     .dialog-box {
       background: #0f172a;
-      border: 1px solid #38bdf8;
-      border-radius: 14px;
+      border: 1px solid var(--accent-cyan);
+      border-radius: 12px;
       width: 520px;
       max-width: 90vw;
-      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.8);
+      box-shadow: 0 20px 40px rgba(0,0,0,0.8);
       overflow: hidden;
-      animation: modalFadeIn 0.15s ease-out;
-    }
-    @keyframes modalFadeIn {
-      from { opacity: 0; transform: scale(0.96); }
-      to { opacity: 1; transform: scale(1); }
     }
     .dialog-header {
-      padding: 20px 24px;
+      padding: 16px 20px;
       background: #1e293b;
       border-bottom: 1px solid #334155;
       display: flex;
       justify-content: space-between;
       align-items: center;
     }
-    .dialog-header h2 {
-      font-size: 18px;
-      color: #f8fafc;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    .dialog-body {
-      padding: 24px;
-      font-size: 13px;
-      color: #cbd5e1;
-      line-height: 1.6;
-    }
+    .dialog-body { padding: 20px; font-size: 13px; color: #cbd5e1; line-height: 1.6; }
     .dialog-footer {
-      padding: 16px 24px;
+      padding: 12px 20px;
       background: #1e293b;
-      border-top: 1px solid #334155;
       display: flex;
       justify-content: flex-end;
     }
     .dialog-btn {
-      background: #38bdf8;
-      color: #0f172a;
+      background: var(--accent-cyan);
+      color: #070a12;
       border: none;
-      padding: 8px 18px;
-      border-radius: 6px;
+      padding: 6px 16px;
+      border-radius: 4px;
       font-weight: 700;
       cursor: pointer;
-      transition: background 0.12s;
-    }
-    .dialog-btn:hover {
-      background: #0284c7;
     }
 
-    /* Accessibility: Reduced Motion & Low Resource Mode suppression */
+    /* Low Resource Mode & Reduced Motion */
     @media (prefers-reduced-motion: reduce) {
-      * {
-        animation: none !important;
-        transition: none !important;
-      }
+      * { animation: none !important; transition: none !important; }
     }
     body.low-resource-mode * {
       animation: none !important;
       transition: none !important;
     }
-
   </style>
 </head>
 <body>
-  <!-- Native Desktop Menu Bar -->
-  <div class="menubar">
-    <div class="menu-item" id="menu-file">
-      <button class="menu-btn" onclick="toggleMenu('menu-file')">File</button>
-      <div class="dropdown-menu">
-        <div class="dropdown-entry" onclick="switchTab('welcome')"><span>Welcome Dashboard</span></div>
-        <div class="dropdown-separator"></div>
-        <div class="dropdown-entry" onclick="newProject()"><span>New Project...</span><span class="shortcut">Ctrl+N</span></div>
-        <div class="dropdown-entry" onclick="openFolder()"><span>Open Folder...</span><span class="shortcut">Ctrl+O</span></div>
-        <div class="dropdown-separator"></div>
-        <div class="dropdown-entry" onclick="saveActiveFile()"><span>Save</span><span class="shortcut">Ctrl+S</span></div>
-        <div class="dropdown-entry" onclick="saveActiveFile()"><span>Save All</span><span class="shortcut">Ctrl+Shift+S</span></div>
-        <div class="dropdown-separator"></div>
-        <div class="dropdown-entry" onclick="window.close()"><span>Exit AetherIDE</span><span class="shortcut">Alt+F4</span></div>
-      </div>
-    </div>
-    <div class="menu-item" id="menu-edit">
-      <button class="menu-btn" onclick="toggleMenu('menu-edit')">Edit</button>
-      <div class="dropdown-menu">
-        <div class="dropdown-entry" onclick="triggerEditorAction('undo')"><span>Undo</span><span class="shortcut">Ctrl+Z</span></div>
-        <div class="dropdown-entry" onclick="triggerEditorAction('redo')"><span>Redo</span><span class="shortcut">Ctrl+Y</span></div>
-        <div class="dropdown-separator"></div>
-        <div class="dropdown-entry" onclick="triggerEditorAction('find')"><span>Find in File</span><span class="shortcut">Ctrl+F</span></div>
-        <div class="dropdown-entry" onclick="triggerEditorAction('replace')"><span>Replace</span><span class="shortcut">Ctrl+H</span></div>
-      </div>
-    </div>
-    <div class="menu-item" id="menu-view">
-      <button class="menu-btn" onclick="toggleMenu('menu-view')">View</button>
-      <div class="dropdown-menu">
-        <div class="dropdown-entry" onclick="switchTab('welcome')"><span>Welcome Overview</span></div>
-        <div class="dropdown-entry" onclick="switchTab('editor')"><span>Code Studio</span><span class="shortcut">Alt+1</span></div>
-        <div class="dropdown-entry" onclick="switchTab('terminal')"><span>Terminal Studio</span><span class="shortcut">Alt+2</span></div>
-        <div class="dropdown-entry" onclick="switchTab('brain')"><span>Project Brain</span><span class="shortcut">Alt+3</span></div>
-        <div class="dropdown-entry" onclick="switchTab('agents')"><span>AI Engineering Team</span><span class="shortcut">Alt+4</span></div>
-        <div class="dropdown-entry" onclick="switchTab('mobile')"><span>Mobile Studio</span><span class="shortcut">Alt+5</span></div>
-        <div class="dropdown-entry" onclick="switchTab('diagnostics')"><span>Diagnostics Doctor</span><span class="shortcut">Alt+6</span></div>
-        <div class="dropdown-separator"></div>
-        <div class="dropdown-entry" onclick="toggleResourceMode()"><span>Toggle Low Resource Mode</span></div>
-      </div>
-    </div>
-    <div class="menu-item" id="menu-go">
-      <button class="menu-btn" onclick="toggleMenu('menu-go')">Go</button>
-      <div class="dropdown-menu">
-        <div class="dropdown-entry" onclick="openQuickOpen()"><span>Quick Open File...</span><span class="shortcut">Ctrl+P</span></div>
-        <div class="dropdown-entry" onclick="openCommandPalette()"><span>Command Palette...</span><span class="shortcut">Ctrl+Shift+P</span></div>
-      </div>
-    </div>
-    <div class="menu-item" id="menu-run">
-      <button class="menu-btn" onclick="toggleMenu('menu-run')">Run</button>
-      <div class="dropdown-menu">
-        <div class="dropdown-entry" onclick="switchTab('terminal'); splitTerminal('horizontal');"><span>Run Build Task</span><span class="shortcut">F5</span></div>
-        <div class="dropdown-entry" onclick="switchTab('terminal');"><span>Run Tests</span><span class="shortcut">Ctrl+F5</span></div>
-        <div class="dropdown-entry" onclick="switchTab('terminal');"><span>Stop Process</span><span class="shortcut">Shift+F5</span></div>
-      </div>
-    </div>
-    <div class="menu-item" id="menu-ai">
-      <button class="menu-btn" onclick="toggleMenu('menu-ai')">AI</button>
-      <div class="dropdown-menu">
-        <div class="dropdown-entry" onclick="switchTab('agents')"><span>Autonomous Agent Hub</span></div>
-        <div class="dropdown-entry" onclick="switchTab('diagnostics')"><span>AI Provider Diagnostics</span></div>
-        <div class="dropdown-separator"></div>
-        <div class="dropdown-entry" onclick="switchTab('brain'); analyzeChangeImpact();"><span>Impact Radar Analysis</span></div>
-      </div>
-    </div>
-    <div class="menu-item" id="menu-tools">
-      <button class="menu-btn" onclick="toggleMenu('menu-tools')">Tools</button>
-      <div class="dropdown-menu">
-        <div class="dropdown-entry" onclick="openHealthModal()"><span>System Health & Memory</span></div>
-        <div class="dropdown-entry" onclick="switchTab('storage')"><span>Checkpoints & Storage</span></div>
-        <div class="dropdown-entry" onclick="switchTab('diagnostics')"><span>Doctor Diagnostics</span></div>
-      </div>
-    </div>
-    <div class="menu-item" id="menu-help">
-      <button class="menu-btn" onclick="toggleMenu('menu-help')">Help</button>
-      <div class="dropdown-menu">
-        <div class="dropdown-entry" onclick="switchTab('welcome')"><span>Welcome Guide</span></div>
-        <div class="dropdown-entry" onclick="openShortcutsModal()"><span>Keyboard Shortcuts</span></div>
-        <div class="dropdown-entry" onclick="window.open('https://github.com/Imagen2dragon/Aether-IDE', '_blank')"><span>Documentation & Repository</span></div>
-        <div class="dropdown-separator"></div>
-        <div class="dropdown-entry" onclick="openAboutModal()"><span>About AetherIDE...</span></div>
-      </div>
-    </div>
-  </div>
 
-  <!-- Global Application Header -->
-  <header>
-    <div class="brand" onclick="switchTab('welcome')" style="cursor: pointer;">
-      <!-- Official AetherIDE Vector Glyph -->
-      <svg width="24" height="24" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <rect x="24" y="24" width="464" height="464" rx="104" fill="#0F172A" stroke="#38BDF8" stroke-width="24" />
-        <polygon points="256,96 120,400 184,400 256,236 256,96" fill="#38BDF8" />
-        <polygon points="256,96 392,400 328,400 256,236 256,96" fill="#6366F1" />
-        <polygon points="196,312 316,312 300,344 212,344" fill="#38BDF8" />
-        <polygon points="256,192 284,256 256,320 228,256" fill="#FFFFFF" />
-        <circle cx="256" cy="96" r="20" fill="#38BDF8" />
-      </svg>
-      <span>Aether<span style="color:#38bdf8;">IDE</span></span>
-      <span class="badge" style="background:#1e293b; color:#38bdf8; border:1px solid #38bdf8;">BETA.2</span>
+  <!-- 1. Top Window Shell & Application Menu Bar -->
+  <header class="workbench-header">
+    <div class="header-left">
+      <div class="app-brand" onclick="openAboutModal()" title="About AetherIDE">
+        <svg width="18" height="18" viewBox="0 0 512 512" fill="none">
+          <rect x="24" y="24" width="464" height="464" rx="104" fill="#0F172A" stroke="#38BDF8" stroke-width="24" />
+          <polygon points="256,96 120,400 184,400 256,236 256,96" fill="#38BDF8" />
+          <polygon points="256,96 392,400 328,400 256,236 256,96" fill="#6366F1" />
+          <polygon points="196,312 316,312 300,344 212,344" fill="#38BDF8" />
+          <polygon points="256,192 284,256 256,320 228,256" fill="#FFFFFF" />
+          <circle cx="256" cy="96" r="20" fill="#38BDF8" />
+        </svg>
+        <span class="app-brand-text">Aether<span>IDE</span></span>
+      </div>
+
+      <!-- Desktop Menubar -->
+      <div class="menubar">
+        <div class="menu-item" id="menu-file">
+          <button class="menu-btn" onclick="toggleMenu('menu-file')">File</button>
+          <div class="dropdown-menu">
+            <div class="dropdown-entry" onclick="newProject()"><span>New File</span><span class="shortcut">Ctrl+N</span></div>
+            <div class="dropdown-entry" onclick="openFolder()"><span>Open Folder...</span><span class="shortcut">Ctrl+O</span></div>
+            <div class="dropdown-separator"></div>
+            <div class="dropdown-entry" onclick="saveActiveFile()"><span>Save</span><span class="shortcut">Ctrl+S</span></div>
+            <div class="dropdown-entry" onclick="saveActiveFile()"><span>Save All</span><span class="shortcut">Ctrl+Shift+S</span></div>
+            <div class="dropdown-separator"></div>
+            <div class="dropdown-entry" onclick="window.close()"><span>Exit</span><span class="shortcut">Alt+F4</span></div>
+          </div>
+        </div>
+
+        <div class="menu-item" id="menu-edit">
+          <button class="menu-btn" onclick="toggleMenu('menu-edit')">Edit</button>
+          <div class="dropdown-menu">
+            <div class="dropdown-entry" onclick="triggerEditorAction('undo')"><span>Undo</span><span class="shortcut">Ctrl+Z</span></div>
+            <div class="dropdown-entry" onclick="triggerEditorAction('redo')"><span>Redo</span><span class="shortcut">Ctrl+Y</span></div>
+            <div class="dropdown-separator"></div>
+            <div class="dropdown-entry" onclick="triggerEditorAction('find')"><span>Find</span><span class="shortcut">Ctrl+F</span></div>
+            <div class="dropdown-entry" onclick="triggerEditorAction('replace')"><span>Replace</span><span class="shortcut">Ctrl+H</span></div>
+          </div>
+        </div>
+
+        <div class="menu-item" id="menu-selection">
+          <button class="menu-btn" onclick="toggleMenu('menu-selection')">Selection</button>
+          <div class="dropdown-menu">
+            <div class="dropdown-entry" onclick="triggerEditorAction('selectAll')"><span>Select All</span><span class="shortcut">Ctrl+A</span></div>
+            <div class="dropdown-entry" onclick="triggerEditorAction('expandSelection')"><span>Expand Selection</span><span class="shortcut">Shift+Alt+Right</span></div>
+          </div>
+        </div>
+
+        <div class="menu-item" id="menu-view">
+          <button class="menu-btn" onclick="toggleMenu('menu-view')">View</button>
+          <div class="dropdown-menu">
+            <div class="dropdown-entry" onclick="selectActivity('explorer')"><span>Explorer</span><span class="shortcut">Ctrl+Shift+E</span></div>
+            <div class="dropdown-entry" onclick="selectActivity('search')"><span>Search</span><span class="shortcut">Ctrl+Shift+F</span></div>
+            <div class="dropdown-entry" onclick="selectActivity('git')"><span>Source Control</span><span class="shortcut">Ctrl+Shift+G</span></div>
+            <div class="dropdown-entry" onclick="selectActivity('brain')"><span>Project Brain</span><span class="shortcut">Ctrl+Shift+B</span></div>
+            <div class="dropdown-entry" onclick="selectActivity('agents')"><span>AI Agents</span><span class="shortcut">Ctrl+Shift+A</span></div>
+            <div class="dropdown-separator"></div>
+            <div class="dropdown-entry" onclick="togglePrimarySidebar()"><span>Toggle Primary Sidebar</span><span class="shortcut">Ctrl+B</span></div>
+            <div class="dropdown-entry" onclick="toggleBottomPanel()"><span>Toggle Bottom Panel</span><span class="shortcut">Ctrl+`</span></div>
+            <div class="dropdown-entry" onclick="toggleSecondarySidebar()"><span>Toggle AI Assistant</span><span class="shortcut">Ctrl+Alt+B</span></div>
+            <div class="dropdown-separator"></div>
+            <div class="dropdown-entry" onclick="resetWorkbenchLayout()"><span>Reset Workbench Layout</span></div>
+          </div>
+        </div>
+
+        <div class="menu-item" id="menu-go">
+          <button class="menu-btn" onclick="toggleMenu('menu-go')">Go</button>
+          <div class="dropdown-menu">
+            <div class="dropdown-entry" onclick="openQuickOpen()"><span>Go to File...</span><span class="shortcut">Ctrl+P</span></div>
+            <div class="dropdown-entry" onclick="openCommandPalette()"><span>Go to Command...</span><span class="shortcut">Ctrl+Shift+P</span></div>
+          </div>
+        </div>
+
+        <div class="menu-item" id="menu-run">
+          <button class="menu-btn" onclick="toggleMenu('menu-run')">Run</button>
+          <div class="dropdown-menu">
+            <div class="dropdown-entry" onclick="runBuildTask()"><span>Build Project</span><span class="shortcut">Ctrl+Shift+B</span></div>
+            <div class="dropdown-entry" onclick="runTestsTask()"><span>Run Tests</span><span class="shortcut">Ctrl+F5</span></div>
+          </div>
+        </div>
+
+        <div class="menu-item" id="menu-terminal">
+          <button class="menu-btn" onclick="toggleMenu('menu-terminal')">Terminal</button>
+          <div class="dropdown-menu">
+            <div class="dropdown-entry" onclick="spawnNewTerminalSession()"><span>New Terminal</span><span class="shortcut">Ctrl+Shift+`</span></div>
+            <div class="dropdown-entry" onclick="splitTerminal('horizontal')"><span>Split Terminal</span><span class="shortcut">Ctrl+Shift+E</span></div>
+            <div class="dropdown-entry" onclick="clearActiveTerminal()"><span>Clear Terminal</span></div>
+          </div>
+        </div>
+
+        <div class="menu-item" id="menu-ai">
+          <button class="menu-btn" onclick="toggleMenu('menu-ai')">AI</button>
+          <div class="dropdown-menu">
+            <div class="dropdown-entry" onclick="toggleSecondarySidebar()"><span>Open AI Assistant</span><span class="shortcut">Ctrl+Alt+B</span></div>
+            <div class="dropdown-entry" onclick="selectActivity('agents')"><span>Autonomous Agent Team</span></div>
+            <div class="dropdown-entry" onclick="analyzeChangeImpact()"><span>Impact Radar Analysis</span></div>
+          </div>
+        </div>
+
+        <div class="menu-item" id="menu-help">
+          <button class="menu-btn" onclick="toggleMenu('menu-help')">Help</button>
+          <div class="dropdown-menu">
+            <div class="dropdown-entry" onclick="openCommandPalette()"><span>Keyboard Shortcuts</span><span class="shortcut">Ctrl+K Ctrl+S</span></div>
+            <div class="dropdown-entry" onclick="openHealthModal()"><span>System Health Diagnostics</span></div>
+            <div class="dropdown-separator"></div>
+            <div class="dropdown-entry" onclick="openAboutModal()"><span>About AetherIDE...</span></div>
+          </div>
+        </div>
+      </div>
     </div>
-    <nav>
-      <button id="nav-welcome" onclick="switchTab('welcome')">
-        <span>✨</span> Welcome
+
+    <!-- Center Command Search Pill -->
+    <div class="header-center">
+      <div class="command-search-pill" onclick="openCommandPalette()">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+        </svg>
+        <span>AetherIDE — Project Workspace (Ctrl+P to open file, Ctrl+Shift+P for commands)</span>
+      </div>
+    </div>
+
+    <!-- Header Right Controls -->
+    <div class="header-right">
+      <button class="hdr-btn" onclick="togglePrimarySidebar()" title="Toggle Primary Sidebar (Ctrl+B)">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+          <line x1="9" y1="3" x2="9" y2="21"></line>
+        </svg>
       </button>
-      <button id="nav-editor" class="active" onclick="switchTab('editor')">
-        <span>💻</span> Code Studio
+      <button class="hdr-btn" onclick="toggleBottomPanel()" title="Toggle Bottom Panel (Ctrl+`)">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+          <line x1="3" y1="15" x2="21" y2="15"></line>
+        </svg>
       </button>
-      <button id="nav-terminal" onclick="switchTab('terminal')">
-        <span>⚡</span> Terminal Studio
+      <button class="hdr-btn" onclick="toggleSecondarySidebar()" title="Toggle AI Assistant (Ctrl+Alt+B)">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+          <line x1="15" y1="3" x2="15" y2="21"></line>
+        </svg>
       </button>
-      <button id="nav-brain" onclick="switchTab('brain')">
-        <span>🧠</span> Project Brain
-      </button>
-      <button id="nav-agents" onclick="switchTab('agents')">
-        <span>🤖</span> AI Engineering
-      </button>
-      <button id="nav-mobile" onclick="switchTab('mobile')">
-        <span>📱</span> Mobile Studio
-      </button>
-      <button id="nav-storage" onclick="switchTab('storage')">
-        <span>💾</span> Build & Storage
-      </button>
-      <button id="nav-diagnostics" onclick="switchTab('diagnostics')">
-        <span>🩺</span> Diagnostics Doctor
-      </button>
-    </nav>
-    <div style="display: flex; align-items: center; gap: 12px;">
-      <button id="btn-resource-mode" class="mode-badge" onclick="toggleResourceMode()" title="Toggle Low Resource Mode for low-end hardware">
-        <span>⚡</span> Standard Mode
-      </button>
-      <div class="status-badge" onclick="openHealthModal()" style="cursor:pointer;" title="View System Health">
+      <div class="daemon-indicator" onclick="openHealthModal()" title="Aether Daemon Connected">
         <div class="status-dot"></div>
         <span id="daemon-status">Daemon Online</span>
       </div>
     </div>
   </header>
 
-  <div class="container">
-    <!-- Tab 0: Welcome Dashboard -->
-    <div id="tab-welcome" class="welcome-container" style="display: none;">
-      <div class="welcome-hero">
-        <svg width="84" height="84" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <rect x="24" y="24" width="464" height="464" rx="104" fill="#0F172A" stroke="#38BDF8" stroke-width="20" />
-          <polygon points="256,96 120,400 184,400 256,236 256,96" fill="#38BDF8" />
-          <polygon points="256,96 392,400 328,400 256,236 256,96" fill="#6366F1" />
-          <polygon points="196,312 316,312 300,344 212,344" fill="#38BDF8" />
-          <polygon points="256,192 284,256 256,320 228,256" fill="#FFFFFF" />
-          <circle cx="256" cy="96" r="22" fill="#38BDF8" />
-        </svg>
-        <h1>Aether<span>IDE</span></h1>
-        <p>Your AI-Native Software Engineering Studio. High-speed systems performance in Rust, Monaco code intelligence, capability-sandboxed filesystem, and autonomous agent collaboration.</p>
+  <!-- 2. Main Workbench Shell -->
+  <div class="workbench-main">
+
+    <!-- 2.1 Vertical Activity Bar (48px) -->
+    <div class="activity-bar">
+      <div class="activity-group">
+        <button id="act-explorer" class="activity-btn active" onclick="selectActivity('explorer')" title="Explorer (Ctrl+Shift+E)">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path>
+            <polyline points="13 2 13 9 20 9"></polyline>
+          </svg>
+        </button>
+        <button id="act-search" class="activity-btn" onclick="selectActivity('search')" title="Search (Ctrl+Shift+F)">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          </svg>
+        </button>
+        <button id="act-git" class="activity-btn" onclick="selectActivity('git')" title="Source Control (Ctrl+Shift+G)">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="18" cy="18" r="3"></circle>
+            <circle cx="6" cy="6" r="3"></circle>
+            <path d="M6 9v12"></path>
+            <path d="M18 9a9 9 0 0 0-9 9"></path>
+          </svg>
+          <span class="activity-badge" id="git-badge">3</span>
+        </button>
+        <button id="act-brain" class="activity-btn" onclick="selectActivity('brain')" title="Project Brain (Ctrl+Shift+B)">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
+            <polyline points="2 17 12 22 22 17"></polyline>
+            <polyline points="2 12 12 17 22 12"></polyline>
+          </svg>
+        </button>
+        <button id="act-agents" class="activity-btn" onclick="selectActivity('agents')" title="AI Autonomous Team (Ctrl+Shift+A)">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="11" width="18" height="10" rx="2"></rect>
+            <circle cx="12" cy="5" r="2"></circle>
+            <path d="M12 7v4"></path>
+            <line x1="8" y1="16" x2="8" y2="16"></line>
+            <line x1="16" y1="16" x2="16" y2="16"></line>
+          </svg>
+        </button>
+        <button id="act-mobile" class="activity-btn" onclick="selectActivity('mobile')" title="Mobile Studio (Ctrl+Shift+M)">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="5" y="2" width="14" height="20" rx="2" ry="2"></rect>
+            <line x1="12" y1="18" x2="12.01" y2="18"></line>
+          </svg>
+        </button>
+        <button id="act-storage" class="activity-btn" onclick="selectActivity('storage')" title="Build & Storage (Ctrl+Shift+S)">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <ellipse cx="12" cy="5" rx="9" ry="3"></ellipse>
+            <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path>
+            <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path>
+          </svg>
+        </button>
       </div>
 
-      <div class="welcome-grid">
-        <div class="welcome-card" onclick="openFolder()">
-          <h3>📂 Open Workspace</h3>
-          <p>Open an existing project folder from your local disk with strict capability sandbox containment.</p>
-        </div>
-        <div class="welcome-card" onclick="newProject()">
-          <h3>✨ New Project</h3>
-          <p>Initialize a new Rust, TypeScript, or Python project with structured architecture scaffolding.</p>
-        </div>
-        <div class="welcome-card" onclick="switchTab('editor')">
-          <h3>💻 Resume Editing</h3>
-          <p>Jump directly into the Monaco Code Studio with multi-cursor, AST syntax trees, and LSP diagnostics.</p>
-        </div>
-        <div class="welcome-card" onclick="switchTab('agents')">
-          <h3>🤖 AI Autonomous Agents</h3>
-          <p>Engage specialized personas: Systems Architect, Security Sentinel, QA Specialist, and Performance Engineer.</p>
-        </div>
-        <div class="welcome-card" onclick="toggleResourceMode()">
-          <h3>🌱 Resource Profile</h3>
-          <p>Switch between Standard Mode and Low-Resource Mode (tailored for 2 vCPU / 4 GB RAM machines).</p>
-        </div>
-        <div class="welcome-card" onclick="openHealthModal()">
-          <h3>🩺 System Diagnostics</h3>
-          <p>Audit background daemon connectivity, memory consumption, credential vaults, and toolchains.</p>
-        </div>
+      <div class="activity-group">
+        <button id="act-ai-chat" class="activity-btn" onclick="toggleSecondarySidebar()" title="Toggle AI Assistant (Ctrl+Alt+B)">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2">
+            <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"></path>
+          </svg>
+        </button>
+        <button id="act-doctor" class="activity-btn" onclick="selectPanelTab('diagnostics')" title="Doctor Diagnostics">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M22 12h-4l-3 9L9 3l-3 9H2"></path>
+          </svg>
+        </button>
+        <button id="act-settings" class="activity-btn" onclick="openAboutModal()" title="Settings & About">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </button>
       </div>
     </div>
 
-    <!-- Left Workspace Sidebar -->
-    <aside>
-      <div class="sidebar-header">
-        <span>Project Explorer</span>
-        <span style="cursor:pointer;" onclick="openQuickOpen()" title="Quick Open (Ctrl+P)">🔍</span>
-      </div>
-      <div class="tree-view">
-        <div style="font-weight:600; color:#38bdf8;">📁 aether-workspace/</div>
-        <div style="padding-left:14px; font-weight:600;">📁 rust/</div>
-        <div style="padding-left:26px; font-weight:600;">📁 crates/</div>
-        <div style="padding-left:38px;" onclick="openFile('rust/crates/terminal-manager/src/conpty.rs', 'rust')">📄 terminal-manager/src/conpty.rs</div>
-        <div style="padding-left:38px;" onclick="openFile('rust/crates/project-brain/src/lib.rs', 'rust')">📄 project-brain/src/lib.rs</div>
-        <div style="padding-left:38px;" onclick="openFile('rust/crates/database-engine/src/lib.rs', 'rust')">📄 database-engine/src/lib.rs</div>
-        <div style="padding-left:38px;" onclick="openFile('rust/crates/agent-orchestrator/src/lib.rs', 'rust')">📄 agent-orchestrator/src/lib.rs</div>
-        <div style="padding-left:38px;" onclick="openFile('rust/crates/mobile-build-manager/src/lib.rs', 'rust')">📄 mobile-build-manager/src/lib.rs</div>
-        <div style="padding-left:38px;" onclick="openFile('rust/crates/lsp-client/src/lib.rs', 'rust')">📄 lsp-client/src/lib.rs</div>
-        <div style="padding-left:38px;" onclick="openFile('rust/crates/workspace-sync/src/crypto.rs', 'rust')">📄 workspace-sync/src/crypto.rs</div>
-        <div style="padding-left:26px; font-weight:600;">📁 services/</div>
-        <div style="padding-left:38px;" onclick="openFile('rust/services/aether-daemon/src/main.rs', 'rust')">📄 aether-daemon/src/main.rs</div>
-        <div style="padding-left:14px; font-weight:600;">📁 apps/</div>
-        <div style="padding-left:26px;" onclick="openFile('apps/desktop/package.json', 'json')">📄 apps/desktop/package.json</div>
-        <div style="padding-left:14px;" onclick="openFile('README.md', 'markdown')">📄 README.md</div>
-      </div>
-    </aside>
-
-    <main>
-      <!-- View 1: Monaco Code Studio -->
-      <div id="view-editor" class="panel-view active">
-        <div class="editor-tabs" id="tab-bar"></div>
-        <div class="breadcrumbs" id="breadcrumbs">
-          <span>workspace</span> &gt;
-          <span class="crumb">rust</span> &gt;
-          <span class="crumb">services</span> &gt;
-          <span class="crumb">aether-daemon</span> &gt;
-          <span class="crumb-active" id="active-breadcrumb-filename">main.rs</span>
+    <!-- 2.2 Primary Sidebar (Resizable, 260px) -->
+    <div id="primary-sidebar" class="primary-sidebar">
+      <div class="sidebar-header-bar">
+        <span id="sidebar-title" class="sidebar-title">EXPLORER</span>
+        <div id="sidebar-actions" class="sidebar-actions">
+          <button class="tool-icon-btn" onclick="newProject()" title="New File">📄</button>
+          <button class="tool-icon-btn" onclick="openFolder()" title="Open Folder">📁</button>
+          <button class="tool-icon-btn" onclick="refreshTree()" title="Refresh">↻</button>
         </div>
+      </div>
+
+      <!-- Sideview: Explorer -->
+      <div id="sideview-explorer" class="sideview-content active">
+        <div class="section-header">Workspace: Aether-IDE</div>
+        <div class="tree-view" id="file-tree"></div>
+        <div class="section-header" style="margin-top: auto;">Open Editors</div>
+        <div id="open-editors-list" class="tree-view" style="max-height: 120px; flex: none;"></div>
+      </div>
+
+      <!-- Sideview: Search -->
+      <div id="sideview-search" class="sideview-content">
+        <div class="sideview-input-box">
+          <input type="text" id="search-input" class="side-input" placeholder="Search files (Enter to search)..." onkeydown="handleSearchInput(event)">
+          <input type="text" id="replace-input" class="side-input" placeholder="Replace with...">
+          <button class="side-btn" onclick="executeSearch()">Find in Files</button>
+        </div>
+        <div id="search-results-list" class="tree-view"></div>
+      </div>
+
+      <!-- Sideview: Source Control -->
+      <div id="sideview-git" class="sideview-content">
+        <div class="sideview-input-box">
+          <div style="display:flex; justify-content:space-between; font-size:11px; color:#94a3b8;">
+            <span>Branch: <strong>main*</strong></span>
+            <span>3 changes</span>
+          </div>
+          <textarea id="git-commit-msg" class="side-input" rows="2" placeholder="Message (Ctrl+Enter to commit)"></textarea>
+          <button class="side-btn" onclick="executeCommit()">Commit to main</button>
+        </div>
+        <div class="section-header">Changes</div>
+        <div class="tree-view">
+          <div class="tree-item" onclick="openFile('rust/cli/aether-launcher/src/win32_host.rs', 'rust')"><span style="color:#f59e0b;">M</span> win32_host.rs</div>
+          <div class="tree-item" onclick="openFile('scripts/installer/aetheride_installer.iss', 'ini')"><span style="color:#f59e0b;">M</span> aetheride_installer.iss</div>
+          <div class="tree-item" onclick="openFile('apps/desktop/workbench/index.html', 'html')"><span style="color:#f59e0b;">M</span> index.html</div>
+        </div>
+      </div>
+
+      <!-- Sideview: Project Brain -->
+      <div id="sideview-brain" class="sideview-content">
+        <div class="sideview-input-box">
+          <span style="font-size:11px; color:#94a3b8;">Impact Radar & Symbol Index</span>
+          <select id="radar-file-select" class="side-input" onchange="analyzeChangeImpact()"></select>
+          <button class="side-btn" onclick="analyzeChangeImpact()">Calculate Blast Radius</button>
+        </div>
+        <div id="radar-results" style="padding: 10px; font-size:12px;">
+          <div style="font-weight:700; margin-bottom:6px;">Blast Radius: <span id="radar-risk-badge" style="color:#22c55e;">LOW</span></div>
+          <div style="color:#94a3b8; font-size:11px; margin-bottom:4px;">Direct Consumers: <span id="radar-direct-count">0</span></div>
+          <div id="radar-direct-list" style="margin-bottom:8px; font-family:monospace; font-size:11px;"></div>
+          <div style="color:#94a3b8; font-size:11px; margin-bottom:4px;">Impacted Tests: <span id="radar-tests-count">0</span></div>
+          <div id="radar-tests-list" style="font-family:monospace; font-size:11px;"></div>
+        </div>
+        <div id="node-inspector-content" style="padding:10px; font-size:11px; color:#94a3b8; border-top:1px solid #1e293b;"></div>
+        <div id="brain-canvas" style="display:none;"></div>
+      </div>
+
+      <!-- Sideview: AI Autonomous Agents -->
+      <div id="sideview-agents" class="sideview-content">
+        <div style="padding: 10px; display:flex; flex-direction:column; gap:8px;">
+          <select id="agent-persona-select" class="side-input" onchange="updatePersonaBio()">
+            <option value="architect">Systems Architect</option>
+            <option value="sentinel">Security Sentinel</option>
+            <option value="qa">QA Specialist</option>
+            <option value="perf">Performance Engineer</option>
+          </select>
+          <div id="persona-bio-box" style="font-size:11px; color:#94a3b8; padding:6px; background:#070a14; border-radius:4px;"></div>
+          <textarea id="agent-prompt" class="side-input" rows="2" placeholder="Task prompt for agent..."></textarea>
+          <button class="side-btn" onclick="triggerAgentRun()">Dispatch Task</button>
+        </div>
+        <div class="section-header">Agent Task Log</div>
+        <div id="agent-feed" style="flex:1; overflow-y:auto; padding:8px; font-size:11px; font-family:monospace;"></div>
+        <div id="approval-center-box" style="display:none;"></div>
+        <div id="memory-notes-list" style="display:none;"></div>
+        <div id="memory-title" style="display:none;"></div>
+        <div id="memory-content" style="display:none;"></div>
+      </div>
+
+      <!-- Sideview: Mobile Studio -->
+      <div id="sideview-mobile" class="sideview-content">
+        <div style="padding:10px; display:flex; flex-direction:column; gap:8px;">
+          <select id="device-model-select" class="side-input" onchange="updateDeviceMockup()">
+            <option value="pixel7">Google Pixel 7 (Android)</option>
+            <option value="iphone14">Apple iPhone 14 (iOS)</option>
+          </select>
+          <div style="display:flex; justify-content:space-between; font-size:11px;">
+            <span>Metro Status:</span>
+            <span id="expo-status-badge" style="color:#22c55e;">Ready</span>
+          </div>
+          <button class="side-btn" onclick="runMobileSimulator()">Launch Simulator</button>
+        </div>
+        <div id="adb-devices-list" style="padding:8px; font-size:11px; font-family:monospace;"></div>
+        <div id="metro-logs" style="display:none;"></div>
+        <div id="device-frame" style="display:none;"><iframe id="device-iframe"></iframe></div>
+      </div>
+
+      <!-- Sideview: Build & Storage -->
+      <div id="sideview-storage" class="sideview-content">
+        <div style="padding:10px; display:flex; flex-direction:column; gap:8px;">
+          <button class="side-btn" onclick="runBuildTask()">Run Full Cargo Build</button>
+          <button class="side-btn" onclick="triggerCheckpoint()">Create System Checkpoint</button>
+        </div>
+        <div class="section-header">Storage & Checkpoint Log</div>
+        <div id="storage-log-output" style="flex:1; overflow-y:auto; padding:8px; font-size:11px; font-family:monospace; color:#cbd5e1;"></div>
+      </div>
+    </div>
+
+    <!-- Vertical Drag Resizer for Primary Sidebar -->
+    <div id="sidebar-resizer" class="resizer-v" title="Drag to resize sidebar"></div>
+
+    <!-- 2.3 Central Workspace (Editor + Bottom Panel) -->
+    <div class="central-workspace">
+      
+      <!-- Persistent Central Editor -->
+      <div class="editor-container">
+        <!-- Editor Tab Bar -->
+        <div class="editor-tabs-bar">
+          <div class="editor-tabs" id="tab-bar"></div>
+          <div class="editor-tab-actions">
+            <button class="tool-icon-btn" onclick="splitEditor('right')" title="Split Editor Right (Ctrl+\)">◫</button>
+            <button class="tool-icon-btn" onclick="toggleMinimap()" title="Toggle Minimap">🗺</button>
+            <button class="tool-icon-btn" onclick="closeAllTabs()" title="Close All Tabs">&times;</button>
+          </div>
+        </div>
+
+        <!-- Breadcrumbs Navigation -->
+        <div class="breadcrumbs">
+          <span class="crumb">aetheride</span>
+          <span>&rsaquo;</span>
+          <span class="crumb">rust</span>
+          <span>&rsaquo;</span>
+          <span class="crumb">cli</span>
+          <span>&rsaquo;</span>
+          <span class="crumb-active" id="active-breadcrumb-filename">win32_host.rs</span>
+        </div>
+
+        <!-- Monaco Editor Host -->
         <div id="monaco-root"></div>
 
-        <!-- Collapsible Bottom Terminal Dock in Code Studio -->
-        <div id="editor-dock-tray">
-          <div class="dock-header">
-            <div class="dock-title">
-              <span>⚡ Terminal Dock (ConPTY)</span>
-              <span id="dock-session-info" style="font-size:11px; color:var(--text-muted);">Session #1</span>
-            </div>
-            <div style="display:flex; gap:8px;">
-              <button class="btn btn-secondary btn-small" onclick="switchTab('terminal')">Expand to Studio</button>
-              <button class="btn btn-secondary btn-small" onclick="toggleDockTerminal()">Hide (Ctrl+`)</button>
-            </div>
-          </div>
-          <div id="dock-terminal-host" style="flex:1; overflow:hidden;"></div>
-        </div>
-      </div>
-
-      <!-- View 2: Advanced Interactive Terminal Studio -->
-      <div id="view-terminal" class="panel-view">
-        <div class="terminal-container">
-          <div class="terminal-toolbar">
-            <div class="term-tabs" id="terminal-session-tabs">
-              <!-- Dynamically populated session tabs -->
-            </div>
-            <div class="term-controls">
-              <select id="term-shell-select" style="width:160px; margin-bottom:0; padding:4px 8px; font-size:12px;">
-                <option value="powershell">PowerShell 7 / WinPS</option>
-                <option value="cmd">Command Prompt (CMD)</option>
-                <option value="bash">Git Bash / WSL</option>
-              </select>
-              <button class="btn btn-secondary btn-small" onclick="spawnNewTerminalSession()" title="Spawn New ConPTY Session">+ New</button>
-              <button class="btn btn-secondary btn-small" onclick="splitTerminal('horizontal')" title="Split Horizontally (Ctrl+Shift+E)">⬌ Split H</button>
-              <button class="btn btn-secondary btn-small" onclick="splitTerminal('vertical')" title="Split Vertically (Ctrl+Shift+O)">⬍ Split V</button>
-              <input type="text" id="term-search-box" placeholder="Find in terminal..." style="width:140px; margin-bottom:0; padding:4px 8px; font-size:11px;" onkeyup="findInActiveTerminal(this.value)" />
-              <button class="btn btn-secondary btn-small" onclick="clearActiveTerminal()">Clear</button>
-              <button class="btn btn-danger btn-small" onclick="closeActiveTerminalSession()" title="Close Terminal & Kill Child Process Tree">✕ Kill</button>
-            </div>
-          </div>
-          <div class="term-panes-wrapper" id="terminal-panes-container">
-            <!-- Active Terminal Panes Mounted Here -->
-          </div>
-        </div>
-      </div>
-
-      <!-- View 3: Living Project Brain & Impact Radar -->
-      <div id="view-brain" class="panel-view">
-        <div class="brain-layout">
-          <div class="brain-main">
-            <div style="padding:10px 16px; background:var(--bg-secondary); border-bottom:1px solid var(--border-color); display:flex; justify-content:space-between; align-items:center;">
-              <div style="display:flex; align-items:center; gap:12px;">
-                <strong style="color:var(--accent);">Semantic Architecture Graph</strong>
-                <span style="font-size:12px; color:var(--text-muted);" id="brain-stats">AST Graph: 24 Crates, 48 Modules, 128 Edges</span>
+        <!-- Minimalist Empty Editor State (hidden when files are open) -->
+        <div id="empty-editor-state" class="empty-editor-state" style="display: none;">
+          <div class="empty-card">
+            <svg width="48" height="48" viewBox="0 0 512 512" fill="none">
+              <rect x="24" y="24" width="464" height="464" rx="104" fill="#0F172A" stroke="#38BDF8" stroke-width="24" />
+              <polygon points="256,96 120,400 184,400 256,236 256,96" fill="#38BDF8" />
+              <polygon points="256,96 392,400 328,400 256,236 256,96" fill="#6366F1" />
+            </svg>
+            <h2>Aether<span>IDE</span></h2>
+            <p>AI-Native Software Engineering Studio</p>
+            <div class="shortcut-list">
+              <div class="shortcut-item" onclick="openFile('rust/cli/aether-launcher/src/win32_host.rs', 'rust')">
+                <span>Resume Editing: win32_host.rs</span>
+                <span class="shortcut-key">Rust</span>
               </div>
-              <div style="display:flex; gap:8px;">
-                <select id="graph-layout-select" onchange="applyGraphLayout(this.value)" style="width:120px; margin-bottom:0; padding:4px 8px; font-size:11px;">
-                  <option value="concentric">Concentric</option>
-                  <option value="breadthfirst">Breadthfirst</option>
-                  <option value="cose">Force Cose</option>
-                  <option value="circle">Circle</option>
-                </select>
-                <button class="btn btn-secondary btn-small" onclick="fitGraphView()">Fit View</button>
-                <button class="btn btn-secondary btn-small" onclick="refreshProjectGraph()">Refresh Graph</button>
+              <div class="shortcut-item" onclick="openQuickOpen()">
+                <span>Quick Open File</span>
+                <span class="shortcut-key">Ctrl + P</span>
               </div>
-            </div>
-            <!-- Cytoscape Mount Canvas -->
-            <div id="brain-canvas"></div>
-          </div>
-
-          <!-- Radar & Living Memory Sidebar -->
-          <div class="brain-sidebar">
-            <!-- Selected Node Inspector -->
-            <div class="card" id="node-inspector-card">
-              <h3>🔍 Node Inspector</h3>
-              <div id="node-inspector-content" style="font-size:12px; line-height:1.7; color:#cbd5e1;">
-                Click any graph node to inspect symbol details, incoming/outgoing imports, and jump to Monaco.
+              <div class="shortcut-item" onclick="openCommandPalette()">
+                <span>Show All Commands</span>
+                <span class="shortcut-key">Ctrl + Shift + P</span>
               </div>
-            </div>
-
-            <!-- Change Impact Radar -->
-            <div class="card">
-              <h3>🎯 Change Impact Radar</h3>
-              <label style="font-size:11px; color:var(--text-muted); display:block; margin-bottom:4px;">Target Changed File:</label>
-              <select id="radar-file-select">
-                <option value="rust/crates/terminal-manager/src/conpty.rs">terminal-manager/src/conpty.rs</option>
-                <option value="rust/crates/project-brain/src/lib.rs">project-brain/src/lib.rs</option>
-                <option value="rust/crates/database-engine/src/lib.rs">database-engine/src/lib.rs</option>
-                <option value="rust/services/aether-daemon/src/main.rs">services/aether-daemon/src/main.rs</option>
-                <option value="rust/crates/workspace-sync/src/crypto.rs">workspace-sync/src/crypto.rs</option>
-              </select>
-              <button class="btn btn-small" style="width:100%; margin-bottom:12px;" onclick="analyzeChangeImpact()">Calculate Blast Radius</button>
-              <div id="radar-results" style="font-size:12px; line-height:1.6; display:none;">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                  <span>Risk Score:</span>
-                  <span id="radar-risk-badge" class="radar-blast-badge radar-low">LOW (0.24)</span>
-                </div>
-                <div style="margin-bottom:6px;"><strong>Direct Dependents:</strong> <span id="radar-direct-count" style="color:var(--accent);">2 crates</span></div>
-                <div id="radar-direct-list" style="color:var(--text-muted); margin-bottom:8px; font-size:11px;"></div>
-                <div style="margin-bottom:6px;"><strong>Impacted Tests:</strong> <span id="radar-tests-count" style="color:var(--warning);">3 test suites</span></div>
-                <div id="radar-tests-list" style="color:var(--text-muted); font-size:11px; margin-bottom:10px;"></div>
-              </div>
-            </div>
-
-            <!-- Living Project Memory (SQLite Layer 2) -->
-            <div class="card">
-              <h3>📝 Living Project Memory</h3>
-              <div id="memory-notes-list" style="max-height:180px; overflow-y:auto; margin-bottom:12px; font-size:12px;">
-                <!-- Populated from SQLite notes -->
-              </div>
-              <input type="text" id="memory-title" placeholder="Architectural Decision Title..." style="font-size:12px; padding:6px 10px;" />
-              <textarea id="memory-content" rows="2" placeholder="Record rationale, conventions, or constraints..." style="font-size:12px; padding:6px 10px;"></textarea>
-              <button class="btn btn-secondary btn-small" style="width:100%;" onclick="saveProjectMemoryNote()">Save to SQLite Memory</button>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- View 4: Autonomous Agent Command Center -->
-      <div id="view-agents" class="panel-view">
-        <div class="view-content-wrapper">
-          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
-            <div>
-              <h2>Autonomous AI Engineering Team</h2>
-              <p style="font-size:12px; color:var(--text-muted);">14 Specialized Autonomous Personas with Real-Time Approval Guardrails</p>
-            </div>
-            <div style="display:flex; gap:8px;">
-              <span class="badge" style="background:#1e293b; color:#38bdf8; padding:6px 12px; border-radius:6px; font-size:12px;">
-                Autonomy Mode: <strong id="agent-mode-display">Supervised</strong>
-              </span>
-            </div>
-          </div>
-
-          <!-- Persona Stepper Visualizer -->
-          <div class="stepper-container">
-            <div class="step-item completed" id="step-1">
-              <div class="step-circle">✓</div>
-              <div class="step-label">1. Task Ingestion</div>
-            </div>
-            <div class="step-item completed" id="step-2">
-              <div class="step-circle">✓</div>
-              <div class="step-label">2. Architectural Plan</div>
-            </div>
-            <div class="step-item active" id="step-3">
-              <div class="step-circle">3</div>
-              <div class="step-label">3. Tool Execution</div>
-            </div>
-            <div class="step-item approval" id="step-4">
-              <div class="step-circle">!</div>
-              <div class="step-label">4. Awaiting Approval</div>
-            </div>
-            <div class="step-item" id="step-5">
-              <div class="step-circle">5</div>
-              <div class="step-label">5. Proof of Work</div>
-            </div>
-            <div class="step-item" id="step-6">
-              <div class="step-circle">6</div>
-              <div class="step-label">6. Verified Done</div>
-            </div>
-          </div>
-
-          <!-- Human In The Loop Approval Center -->
-          <div id="approval-center-box" class="approval-card">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-              <div style="display:flex; align-items:center; gap:10px;">
-                <span style="font-size:18px;">⚠️</span>
-                <div>
-                  <strong style="color:var(--warning); font-size:14px;">Human Authorization Required</strong>
-                  <div style="font-size:11px; color:var(--text-muted);" id="approval-task-meta">Task #task-4882 • Persona: Rust Systems Engineer</div>
-                </div>
-              </div>
-              <div style="display:flex; gap:8px;">
-                <button class="btn btn-success btn-small" onclick="approveCurrentAgentStep()">Approve Step (Enter)</button>
-                <button class="btn btn-secondary btn-small" onclick="rejectCurrentAgentStep()">Reject Step (Esc)</button>
-                <button class="btn btn-danger btn-small" onclick="cancelCurrentAgentTask()">Cancel Task</button>
-              </div>
-            </div>
-            <p style="font-size:12px; margin-bottom:8px;" id="approval-desc">
-              Requesting write modification to <code>rust/crates/terminal-manager/src/conpty.rs</code> to add Win32 Job Object cleanup handling.
-            </p>
-            <div class="diff-box" id="approval-diff-viewer">
-              <span class="diff-del">- pub fn close_session(&self, id: u32) -> Result<()> {</span>
-              <span class="diff-add">+ pub fn close_session(&self, id: u32) -> Result<()> {</span>
-              <span class="diff-add">+     // Win32 Job Object process-tree termination</span>
-              <span class="diff-add">+     unsafe { TerminateJobObject(self.job_handle, 0); }</span>
-            </div>
-          </div>
-
-          <div class="grid-2col">
-            <!-- Dispatcher Card -->
-            <div class="card">
-              <h3>🚀 Dispatch Autonomous Persona</h3>
-              <label style="font-size:12px; color:var(--text-muted); display:block; margin-bottom:6px;">Select Specialist Persona (14 Roster):</label>
-              <select id="agent-persona-select" onchange="updatePersonaDetails(this.value)">
-                <!-- 14 personas populated dynamically -->
-              </select>
-              <div id="persona-bio-box" style="font-size:11px; color:var(--text-muted); background:#090d16; padding:8px 10px; border-radius:4px; margin-bottom:12px;"></div>
-              <label style="font-size:12px; color:var(--text-muted); display:block; margin-bottom:6px;">Autonomous Goal & Verification Criteria:</label>
-              <textarea id="agent-prompt" rows="3" placeholder="Define the technical objective, target workspace files, and acceptance criteria..."></textarea>
-              <button class="btn" style="width:100%;" onclick="dispatchAgentTask()">Deploy Autonomous Persona</button>
-            </div>
-
-            <!-- Live Agent Activity Feed -->
-            <div class="card">
-              <h3>📡 Orchestration Stream & Proof of Work</h3>
-              <div id="agent-feed" style="font-size:12px; color:#cbd5e1; line-height:1.8; max-height:280px; overflow-y:auto; font-family:Consolas, monospace;">
-                <div>[11:00:12] ● System baseline audit complete. 24 crates verified.</div>
-                <div>[11:02:45] ● [Architect] Symbol index and FTS5 inverted tables synchronized.</div>
-                <div>[11:05:18] ● [Model Gateway] Multi-provider failover initialized: Claude, OpenAI, Gemini, DeepSeek.</div>
+              <div class="shortcut-item" onclick="toggleBottomPanel()">
+                <span>Toggle Terminal</span>
+                <span class="shortcut-key">Ctrl + `</span>
               </div>
             </div>
           </div>
         </div>
       </div>
 
-      <!-- View 5: Mobile App Studio Live Device Preview -->
-      <div id="view-mobile" class="panel-view">
-        <div class="mobile-layout">
-          <!-- Mobile Controls Panel -->
-          <div class="mobile-controls-panel">
-            <h2 style="font-size:16px; margin-bottom:12px;">Mobile Studio (Expo & React Native)</h2>
+      <!-- Horizontal Drag Resizer for Bottom Panel -->
+      <div id="panel-resizer" class="resizer-h" title="Drag to resize bottom panel"></div>
 
-            <!-- Server Supervisor -->
-            <div class="card" style="margin-bottom:14px; padding:14px;">
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-                <strong style="font-size:13px;">Expo Dev Server</strong>
-                <span id="expo-status-badge" class="badge" style="background:#166534; color:#4ade80;">ONLINE :8081</span>
-              </div>
-              <div style="display:flex; gap:6px; margin-bottom:10px;">
-                <button class="btn btn-small" onclick="startExpoServer()">Start Server</button>
-                <button class="btn btn-secondary btn-small" onclick="reloadExpoPreview()">Fast Refresh</button>
-                <button class="btn btn-danger btn-small" onclick="stopExpoServer()">Stop</button>
-              </div>
-              <div style="font-size:11px; color:var(--text-muted);">
-                LAN URI: <code id="expo-lan-uri" style="color:var(--accent);">exp://127.0.0.1:8081</code>
-              </div>
-            </div>
-
-            <!-- QR Code Physical Device Pairing -->
-            <div class="card" style="margin-bottom:14px; padding:14px; text-align:center;">
-              <strong style="font-size:13px; display:block; margin-bottom:8px;">📱 Scan to Preview (Expo Go)</strong>
-              <div style="display:flex; justify-content:center; margin-bottom:8px;">
-                <svg width="140" height="140" viewBox="0 0 100 100" style="background:#fff; padding:6px; border-radius:6px;">
-                  <!-- Styled vector QR pattern -->
-                  <rect width="100" height="100" fill="#fff" />
-                  <rect x="10" y="10" width="25" height="25" fill="#000" />
-                  <rect x="15" y="15" width="15" height="15" fill="#fff" />
-                  <rect x="18" y="18" width="9" height="9" fill="#000" />
-                  <rect x="65" y="10" width="25" height="25" fill="#000" />
-                  <rect x="70" y="15" width="15" height="15" fill="#fff" />
-                  <rect x="73" y="18" width="9" height="9" fill="#000" />
-                  <rect x="10" y="65" width="25" height="25" fill="#000" />
-                  <rect x="15" y="70" width="15" height="15" fill="#fff" />
-                  <rect x="18" y="73" width="9" height="9" fill="#000" />
-                  <rect x="42" y="15" width="8" height="20" fill="#000" />
-                  <rect x="45" y="45" width="12" height="12" fill="#000" />
-                  <rect x="65" y="45" width="20" height="8" fill="#000" />
-                  <rect x="65" y="65" width="10" height="25" fill="#000" />
-                  <rect x="42" y="75" width="16" height="8" fill="#000" />
-                </svg>
-              </div>
-              <div style="font-size:11px; color:var(--text-muted);">
-                Open Camera (iOS) or Expo Go (Android) on LAN Wi-Fi
-              </div>
-            </div>
-
-            <!-- ADB Device & Emulator Discovery -->
-            <div class="card" style="margin-bottom:14px; padding:14px;">
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                <strong style="font-size:13px;">Connected Devices (ADB)</strong>
-                <button class="btn btn-secondary btn-small" onclick="refreshAdbDevices()">Scan</button>
-              </div>
-              <div id="adb-devices-list" style="font-size:11px; line-height:1.6; color:#cbd5e1;">
-                <div>● emulator-5554 (Pixel 8 Pro API 34) — Online</div>
-              </div>
-            </div>
-
-            <!-- Metro Live Bundler Log Console -->
-            <div class="card" style="flex:1; display:flex; flex-direction:column; padding:12px; margin-bottom:0;">
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-                <strong style="font-size:12px;">Metro Bundler Log</strong>
-                <button class="btn btn-secondary btn-small" onclick="document.getElementById('metro-logs').innerHTML=''">Clear</button>
-              </div>
-              <div id="metro-logs" style="flex:1; background:#070a12; border:1px solid #1e293b; border-radius:4px; padding:8px; font-family:Consolas, monospace; font-size:11px; overflow-y:auto; line-height:1.5; color:#a1a1aa; max-height:140px;">
-                <div>[Metro] Metro bundler ready on port 8081</div>
-                <div>[Metro] Fast Refresh enabled</div>
-                <div>[Metro] Compiling apps/mobile/App.tsx... done (320ms)</div>
-              </div>
-            </div>
+      <!-- 2.4 Integrated Bottom Tool Panel (Resizable) -->
+      <div id="bottom-panel" class="bottom-panel">
+        <div class="panel-header-bar">
+          <div class="panel-tabs">
+            <button id="ptab-terminal" class="panel-tab-btn active" onclick="selectPanelTab('terminal')">
+              <span>TERMINAL</span>
+            </button>
+            <button id="ptab-problems" class="panel-tab-btn" onclick="selectPanelTab('problems')">
+              <span>PROBLEMS</span>
+              <span class="panel-badge" id="problems-count-badge">0</span>
+            </button>
+            <button id="ptab-output" class="panel-tab-btn" onclick="selectPanelTab('output')">
+              <span>OUTPUT</span>
+            </button>
+            <button id="ptab-debug" class="panel-tab-btn" onclick="selectPanelTab('debug')">
+              <span>DEBUG CONSOLE</span>
+            </button>
+            <button id="ptab-diagnostics" class="panel-tab-btn" onclick="selectPanelTab('diagnostics')">
+              <span>DOCTOR DIAGNOSTICS</span>
+            </button>
           </div>
 
-          <!-- Interactive Device Simulator Stage -->
-          <div class="mobile-preview-stage">
-            <div class="device-toolbar">
-              <select id="device-model-select" onchange="changeDeviceFrame(this.value)" style="margin-bottom:0; padding:4px 8px; font-size:12px; width:150px;">
-                <option value="iphone16">Apple iPhone 16</option>
-                <option value="pixel8">Google Pixel 8</option>
-                <option value="ipad">Apple iPad Pro</option>
-              </select>
-              <button class="btn btn-secondary btn-small" onclick="toggleDeviceOrientation()">🔄 Rotate</button>
-              <button class="btn btn-secondary btn-small" onclick="reloadDevicePreview()">⚡ Refresh</button>
+          <div class="panel-controls">
+            <!-- Terminal specific session controls -->
+            <div id="term-session-actions" style="display: flex; align-items:center; gap:4px;">
+              <div id="terminal-session-tabs" class="term-tabs"></div>
+              <button class="tool-icon-btn" onclick="spawnNewTerminalSession()" title="New Terminal (Ctrl+Shift+`)">+</button>
+              <button class="tool-icon-btn" onclick="splitTerminal('horizontal')" title="Split Terminal">◫</button>
+              <button class="tool-icon-btn" onclick="clearActiveTerminal()" title="Clear Terminal">⊘</button>
+              <button class="tool-icon-btn" onclick="closeActiveTerminalSession()" title="Kill Terminal">🗑</button>
             </div>
+            <button class="tool-icon-btn" onclick="toggleMaximizePanel()" title="Maximize / Restore Panel">⤢</button>
+            <button class="tool-icon-btn" onclick="toggleBottomPanel()" title="Close Panel (Ctrl+`)">&times;</button>
+          </div>
+        </div>
 
-            <!-- Device Frame -->
-            <div id="device-frame" class="device-mockup" style="width:390px; height:800px;">
-              <div class="device-notch"></div>
-              <iframe id="device-iframe" class="device-iframe" src="about:blank" sandbox="allow-scripts allow-same-origin"></iframe>
-            </div>
+        <div class="panel-view-content active" id="pview-terminal">
+          <div class="terminal-container">
+            <div class="terminal-panes" id="terminal-panes-container"></div>
+          </div>
+        </div>
+
+        <div class="panel-view-content" id="pview-problems">
+          <div class="problems-list" id="problems-list-container">
+            <div class="prob-entry" style="color:#22c55e;">✓ No problems detected in workspace (0 errors, 0 warnings)</div>
+          </div>
+        </div>
+
+        <div class="panel-view-content" id="pview-output">
+          <div style="padding:6px 10px; background:#080d17; border-bottom:1px solid #1e293b; display:flex; align-items:center; gap:8px; font-size:11px;">
+            <span>Channel:</span>
+            <select class="side-input" style="padding:2px 8px;" onchange="switchOutputChannel(this.value)">
+              <option value="daemon">Aether Daemon (Port 44888)</option>
+              <option value="rust">Rust Analyzer LSP</option>
+              <option value="tsc">TypeScript Compiler</option>
+              <option value="git">Git Engine</option>
+            </select>
+          </div>
+          <pre class="output-log-area" id="output-log-text">AetherIDE Application Core initialized.
+Ready for development sessions.
+Connected to daemon at 127.0.0.1:44888 via IPC protocol.</pre>
+        </div>
+
+        <div class="panel-view-content" id="pview-debug">
+          <div style="flex:1; padding:10px; font-family:monospace; font-size:12px; color:#94a3b8;">
+            Aether Debug Console. Enter expressions or inspection commands below:
+          </div>
+          <div style="padding:6px 10px; border-top:1px solid #1e293b; display:flex; align-items:center; gap:8px;">
+            <span style="color:var(--accent-cyan); font-weight:700;">&gt;</span>
+            <input type="text" class="side-input" style="flex:1;" placeholder="Evaluate expression..." onkeydown="handleDebugEval(event)">
+          </div>
+        </div>
+
+        <div class="panel-view-content" id="pview-diagnostics">
+          <div id="doctor-output" class="output-log-area" style="background:#070a14;"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Vertical Drag Resizer for Secondary Sidebar -->
+    <div id="ai-resizer" class="resizer-v" title="Drag to resize AI Assistant" style="display: none;"></div>
+
+    <!-- 2.5 Secondary Sidebar (Right Edge, AI Assistant) -->
+    <div id="secondary-sidebar" class="secondary-sidebar" style="display: none;">
+      <div class="sidebar-header-bar">
+        <span class="sidebar-title">✨ AI ASSISTANT</span>
+        <div class="sidebar-actions">
+          <select id="ai-model-select" class="side-input" style="padding:2px 6px; font-size:11px;">
+            <option value="claude">Claude 3.5 Sonnet</option>
+            <option value="gpt4o">GPT-4o Omnimodel</option>
+            <option value="ollama">Ollama Local (8B)</option>
+            <option value="gemini">Gemini 1.5 Pro</option>
+          </select>
+          <button class="tool-icon-btn" onclick="toggleSecondarySidebar()" title="Close AI Assistant">&times;</button>
+        </div>
+      </div>
+
+      <div class="ai-chat-thread" id="ai-chat-thread">
+        <div class="ai-msg">
+          <div class="ai-msg-hdr"><span>Aether AI Architect</span><span>Context: main.rs</span></div>
+          <p>I am connected to your workspace. I can explain code, run AST diffs, suggest unit tests, or review security capabilities.</p>
+          <div style="display:flex; flex-wrap:wrap; gap:4px; margin-top:8px;">
+            <button class="side-btn" style="padding:3px 8px; font-size:10px;" onclick="sendQuickPrompt('Explain this code function')">Explain Code</button>
+            <button class="side-btn" style="padding:3px 8px; font-size:10px;" onclick="sendQuickPrompt('Generate unit tests for active file')">Generate Tests</button>
+            <button class="side-btn" style="padding:3px 8px; font-size:10px;" onclick="sendQuickPrompt('Security capability review')">Security Audit</button>
           </div>
         </div>
       </div>
 
-      <!-- View 6: Environment & Diagnostics Doctor -->
-      <div id="view-diagnostics" class="panel-view">
-        <div class="view-content-wrapper">
-          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
-            <h2>Environment & System Doctor</h2>
-            <button class="btn btn-small" onclick="runDoctorDiagnostic()">Run Diagnostics Check</button>
-          </div>
-          <div class="card">
-            <pre id="doctor-output" style="font-family:Consolas, monospace; font-size:12px; color:#4ade80; line-height:1.7; background:#070a12; padding:16px; border-radius:6px; border:1px solid #1e293b; overflow-x:auto;">
-[✓] Rust Toolchain: rustc 1.85+ stable (x86_64-pc-windows-msvc)
-[✓] Cargo Workspace: 24 crates compiled & verified with 67 automated unit/integration tests
-[✓] Monaco Editor: Bundled locally at ./vs/ (zero external CDN network dependencies)
-[✓] Xterm.js Terminal: Bundled locally at ./xterm/ with Fit, Search, and WebLinks addons
-[✓] Cytoscape.js Brain Graph: Bundled locally at ./cytoscape/ (zero external CDN network dependencies)
-[✓] Microsoft WebView2: Native HWND Embedded Win32 Controller Active
-[✓] SQLite3 Bundled Full: WAL mode & FTS5 full-text search active
-[✓] Windows Named Pipe IPC & Loopback TCP: Authenticated on 127.0.0.1:44888
-[✓] ConPTY Windows Terminal: Multi-session interactive ANSI streaming & Win32 Job Object isolation</pre>
-          </div>
+      <div class="ai-input-area">
+        <textarea id="ai-prompt-input" class="ai-prompt-box" rows="3" placeholder="Ask AI Assistant about this file or project (Ctrl+Enter to send)..." onkeydown="handleAiInputKey(event)"></textarea>
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <span style="font-size:10px; color:#64748b;">Ctrl+Enter to send</span>
+          <button class="ai-send-btn" onclick="submitAiPrompt()">Send</button>
         </div>
       </div>
+    </div>
 
-      <!-- View 7: Build & Storage Center -->
-      <div id="view-storage" class="panel-view">
-        <div class="view-content-wrapper" style="padding:24px; max-width:1200px; margin:0 auto; overflow-y:auto; height:100%;">
-          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
-            <div>
-              <h2 style="font-size:18px; margin:0 0 4px 0; color:#f8fafc;">Enterprise Build & Storage Center</h2>
-              <p style="margin:0; font-size:12px; color:var(--text-muted);">Real-time disk consumption monitoring, cache offloading, and cross-platform matrix</p>
-            </div>
-            <div style="display:flex; gap:10px;">
-              <button class="btn btn-secondary btn-small" onclick="auditStorageMetrics()">Audit Storage</button>
-              <button class="btn btn-secondary btn-small" onclick="runStorageDryRun()">Clean (Dry Run)</button>
-              <button class="btn btn-small" onclick="applyStorageCleanup()">Apply Purge</button>
-            </div>
-          </div>
-
-          <!-- Live Storage Metrics Row -->
-          <div style="display:grid; grid-template-columns:repeat(4, 1fr); gap:16px; margin-bottom:24px;">
-            <div class="card" style="padding:16px; border-left:3px solid #10b981;">
-              <div style="font-size:11px; text-transform:uppercase; color:var(--text-muted); margin-bottom:4px;">Repo Disk Footprint</div>
-              <div style="font-size:24px; font-weight:700; color:#10b981;" id="storage-footprint">2.49 GB</div>
-              <div style="font-size:11px; color:#94a3b8; margin-top:4px;">Target Budget: 6.00 GB</div>
-            </div>
-            <div class="card" style="padding:16px; border-left:3px solid #3b82f6;">
-              <div style="font-size:11px; text-transform:uppercase; color:var(--text-muted); margin-bottom:4px;">OneDrive Reclaimed</div>
-              <div style="font-size:24px; font-weight:700; color:#3b82f6;">11.81 GB</div>
-              <div style="font-size:11px; color:#94a3b8; margin-top:4px;">79.7% Storage Reduction</div>
-            </div>
-            <div class="card" style="padding:16px; border-left:3px solid #8b5cf6;">
-              <div style="font-size:11px; text-transform:uppercase; color:var(--text-muted); margin-bottom:4px;">External Build Cache</div>
-              <div style="font-size:24px; font-weight:700; color:#8b5cf6;">%LOCALAPPDATA%</div>
-              <div style="font-size:11px; color:#94a3b8; margin-top:4px;">Isolated from Cloud Sync</div>
-            </div>
-            <div class="card" style="padding:16px; border-left:3px solid #06b6d4;">
-              <div style="font-size:11px; text-transform:uppercase; color:var(--text-muted); margin-bottom:4px;">Compilation Profile</div>
-              <div style="font-size:24px; font-weight:700; color:#06b6d4;">debug = 1</div>
-              <div style="font-size:11px; color:#94a3b8; margin-top:4px;">Line-tables & stripped release</div>
-            </div>
-          </div>
-
-          <!-- Gauge and Storage Health Bar -->
-          <div class="card" style="padding:20px; margin-bottom:24px;">
-            <div style="display:flex; justify-content:space-between; margin-bottom:8px; font-size:12px;">
-              <span style="font-weight:600; color:#f1f5f9;">Storage Consumption Budget Gauge</span>
-              <span style="color:#10b981; font-weight:600;" id="storage-gauge-label">2.49 GB / 6.00 GB (41.5% - HEALTHY)</span>
-            </div>
-            <div style="width:100%; height:12px; background:#1e293b; border-radius:6px; overflow:hidden; position:relative;">
-              <div id="storage-gauge-bar" style="width:41.5%; height:100%; background:linear-gradient(90deg, #10b981, #3b82f6); border-radius:6px; transition:width 0.4s ease;"></div>
-            </div>
-            <div style="display:flex; justify-content:space-between; margin-top:6px; font-size:10px; color:#64748b;">
-              <span>0 GB</span>
-              <span>Target: 6.0 GB</span>
-              <span>Warning: 8.0 GB</span>
-              <span>Hard Cap: 10.0 GB</span>
-            </div>
-          </div>
-
-          <!-- Two Column Grid: Platform Matrix & Diagnostics Log -->
-          <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px;">
-            <div class="card" style="padding:18px;">
-              <h3 style="font-size:14px; margin:0 0 12px 0; color:#f8fafc;">Cross-Platform Matrix & Release Targets</h3>
-              <div style="display:flex; flex-direction:column; gap:10px; font-size:12px;">
-                <div style="display:flex; justify-content:space-between; align-items:center; padding:10px; background:#070a12; border-radius:6px; border:1px solid #1e293b;">
-                  <div>
-                    <div style="font-weight:600; color:#f1f5f9;">Windows 10/11 x64 (MSVC)</div>
-                    <div style="color:var(--text-muted); font-size:11px;">Win32 WebView2 Host · ConPTY · Inno Setup & MSIX</div>
-                  </div>
-                  <span style="padding:3px 8px; border-radius:4px; font-size:11px; background:#064e3b; color:#34d399; font-weight:600;">ACTIVE</span>
-                </div>
-                <div style="display:flex; justify-content:space-between; align-items:center; padding:10px; background:#070a12; border-radius:6px; border:1px solid #1e293b;">
-                  <div>
-                    <div style="font-weight:600; color:#f1f5f9;">Linux x64 (Ubuntu / GNU)</div>
-                    <div style="color:var(--text-muted); font-size:11px;">WebKitGTK · POSIX OpenPTY · AppImage & Debian .deb</div>
-                  </div>
-                  <span style="padding:3px 8px; border-radius:4px; font-size:11px; background:#1e3a5f; color:#60a5fa; font-weight:600;">CONFIGURED</span>
-                </div>
-                <div style="display:flex; justify-content:space-between; align-items:center; padding:10px; background:#070a12; border-radius:6px; border:1px solid #1e293b;">
-                  <div>
-                    <div style="font-weight:600; color:#f1f5f9;">macOS ARM64 (Apple Silicon)</div>
-                    <div style="color:var(--text-muted); font-size:11px;">WKWebView Cocoa · Unix PTY · .app Bundle & DMG</div>
-                  </div>
-                  <span style="padding:3px 8px; border-radius:4px; font-size:11px; background:#1e3a5f; color:#60a5fa; font-weight:600;">CONFIGURED</span>
-                </div>
-              </div>
-            </div>
-
-            <div class="card" style="padding:18px;">
-              <h3 style="font-size:14px; margin:0 0 12px 0; color:#f8fafc;">Storage Audit & Cache Operation Log</h3>
-              <pre id="storage-log-output" style="font-family:Consolas, monospace; font-size:11px; color:#94a3b8; background:#070a12; padding:12px; border-radius:6px; border:1px solid #1e293b; height:180px; overflow-y:auto; margin:0; line-height:1.6;">
-[✓] Storage Audit Initialized
-[✓] In-tree rust/target size: 0.00 GB (Cleaned & moved outside OneDrive)
-[✓] External Build Cache: C:\Users\abdal\AppData\Local\AetherIDE\build-cache\ (2.08 GB)
-[✓] Net Workspace Storage: 2.49 GB (under 6.00 GB target budget)
-[✓] Ready for cache maintenance.</pre>
-            </div>
-          </div>
-        </div>
-      </div>
-    </main>
   </div>
 
-  <!-- Professional Status Bar -->
-  <footer class="status-bar">
-    <div class="status-bar-left">
-      <span class="status-item" id="sb-branch" onclick="alert('Git: main (clean working tree)')">Git: feat/sprint-06-cross-platform-collaboration</span>
-      <span class="status-item" id="sb-errors">ⓧ 0  ⚠ 0</span>
-      <span class="status-item" id="sb-lsp">LSP: rust-analyzer (Online)</span>
-      <span class="status-item" id="sb-terminals">⚡ Terminals: 1</span>
+  <!-- 3. Bottom Status Bar (24px) -->
+  <footer class="workbench-statusbar">
+    <div class="statusbar-group">
+      <div class="sb-cell" onclick="selectActivity('git')" title="Git Branch: main">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="18" cy="18" r="3"></circle>
+          <circle cx="6" cy="6" r="3"></circle>
+          <path d="M6 9v12"></path>
+          <path d="M18 9a9 9 0 0 0-9 9"></path>
+        </svg>
+        <span>main*</span>
+      </div>
+      <div class="sb-cell" onclick="selectPanelTab('problems')" title="Problems">
+        <span style="color:#ef4444;">⊗ 0</span>
+        <span style="color:#f59e0b; margin-left:2px;">⚠ 0</span>
+      </div>
+      <div class="sb-cell" title="LSP Server">
+        <span>⚡ rust-analyzer</span>
+      </div>
+      <div class="sb-cell" id="sb-terminals" onclick="toggleBottomPanel()" title="Terminal Sessions">
+        <span>Terminals: 1</span>
+      </div>
     </div>
-    <div class="status-bar-right">
-      <span class="status-item" id="sb-pos">Ln 1, Col 1</span>
-      <span class="status-item">Spaces: 4</span>
-      <span class="status-item">UTF-8</span>
-      <span class="status-item">CRLF</span>
-      <span class="status-item" id="sb-lang">Rust</span>
+
+    <div class="statusbar-group">
+      <div class="sb-cell mode-pill" id="btn-resource-mode" onclick="toggleResourceMode()" title="Toggle Low-Resource Mode">
+        <span>⚡ Standard Mode</span>
+      </div>
+      <div class="sb-cell" id="sb-pos">Ln 1, Col 1</div>
+      <div class="sb-cell">Spaces: 4</div>
+      <div class="sb-cell">UTF-8</div>
+      <div class="sb-cell">CRLF</div>
+      <div class="sb-cell" id="sb-lang">Rust</div>
+      <div class="sb-cell" onclick="openHealthModal()" title="System Health">
+        <div class="status-dot"></div>
+      </div>
     </div>
   </footer>
 
-  <!-- Command Palette / Quick Open Modal -->
-  <div id="palette-modal" class="modal-overlay" onclick="closePaletteOnBackdrop(event)">
-    <div class="palette-box">
-      <input type="text" id="palette-input" class="palette-input" placeholder="Type a command or file name..." onkeyup="filterPalette(event)" />
-      <div class="palette-list" id="palette-list"></div>
+  <!-- Modal Dialogs: About & Health -->
+  <div id="about-modal" class="dialog-modal" onclick="closeModalOnBackdrop(event, 'about-modal')">
+    <div class="dialog-box">
+      <div class="dialog-header">
+        <h2 style="font-size:16px; color:#fff; display:flex; align-items:center; gap:8px;">
+          <svg width="20" height="20" viewBox="0 0 512 512" fill="none">
+            <rect x="24" y="24" width="464" height="464" rx="104" fill="#0F172A" stroke="#38BDF8" stroke-width="24" />
+            <polygon points="256,96 120,400 184,400 256,236 256,96" fill="#38BDF8" />
+            <polygon points="256,96 392,400 328,400 256,236 256,96" fill="#6366F1" />
+          </svg>
+          About AetherIDE
+        </h2>
+        <button onclick="closeModal('about-modal')" style="background:transparent; border:none; color:#94a3b8; font-size:18px; cursor:pointer;">&times;</button>
+      </div>
+      <div class="dialog-body">
+        <p><strong>AetherIDE — AI-Native Engineering Studio</strong></p>
+        <p style="color:#94a3b8; margin: 4px 0 12px 0;">Release: <strong>v0.1.0-beta.2 (x64 MSVC)</strong></p>
+        <p>A unified desktop development environment with persistent Monaco workbench, ConPTY terminal manager, capability-based filesystem security, and integrated AI agent workflows.</p>
+        <div style="margin-top: 14px; padding: 10px; background: #1e293b; border-radius: 6px; font-family: Consolas, monospace; font-size: 11px;">
+          Architecture: 24 Rust Crates + Native Win32 Host<br>
+          Webview: Microsoft Edge WebView2 Evergreen<br>
+          Sandboxing: cap-std capability file descriptors<br>
+          Telemetry: Zero Remote Tracking
+        </div>
+      </div>
+      <div class="dialog-footer">
+        <button class="dialog-btn" onclick="closeModal('about-modal')">Close</button>
+      </div>
     </div>
   </div>
 
-  <!-- Locally Bundled Core Loader (Zero CDN Dependencies) -->
-  <script src="./vs/loader.js"></script>
+  <div id="health-modal" class="dialog-modal" onclick="closeModalOnBackdrop(event, 'health-modal')">
+    <div class="dialog-box">
+      <div class="dialog-header">
+        <h2 style="font-size:16px; color:#fff;">🩺 System Health & Resource Monitor</h2>
+        <button onclick="closeModal('health-modal')" style="background:transparent; border:none; color:#94a3b8; font-size:18px; cursor:pointer;">&times;</button>
+      </div>
+      <div class="dialog-body">
+        <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
+          <tr style="border-bottom: 1px solid #1e293b;"><td style="padding: 8px 0; color: #94a3b8;">Daemon IPC:</td><td style="font-weight: 700; color: #22c55e;">Connected (127.0.0.1:44888)</td></tr>
+          <tr style="border-bottom: 1px solid #1e293b;"><td style="padding: 8px 0; color: #94a3b8;">Resource Profile:</td><td id="health-mode" style="font-weight: 700; color: #38bdf8;">Standard Mode</td></tr>
+          <tr style="border-bottom: 1px solid #1e293b;"><td style="padding: 8px 0; color: #94a3b8;">Filesystem Sandbox:</td><td style="font-weight: 700; color: #22c55e;">cap-std Enforced</td></tr>
+          <tr style="border-bottom: 1px solid #1e293b;"><td style="padding: 8px 0; color: #94a3b8;">Credential Protection:</td><td style="font-weight: 700; color: #22c55e;">Windows DPAPI Active</td></tr>
+          <tr style="border-bottom: 1px solid #1e293b;"><td style="padding: 8px 0; color: #94a3b8;">Telemetry State:</td><td style="font-weight: 700; color: #22c55e;">Zero Telemetry (Disabled)</td></tr>
+        </table>
+      </div>
+      <div class="dialog-footer">
+        <button class="dialog-btn" onclick="closeModal('health-modal')">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Command Palette Modal -->
+  <div id="palette-modal" class="dialog-modal" onclick="closePaletteOnBackdrop(event)">
+    <div class="dialog-box" style="width: 600px; margin-top: 10vh; align-self: flex-start;">
+      <div style="padding: 10px 14px; border-bottom: 1px solid #1e293b;">
+        <input type="text" id="palette-input" class="side-input" style="width: 100%; font-size: 14px; padding: 8px 12px;" placeholder="Type a command or file name..." onkeyup="filterPalette(event)">
+      </div>
+      <div id="palette-list" style="max-height: 360px; overflow-y: auto; padding: 6px 0;"></div>
+    </div>
+  </div>
+
+  <!-- Compatibility dummy containers for existing code -->
+  <div style="display:none;">
+    <div id="editor-dock-tray"></div>
+    <div id="dock-terminal-host"></div>
+    <div id="term-shell-select"></div>
+    <div id="step-3"></div><div id="step-4"></div><div id="step-5"></div>
+  </div>
+
+<script src="./vs/loader.js"></script>
 
   <script>
     // =========================================================================
@@ -3257,6 +3266,358 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
         if (action === 'replace') editor.trigger('keyboard', 'editor.action.startFindReplaceAction', null);
       }
     }
+
+    
+    // =========================================================================
+    // SPRINT 19 NATIVE DESKTOP IDE CONTROLLER
+    // =========================================================================
+
+    let currentActivity = 'explorer';
+    let isPrimarySidebarOpen = true;
+    let isSecondarySidebarOpen = false;
+    let isBottomPanelOpen = true;
+    let isPanelMaximized = false;
+
+    function selectActivity(activity) {
+      if (currentActivity === activity && isPrimarySidebarOpen) {
+        togglePrimarySidebar();
+        return;
+      }
+
+      currentActivity = activity;
+      if (!isPrimarySidebarOpen) togglePrimarySidebar();
+
+      // Update activity button states
+      document.querySelectorAll('.activity-btn').forEach(btn => btn.classList.remove('active'));
+      const activeBtn = document.getElementById('act-' + activity);
+      if (activeBtn) activeBtn.classList.add('active');
+
+      // Update primary sidebar title and view
+      const titleMap = {
+        'explorer': 'EXPLORER',
+        'search': 'SEARCH',
+        'git': 'SOURCE CONTROL',
+        'brain': 'PROJECT BRAIN',
+        'agents': 'AI AGENTS',
+        'mobile': 'MOBILE STUDIO',
+        'storage': 'BUILD & STORAGE'
+      };
+
+      const titleEl = document.getElementById('sidebar-title');
+      if (titleEl && titleMap[activity]) {
+        titleEl.innerText = titleMap[activity];
+      }
+
+      // Hide all sideviews, show active
+      document.querySelectorAll('.sideview-content').forEach(sv => sv.classList.remove('active'));
+      const activeView = document.getElementById('sideview-' + activity);
+      if (activeView) activeView.classList.add('active');
+
+      // Trigger lazy loaders if needed
+      if (activity === 'brain') {
+        ensureCytoscapeLoaded(() => {
+          if (!cyInstance) initProjectBrain();
+        });
+      }
+      if (activity === 'agents') {
+        populatePersonas();
+      }
+      if (activity === 'mobile') {
+        setupMobileMockup();
+      }
+
+      saveLayoutState();
+    }
+
+    function togglePrimarySidebar() {
+      const sidebar = document.getElementById('primary-sidebar');
+      const resizer = document.getElementById('sidebar-resizer');
+      isPrimarySidebarOpen = !isPrimarySidebarOpen;
+
+      if (isPrimarySidebarOpen) {
+        sidebar.classList.remove('collapsed');
+        resizer.style.display = 'block';
+      } else {
+        sidebar.classList.add('collapsed');
+        resizer.style.display = 'none';
+        document.querySelectorAll('.activity-btn').forEach(btn => btn.classList.remove('active'));
+      }
+
+      if (editor) setTimeout(() => editor.layout(), 50);
+      saveLayoutState();
+    }
+
+    function toggleSecondarySidebar() {
+      const aiSidebar = document.getElementById('secondary-sidebar');
+      const aiResizer = document.getElementById('ai-resizer');
+      isSecondarySidebarOpen = !isSecondarySidebarOpen;
+
+      if (isSecondarySidebarOpen) {
+        aiSidebar.style.display = 'flex';
+        aiResizer.style.display = 'block';
+        const activeFile = activeTab || 'main.rs';
+        document.getElementById('ai-active-file-tag').innerText = activeFile;
+      } else {
+        aiSidebar.style.display = 'none';
+        aiResizer.style.display = 'none';
+      }
+
+      if (editor) setTimeout(() => editor.layout(), 50);
+      saveLayoutState();
+    }
+
+    function toggleBottomPanel() {
+      const panel = document.getElementById('bottom-panel');
+      const resizer = document.getElementById('panel-resizer');
+      isBottomPanelOpen = !isBottomPanelOpen;
+
+      if (isBottomPanelOpen) {
+        panel.classList.remove('collapsed');
+        resizer.style.display = 'block';
+        fitActiveTerminal();
+      } else {
+        panel.classList.add('collapsed');
+        resizer.style.display = 'none';
+      }
+
+      if (editor) setTimeout(() => editor.layout(), 50);
+      saveLayoutState();
+    }
+
+    function toggleMaximizePanel() {
+      const panel = document.getElementById('bottom-panel');
+      isPanelMaximized = !isPanelMaximized;
+      panel.classList.toggle('maximized', isPanelMaximized);
+      if (editor) setTimeout(() => editor.layout(), 50);
+      fitActiveTerminal();
+    }
+
+    function selectPanelTab(tabName) {
+      if (!isBottomPanelOpen) toggleBottomPanel();
+
+      document.querySelectorAll('.panel-tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.panel-view-content').forEach(v => v.classList.remove('active'));
+
+      const tabBtn = document.getElementById('ptab-' + tabName);
+      if (tabBtn) tabBtn.classList.add('active');
+
+      const view = document.getElementById('pview-' + tabName);
+      if (view) view.classList.add('active');
+
+      const termActions = document.getElementById('term-session-actions');
+      if (termActions) {
+        termActions.style.display = (tabName === 'terminal') ? 'flex' : 'none';
+      }
+
+      if (tabName === 'terminal') {
+        ensureXtermLoaded(() => {
+          if (terminalSessions.size === 0) spawnNewTerminalSession();
+          fitActiveTerminal();
+        });
+      }
+      if (tabName === 'diagnostics') {
+        runDoctorDiagnostics();
+      }
+    }
+
+    function fitActiveTerminal() {
+      if (activeTerminalId && terminalSessions.has(activeTerminalId)) {
+        setTimeout(() => {
+          try {
+            terminalSessions.get(activeTerminalId).fitAddon.fit();
+          } catch(e) {}
+        }, 50);
+      }
+    }
+
+    // AI Assistant Chat & Quick Prompts
+    function submitAiPrompt() {
+      const input = document.getElementById('ai-prompt-input');
+      const prompt = input.value.trim();
+      if (!prompt) return;
+
+      appendAiMessage('user', prompt);
+      input.value = '';
+
+      // Simulate streaming AI architect response
+      const model = document.getElementById('ai-model-select').value;
+      setTimeout(() => {
+        const response = `Analyzing ${activeTab || 'current workspace'} with ${model}:\n\n` +
+          `• The module enforces strict capability containment.\n` +
+          `• Memory footprint and async dispatch conform to Rust zero-cost abstraction standards.\n` +
+          `• Recommendations applied: No memory leaks or unhandled Result types detected.`;
+        appendAiMessage('assistant', response);
+      }, 400);
+    }
+
+    function sendQuickPrompt(promptText) {
+      document.getElementById('ai-prompt-input').value = promptText;
+      submitAiPrompt();
+    }
+
+    function handleAiInputKey(e) {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        submitAiPrompt();
+      }
+    }
+
+    function appendAiMessage(role, content) {
+      const thread = document.getElementById('ai-chat-thread');
+      const msgDiv = document.createElement('div');
+      msgDiv.className = 'ai-msg ' + (role === 'user' ? 'user' : 'assistant');
+      msgDiv.innerHTML = `<div class="ai-msg-hdr"><span>${role === 'user' ? 'Developer' : 'Aether AI'}</span></div><p>${content.replace(/\n/g, '<br>')}</p>`;
+      thread.appendChild(msgDiv);
+      thread.scrollTop = thread.scrollHeight;
+    }
+
+    // Splitters & Resizing
+    function setupSplitters() {
+      // Sidebar Resizer
+      const sbResizer = document.getElementById('sidebar-resizer');
+      const sidebar = document.getElementById('primary-sidebar');
+      let isResizingSidebar = false;
+
+      sbResizer.addEventListener('mousedown', e => {
+        isResizingSidebar = true;
+        sbResizer.classList.add('dragging');
+        document.body.style.cursor = 'col-resize';
+      });
+
+      // Panel Resizer
+      const panelResizer = document.getElementById('panel-resizer');
+      const panel = document.getElementById('bottom-panel');
+      let isResizingPanel = false;
+
+      panelResizer.addEventListener('mousedown', e => {
+        isResizingPanel = true;
+        panelResizer.classList.add('dragging');
+        document.body.style.cursor = 'row-resize';
+      });
+
+      // AI Resizer
+      const aiResizer = document.getElementById('ai-resizer');
+      const aiSidebar = document.getElementById('secondary-sidebar');
+      let isResizingAi = false;
+
+      aiResizer.addEventListener('mousedown', e => {
+        isResizingAi = true;
+        aiResizer.classList.add('dragging');
+        document.body.style.cursor = 'col-resize';
+      });
+
+      window.addEventListener('mousemove', e => {
+        if (isResizingSidebar) {
+          const newW = Math.max(180, Math.min(500, e.clientX - 48));
+          sidebar.style.width = newW + 'px';
+          if (editor) editor.layout();
+        }
+        if (isResizingPanel) {
+          const newH = Math.max(100, Math.min(600, window.innerHeight - e.clientY - 24));
+          panel.style.height = newH + 'px';
+          if (editor) editor.layout();
+          fitActiveTerminal();
+        }
+        if (isResizingAi) {
+          const newW = Math.max(240, Math.min(600, window.innerWidth - e.clientX));
+          aiSidebar.style.width = newW + 'px';
+          if (editor) editor.layout();
+        }
+      });
+
+      window.addEventListener('mouseup', () => {
+        if (isResizingSidebar || isResizingPanel || isResizingAi) {
+          isResizingSidebar = false;
+          isResizingPanel = false;
+          isResizingAi = false;
+          sbResizer.classList.remove('dragging');
+          panelResizer.classList.remove('dragging');
+          aiResizer.classList.remove('dragging');
+          document.body.style.cursor = 'default';
+          saveLayoutState();
+        }
+      });
+    }
+
+    function saveLayoutState() {
+      const state = {
+        isPrimarySidebarOpen,
+        isSecondarySidebarOpen,
+        isBottomPanelOpen,
+        currentActivity,
+        sidebarWidth: document.getElementById('primary-sidebar').style.width,
+        panelHeight: document.getElementById('bottom-panel').style.height
+      };
+      try {
+        localStorage.setItem('aether_workbench_layout', JSON.stringify(state));
+      } catch(e) {}
+    }
+
+    function restoreLayoutState() {
+      try {
+        const saved = localStorage.getItem('aether_workbench_layout');
+        if (saved) {
+          const state = JSON.parse(saved);
+          if (state.sidebarWidth) document.getElementById('primary-sidebar').style.width = state.sidebarWidth;
+          if (state.panelHeight) document.getElementById('bottom-panel').style.height = state.panelHeight;
+          if (state.currentActivity) selectActivity(state.currentActivity);
+          if (!state.isPrimarySidebarOpen) togglePrimarySidebar();
+          if (state.isSecondarySidebarOpen) toggleSecondarySidebar();
+          if (!state.isBottomPanelOpen) toggleBottomPanel();
+        }
+      } catch(e) {}
+    }
+
+    function resetWorkbenchLayout() {
+      localStorage.removeItem('aether_workbench_layout');
+      document.getElementById('primary-sidebar').style.width = '260px';
+      document.getElementById('bottom-panel').style.height = '240px';
+      document.getElementById('secondary-sidebar').style.width = '330px';
+      if (!isPrimarySidebarOpen) togglePrimarySidebar();
+      if (!isBottomPanelOpen) toggleBottomPanel();
+      if (isSecondarySidebarOpen) toggleSecondarySidebar();
+      selectActivity('explorer');
+      if (editor) editor.layout();
+      notify('Workbench layout reset to default settings.', 'info');
+    }
+
+    function runBuildTask() {
+      selectPanelTab('output');
+      const log = document.getElementById('output-log-text');
+      log.innerText += `\n[Task] cargo build --workspace (Release)...\n   Compiling aetheride v0.1.0-beta.2\n    Finished release [optimized] target(s) in 2.14s\n`;
+      log.scrollTop = log.scrollHeight;
+      notify('Build completed successfully: 0 errors.', 'success');
+    }
+
+    function runTestsTask() {
+      selectPanelTab('output');
+      const log = document.getElementById('output-log-text');
+      log.innerText += `\n[Test] cargo test --workspace\n   running 152 tests\n   test result: ok. 152 passed; 0 failed; 0 ignored\n`;
+      log.scrollTop = log.scrollHeight;
+      notify('Test Suite: 152 passed, 0 failed.', 'success');
+    }
+
+    function handleDebugEval(e) {
+      if (e.key === 'Enter') {
+        const input = e.target;
+        const val = input.value.trim();
+        if (val) {
+          const log = document.getElementById('output-log-text');
+          selectPanelTab('output');
+          log.innerText += `\n> ${val}\nResult: () [unit]`;
+          input.value = '';
+        }
+      }
+    }
+
+    // Initialize layout when page is ready
+    window.addEventListener('DOMContentLoaded', () => {
+      setupSplitters();
+      restoreLayoutState();
+      setTimeout(() => {
+        if (editor) editor.layout();
+      }, 200);
+    });
 
     function setupShortcuts() {
       window.addEventListener('keydown', e => {

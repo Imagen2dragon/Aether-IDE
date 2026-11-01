@@ -56,6 +56,7 @@ pub mod native {
             Self { config }
         }
 
+        #[allow(clippy::manual_dangling_ptr)]
         pub fn run(&self) -> Result<()> {
             unsafe {
                 // 0. Configure stable Windows Application User Model ID for shell & taskbar grouping
