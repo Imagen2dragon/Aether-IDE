@@ -47,6 +47,7 @@ mod tests {
             session_token: None,
             peer_id: None,
             daemon_port: 44888,
+            initial_path: None,
         });
         assert_eq!(host.platform_name(), "macOS (Cocoa / WKWebView)");
     }

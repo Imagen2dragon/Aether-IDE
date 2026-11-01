@@ -1,10 +1,14 @@
+#![cfg_attr(not(test), windows_subsystem = "windows")]
 pub mod host;
 pub mod linux_host;
 pub mod macos_host;
 #[cfg(windows)]
 mod webview2_runtime;
 #[cfg(windows)]
+pub mod win32_dialogs;
+#[cfg(windows)]
 mod win32_host;
+pub mod workspace_bridge;
 
 use std::env;
 use std::net::TcpStream;
@@ -20,6 +24,35 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
+
+    // Console attachment logic:
+    // If user explicitly asks for --console / -c, allocate a dedicated console.
+    // If user launched from a terminal or invoked a CLI command, attach to parent console.
+    // For normal GUI desktop launches (Start Menu, Explorer, Desktop shortcut), NO console is shown.
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Console::{AllocConsole, AttachConsole, ATTACH_PARENT_PROCESS};
+        let wants_console = args
+            .iter()
+            .any(|a| a == "--console" || a == "-c" || a == "--verbose" || a == "--diagnostics");
+        let is_cli_cmd = !args.is_empty()
+            && (args[0] == "doctor"
+                || args[0] == "ping"
+                || args[0] == "status"
+                || args[0] == "index"
+                || args[0] == "search"
+                || args[0] == "agent"
+                || args[0] == "mobile"
+                || args[0] == "--help"
+                || args[0] == "-h"
+                || args[0] == "--version"
+                || args[0] == "-v");
+        if wants_console {
+            let _ = AllocConsole();
+        } else if is_cli_cmd {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
 
     let exe_dir = env::current_exe()?
         .parent()
@@ -48,6 +81,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Parse workspace path from CLI arguments
+    let mut initial_path: Option<PathBuf> = None;
+    for arg in &args {
+        if !arg.starts_with('-')
+            && arg != "doctor"
+            && arg != "ping"
+            && arg != "status"
+            && arg != "index"
+            && arg != "search"
+            && arg != "agent"
+            && arg != "mobile"
+        {
+            let p = PathBuf::from(arg);
+            if p.exists() {
+                initial_path = p.canonicalize().ok().or(Some(p));
+                break;
+            } else if let Ok(cwd) = env::current_dir() {
+                let joined = cwd.join(&p);
+                if joined.exists() {
+                    initial_path = joined.canonicalize().ok().or(Some(joined));
+                    break;
+                }
+            }
+        }
+    }
+
     println!("============================================================");
     println!(" AetherIDE — Production AI-Native Software Engineering Studio");
     println!(
@@ -55,6 +114,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         application_core::AETHER_VERSION
     );
     println!("============================================================\n");
+
+    // Determine application data and log directories
+    let data_dir = if let Ok(appdata) = env::var("LOCALAPPDATA") {
+        PathBuf::from(appdata).join("AetherIDE")
+    } else if let Ok(home) = env::var("HOME") {
+        PathBuf::from(home).join(".aether")
+    } else {
+        PathBuf::from(".").join(".aether")
+    };
+    let log_dir = data_dir.join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let daemon_log_path = log_dir.join("daemon.log");
 
     // 1. Ensure Daemon is Running
     let is_daemon_running = TcpStream::connect("127.0.0.1:44888").is_ok();
@@ -76,6 +147,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut cmd = Command::new(&daemon_path);
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
+
+        // Redirect daemon stdout/stderr to daemon.log for background supervision
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&daemon_log_path)
+        {
+            if let Ok(err_file) = file.try_clone() {
+                cmd.stdout(file);
+                cmd.stderr(err_file);
+            }
+        }
 
         match cmd.spawn() {
             Ok(_) => {
@@ -107,13 +190,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 2. Read Session Identity from desktop_bootstrap.json
-    let data_dir = if let Ok(appdata) = env::var("LOCALAPPDATA") {
-        PathBuf::from(appdata).join("AetherIDE")
-    } else if let Ok(home) = env::var("HOME") {
-        PathBuf::from(home).join(".aether")
-    } else {
-        PathBuf::from(".").join(".aether")
-    };
 
     let bootstrap_file = data_dir.join("desktop_bootstrap.json");
     let (session_token, peer_id) = if let Ok(data) = std::fs::read_to_string(&bootstrap_file) {
@@ -175,6 +251,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             session_token: session_token.clone(),
             peer_id: peer_id.clone(),
             daemon_port: 44888,
+            initial_path: initial_path.clone(),
         };
         let host = win32_host::native::Win32WebView2Host::new(host_config);
         match host.run() {
@@ -210,6 +287,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             session_token: session_token.clone(),
             peer_id: peer_id.clone(),
             daemon_port: 44888,
+            initial_path: initial_path.clone(),
         };
         let host = linux_host::LinuxGtkHost::new(host_config);
         if let Err(e) = host.run() {
@@ -228,6 +306,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             session_token: session_token.clone(),
             peer_id: peer_id.clone(),
             daemon_port: 44888,
+            initial_path: initial_path.clone(),
         };
         let host = macos_host::MacWkWebViewHost::new(host_config);
         if let Err(e) = host.run() {
@@ -264,14 +343,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Fallback: Open workbench in default browser
-    println!(" [!] Opening Aether Workbench in default browser...");
-    let url = format!(
-        "file:///{}",
-        workbench_html.to_string_lossy().replace('\\', "/")
-    );
-    let _ = Command::new("cmd").args(["/c", "start", &url]).spawn();
+    #[cfg(windows)]
+    {
+        // Standalone application failure handling — never launch external browser
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+        unsafe {
+            let _ = MessageBoxW(
+                windows::Win32::Foundation::HWND::default(),
+                w!("Failed to initialize AetherIDE Native Host. Please ensure the Microsoft WebView2 Runtime is installed."),
+                w!("AetherIDE — Startup Error"),
+                MB_ICONERROR | MB_OK,
+            );
+        }
+    }
 
-    println!("\nAetherIDE Environment Ready. Press Ctrl+C or close window to exit.");
-    Ok(())
+    Err("Failed to start AetherIDE native desktop host".into())
 }

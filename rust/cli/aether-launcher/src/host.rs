@@ -7,6 +7,7 @@ pub struct HostConfig {
     pub session_token: Option<String>,
     pub peer_id: Option<String>,
     pub daemon_port: u16,
+    pub initial_path: Option<PathBuf>,
 }
 
 /// Cross-platform abstraction for desktop native webview hosting.
