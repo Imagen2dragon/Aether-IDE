@@ -134,4 +134,60 @@ impl GitEngine {
         .map_err(|e| AetherError::Process(format!("Git diff failed: {}", e)))?;
         Ok(out.stdout)
     }
+
+    pub async fn get_staged_diff<P: AsRef<Path>>(repo_path: P) -> Result<String> {
+        let out = ProcessManager::run_command_streaming(
+            "git diff --staged",
+            Some(repo_path.as_ref().to_path_buf()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| AetherError::Process(format!("Git diff --staged failed: {}", e)))?;
+        Ok(out.stdout)
+    }
+
+    pub async fn stage_file<P: AsRef<Path>>(repo_path: P, file: &str) -> Result<()> {
+        let cmd = format!("git add \"{}\"", file);
+        ProcessManager::run_command_streaming(
+            &cmd,
+            Some(repo_path.as_ref().to_path_buf()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| AetherError::Process(format!("Git add failed: {}", e)))?;
+        Ok(())
+    }
+
+    pub async fn unstage_file<P: AsRef<Path>>(repo_path: P, file: &str) -> Result<()> {
+        let cmd = format!("git restore --staged \"{}\"", file);
+        ProcessManager::run_command_streaming(
+            &cmd,
+            Some(repo_path.as_ref().to_path_buf()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| AetherError::Process(format!("Git unstage failed: {}", e)))?;
+        Ok(())
+    }
+
+    pub async fn commit<P: AsRef<Path>>(repo_path: P, message: &str) -> Result<String> {
+        let escaped_msg = message.replace('"', "\\\"");
+        let cmd = format!("git commit -m \"{}\"", escaped_msg);
+        let out = ProcessManager::run_command_streaming(
+            &cmd,
+            Some(repo_path.as_ref().to_path_buf()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| AetherError::Process(format!("Git commit failed: {}", e)))?;
+        Ok(out.stdout)
+    }
 }

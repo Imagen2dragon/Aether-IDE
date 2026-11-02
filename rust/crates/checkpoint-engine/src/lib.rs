@@ -55,6 +55,28 @@ impl CheckpointEngine {
         Ok(checkpoint)
     }
 
+    pub fn list_checkpoints(&self) -> Result<Vec<WorkspaceCheckpoint>> {
+        let mut list = Vec::new();
+        if !self.storage_dir.exists() {
+            return Ok(list);
+        }
+        for entry in std::fs::read_dir(&self.storage_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                let meta = entry.path().join("metadata.json");
+                if meta.is_file() {
+                    if let Ok(content) = FilesystemEngine::read_file_string(&meta) {
+                        if let Ok(ckpt) = serde_json::from_str::<WorkspaceCheckpoint>(&content) {
+                            list.push(ckpt);
+                        }
+                    }
+                }
+            }
+        }
+        list.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(list)
+    }
+
     pub fn restore_checkpoint(&self, checkpoint: &WorkspaceCheckpoint) -> Result<()> {
         for (path_str, content) in &checkpoint.file_hashes {
             let path = PathBuf::from(path_str);
