@@ -343,6 +343,10 @@ impl LspMultiplexer {
             .unwrap_or_default()
     }
 
+    pub fn get_all_diagnostics(&self) -> HashMap<String, Vec<Diagnostic>> {
+        self.diagnostics_store.read().clone()
+    }
+
     pub async fn shutdown_all(&self) -> Result<(), LspError> {
         let clients: Vec<Arc<LspClient>> = self
             .active_clients

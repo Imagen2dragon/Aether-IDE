@@ -37,6 +37,14 @@ terminal-manager = { path = "../../../rust/crates/terminal-manager" }
 process-manager = { path = "../../../rust/crates/process-manager" }
 git-engine = { path = "../../../rust/crates/git-engine" }
 diagnostics = { path = "../../../rust/crates/diagnostics" }
+project-brain = { path = "../../../rust/crates/project-brain" }
+database-engine = { path = "../../../rust/crates/database-engine" }
+model-gateway = { path = "../../../rust/crates/model-gateway" }
+agent-orchestrator = { path = "../../../rust/crates/agent-orchestrator" }
+agent-runtime = { path = "../../../rust/crates/agent-runtime" }
+mobile-build-manager = { path = "../../../rust/crates/mobile-build-manager" }
+lsp-client = { path = "../../../rust/crates/lsp-client" }
+checkpoint-engine = { path = "../../../rust/crates/checkpoint-engine" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

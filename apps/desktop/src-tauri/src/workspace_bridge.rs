@@ -39,6 +39,8 @@ pub struct WorkspaceFolderConfig {
     pub name: Option<String>,
 }
 
+pub type SharedWorkspace = std::sync::Arc<parking_lot::Mutex<WorkspaceSession>>;
+
 pub struct WorkspaceSession {
     roots: Mutex<Vec<PathBuf>>,
     user_data_dir: PathBuf,
@@ -107,6 +109,11 @@ impl WorkspaceSession {
     pub fn primary_root(&self) -> Option<PathBuf> {
         let roots = self.roots.lock().unwrap();
         roots.first().cloned()
+    }
+
+    pub fn get_roots(&self) -> Vec<PathBuf> {
+        let roots = self.roots.lock().unwrap();
+        roots.clone()
     }
 
     /// Gets summary of all active roots with file trees.
