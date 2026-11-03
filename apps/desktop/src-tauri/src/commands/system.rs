@@ -1,7 +1,7 @@
 use crate::commands::terminal::*;
 use crate::commands::workspace::*;
 use serde_json::{json, Value};
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 #[tauri::command]
 pub async fn app_ping() -> Result<String, String> {
@@ -20,11 +20,35 @@ pub async fn app_version() -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn app_doctor() -> Result<Value, String> {
+pub async fn app_doctor(app: AppHandle) -> Result<Value, String> {
     let report = diagnostics::EnvironmentDoctor::diagnose_all().await;
+
+    // Active workspace status
+    let ws_arc = app.state::<crate::workspace_bridge::SharedWorkspace>();
+    let ws = ws_arc.lock();
+    let ws_summary = ws.get_workspace_summary().unwrap_or(json!({}));
+    drop(ws);
+
+    // Provider status without exposing secrets
+    let gw = app.state::<crate::commands::ai::SharedGateway>();
+    let provider_statuses = gw.diagnose_all_providers();
+
+    // Active Metro & Build processes
+    let metro_pid_arc = app.state::<crate::commands::mobile::ActiveMetroPid>();
+    let metro_pid = *metro_pid_arc.lock();
+
+    let builds_arc = app.state::<crate::commands::build::SharedActiveBuilds>();
+    let active_builds = builds_arc.lock().clone();
+
     Ok(json!({
         "all_healthy": report.all_healthy,
         "diagnostics": report.diagnostics,
+        "workspace": ws_summary,
+        "ai_providers": provider_statuses,
+        "active_processes": {
+            "metro_pid": metro_pid,
+            "active_build_tasks": active_builds
+        },
         "timestamp": chrono::Utc::now().to_rfc3339()
     }))
 }
@@ -100,7 +124,7 @@ pub async fn ide_dispatch(
                 .to_string();
             workspace_create_file(app, path).await
         }
-        "WorkspaceCreateFolder" => {
+        "WorkspaceCreateDirectory" => {
             let path = p
                 .get("path")
                 .and_then(|v| v.as_str())
@@ -138,36 +162,29 @@ pub async fn ide_dispatch(
             workspace_reveal_in_explorer(app, path).await
         }
         "WorkspaceSetTrust" => {
-            let path = p
-                .get("path")
+            let root_path = p
+                .get("rootPath")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
+                .ok_or("Missing rootPath")?
                 .to_string();
-            let trusted = p.get("trusted").and_then(|v| v.as_bool()).unwrap_or(true);
-            workspace_set_trust(app, path, trusted).await
+            let is_trusted = p.get("isTrusted").and_then(|v| v.as_bool()).unwrap_or(true);
+            workspace_set_trust(app, root_path, is_trusted).await
         }
         "TerminalSpawn" => {
-            let cwd = p.get("cwd").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let cols = p.get("cols").and_then(|v| v.as_u64()).map(|n| n as u16);
-            let rows = p.get("rows").and_then(|v| v.as_u64()).map(|n| n as u16);
-            terminal_spawn(app, cwd, cols, rows).await
+            let cols = p.get("cols").and_then(|v| v.as_u64()).map(|v| v as u16);
+            let rows = p.get("rows").and_then(|v| v.as_u64()).map(|v| v as u16);
+            terminal_spawn(app, None, cols, rows).await
         }
         "TerminalWrite" => {
-            let data = p
-                .get("data")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            terminal_write(app, data).await
+            let data = p.get("data").and_then(|v| v.as_str()).unwrap_or("");
+            terminal_write(app, data.to_string()).await
         }
         "TerminalResize" => {
-            let cols = p.get("cols").and_then(|v| v.as_u64()).unwrap_or(120) as u16;
-            let rows = p.get("rows").and_then(|v| v.as_u64()).unwrap_or(30) as u16;
+            let cols = p.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
+            let rows = p.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
             terminal_resize(app, cols, rows).await
         }
-        "TerminalKill" => terminal_kill(app).await,
-        "Ping" => app_ping().await.map(|s| json!({ "reply": s })),
-        "Doctor" => app_doctor().await,
-        other => Err(format!("Unknown or unhandled action: {}", other)),
+        "TerminalClose" => terminal_kill(app).await,
+        _ => Err(format!("Unknown ide_dispatch action: {}", action)),
     }
 }

@@ -319,6 +319,20 @@ impl WorkspaceCapability {
         self.dir.remove_file(&rel).map_err(AetherError::Io)
     }
 
+    /// Deletes a directory and its contents recursively inside workspace capability.
+    /// Strictly refuses to follow or delete through external symlinks or reparse points.
+    pub fn delete_dir_all(&self, user_path: &str) -> Result<()> {
+        let rel = sanitize_relative_path(user_path)?;
+        if let Ok(meta) = self.dir.symlink_metadata(&rel) {
+            if meta.is_symlink() {
+                return Err(AetherError::PermissionDenied(
+                    "Access Denied: Target is a symlink, cannot recursively delete".into(),
+                ));
+            }
+        }
+        self.dir.remove_dir_all(&rel).map_err(AetherError::Io)
+    }
+
     /// Renames a file entry within the workspace capability.
     pub fn rename(&self, from_user_path: &str, to_user_path: &str) -> Result<()> {
         let from_rel = sanitize_relative_path(from_user_path)?;
@@ -607,6 +621,12 @@ impl FilesystemEngine {
     pub fn delete_file_contained<P: AsRef<Path>>(root: P, user_path: &str) -> Result<()> {
         let cap = WorkspaceCapability::open(root)?;
         cap.delete_file(user_path)
+    }
+
+    /// Safely deletes a directory and its contents contained within the workspace root.
+    pub fn delete_dir_all_contained<P: AsRef<Path>>(root: P, user_path: &str) -> Result<()> {
+        let cap = WorkspaceCapability::open(root)?;
+        cap.delete_dir_all(user_path)
     }
 
     /// Safely creates a directory contained within the workspace root.

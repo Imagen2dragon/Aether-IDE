@@ -1,10 +1,21 @@
+use crate::workspace_bridge::SharedWorkspace;
 use lsp_client::{Diagnostic, LspMultiplexer};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 
 pub type SharedLspMultiplexer = Arc<LspMultiplexer>;
+
+fn resolve_file_path(app: &AppHandle, user_path: &str) -> PathBuf {
+    let ws_arc = app.state::<SharedWorkspace>();
+    let ws = ws_arc.lock();
+    if let Ok((_, root, rel)) = ws.resolve_in_workspace(user_path) {
+        root.join(rel)
+    } else {
+        PathBuf::from(user_path)
+    }
+}
 
 #[tauri::command]
 pub async fn lsp_get_diagnostics(
@@ -13,7 +24,7 @@ pub async fn lsp_get_diagnostics(
 ) -> Result<HashMap<String, Vec<Diagnostic>>, String> {
     let lsp = app.state::<SharedLspMultiplexer>();
     if let Some(p) = path {
-        let file_path = PathBuf::from(&p);
+        let file_path = resolve_file_path(&app, &p);
         let diags = lsp.get_diagnostics(&file_path);
         let mut map = HashMap::new();
         map.insert(p, diags);
@@ -31,8 +42,8 @@ pub async fn lsp_open_document(
     language_id: Option<String>,
 ) -> Result<bool, String> {
     let lsp = app.state::<SharedLspMultiplexer>();
-    let p = Path::new(&path);
-    lsp.open_document(p, &content, language_id.as_deref())
+    let resolved = resolve_file_path(&app, &path);
+    lsp.open_document(&resolved, &content, language_id.as_deref())
         .await
         .map_err(|e| format!("LSP open failed: {}", e))?;
     Ok(true)
@@ -46,8 +57,8 @@ pub async fn lsp_change_document(
     version: i64,
 ) -> Result<bool, String> {
     let lsp = app.state::<SharedLspMultiplexer>();
-    let p = Path::new(&path);
-    lsp.change_document(p, &content, version)
+    let resolved = resolve_file_path(&app, &path);
+    lsp.change_document(&resolved, &content, version)
         .await
         .map_err(|e| format!("LSP change failed: {}", e))?;
     Ok(true)
@@ -56,8 +67,8 @@ pub async fn lsp_change_document(
 #[tauri::command]
 pub async fn lsp_save_document(app: AppHandle, path: String) -> Result<bool, String> {
     let lsp = app.state::<SharedLspMultiplexer>();
-    let p = Path::new(&path);
-    lsp.save_document(p)
+    let resolved = resolve_file_path(&app, &path);
+    lsp.save_document(&resolved)
         .await
         .map_err(|e| format!("LSP save failed: {}", e))?;
     Ok(true)
@@ -66,8 +77,8 @@ pub async fn lsp_save_document(app: AppHandle, path: String) -> Result<bool, Str
 #[tauri::command]
 pub async fn lsp_close_document(app: AppHandle, path: String) -> Result<bool, String> {
     let lsp = app.state::<SharedLspMultiplexer>();
-    let p = Path::new(&path);
-    lsp.close_document(p)
+    let resolved = resolve_file_path(&app, &path);
+    lsp.close_document(&resolved)
         .await
         .map_err(|e| format!("LSP close failed: {}", e))?;
     Ok(true)

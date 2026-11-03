@@ -77,9 +77,12 @@ export const App: React.FC = () => {
   const handleOpenFolder = async (folderPath?: string) => {
     try {
       const summary = await TauriService.openFolder(folderPath);
-      setWorkspaceRoots(summary.roots);
-      if (summary.roots.length > 0) {
-        const tree = await TauriService.getTree(summary.roots[0]);
+      const rootPaths = (summary.roots || []).map((r: any) =>
+        typeof r === "string" ? r : r.path || r.id || ""
+      );
+      setWorkspaceRoots(rootPaths);
+      if (rootPaths.length > 0) {
+        const tree = await TauriService.getTree(rootPaths[0]);
         setWorkspaceTree(tree);
         await refreshGit();
       }

@@ -1,18 +1,23 @@
 import React, { useState, useEffect, useRef } from "react";
 import {
+  Sparkles,
   Send,
   Bot,
-  User,
-  Check,
-  X,
-  Sparkles,
+  Square,
+  FileCode,
   Zap,
-  Code,
-  FileCheck,
+  Check,
   ShieldAlert,
+  AlertTriangle,
+  X,
+  Eye,
 } from "lucide-react";
 import { TauriService } from "../../services/tauri";
-import type { ModelMetadata } from "../../types/workbench";
+import {
+  ModelMetadata,
+  ProposalReviewPreview,
+  StructuredProposal,
+} from "../../types/workbench";
 
 interface ChatMessage {
   id: string;
@@ -25,60 +30,89 @@ interface ChatMessage {
 interface AssistantPanelProps {
   activeFilePath?: string;
   activeFileContent?: string;
-  onApplyDiff: (diffContent: string) => void;
-  onClose: () => void;
+  onApplyDiff: (newContent: string) => void;
+  onClose?: () => void;
 }
 
 export const AssistantPanel: React.FC<AssistantPanelProps> = ({
   activeFilePath,
   activeFileContent,
   onApplyDiff,
-  onClose,
 }) => {
-  const [models, setModels] = useState<ModelMetadata[]>([]);
-  const [selectedModel, setSelectedModel] = useState<string>("claude-3-5-sonnet");
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
-      id: "welcome-msg",
+      id: "welcome-1",
       sender: "assistant",
       content:
-        "Hello! I am your Aether AI Engineering Assistant connected to the Model Gateway. I can generate code, refactor functions, write tests, and explain architecture.",
+        "Hello! I am your Aether AI assistant. Ask questions, request refactorings, or generate code. All proposals are verified with diff reviews before touching the filesystem.",
       timestamp: new Date().toLocaleTimeString(),
     },
   ]);
   const [inputPrompt, setInputPrompt] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamedResponse, setStreamedResponse] = useState("");
+  const [models, setModels] = useState<ModelMetadata[]>([]);
+  const [selectedModel, setSelectedModel] = useState<string>("gpt-4o");
+  const [activeRequestId, setActiveRequestId] = useState<string | null>(null);
+
+  // Proposal Review Modal State
+  const [activeProposal, setActiveProposal] = useState<StructuredProposal | null>(null);
+  const [reviewPreview, setReviewPreview] = useState<ProposalReviewPreview | null>(null);
+  const [isApplyingProposal, setIsApplyingProposal] = useState(false);
+  const [applyMessage, setApplyMessage] = useState<string | null>(null);
 
   const chatBottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     loadModels();
-
-    // Listen for live streaming chunks from backend
-    const unlistenChunkPromise = TauriService.onEvent<{ chunk: string }>(
-      "ai-stream-chunk",
-      (event) => {
-        setStreamedResponse((prev) => prev + event.chunk);
-      }
-    );
-
-    const unlistenCompletePromise = TauriService.onEvent<any>(
-      "ai-generation-complete",
-      () => {
-        setIsStreaming(false);
-      }
-    );
-
-    return () => {
-      unlistenChunkPromise.then((unlisten) => unlisten());
-      unlistenCompletePromise.then((unlisten) => unlisten());
-    };
   }, []);
 
   useEffect(() => {
     chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, streamedResponse]);
+
+  // Subscribe to real provider stream chunks over Tauri event bus
+  useEffect(() => {
+    let unlistenChunk: (() => void) | undefined;
+    let unlistenComplete: (() => void) | undefined;
+    let unlistenError: (() => void) | undefined;
+
+    TauriService.onEvent<any>("ai-stream-chunk", (payload) => {
+      if (payload.chunk) {
+        setStreamedResponse((prev) => prev + payload.chunk);
+      }
+    }).then((un) => {
+      unlistenChunk = un;
+    });
+
+    TauriService.onEvent<any>("ai-generation-complete", () => {
+      // Completed payload
+    }).then((un) => {
+      unlistenComplete = un;
+    });
+
+    TauriService.onEvent<any>("ai-stream-error", (payload) => {
+      if (payload.error) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `err-${Date.now()}`,
+            sender: "assistant",
+            content: `AI stream error: ${payload.error}`,
+            timestamp: new Date().toLocaleTimeString(),
+          },
+        ]);
+      }
+    }).then((un) => {
+      unlistenError = un;
+    });
+
+    return () => {
+      if (unlistenChunk) unlistenChunk();
+      if (unlistenComplete) unlistenComplete();
+      if (unlistenError) unlistenError();
+    };
+  }, []);
 
   const loadModels = async () => {
     try {
@@ -95,6 +129,9 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
   const handleSendPrompt = async (promptToSend?: string) => {
     const text = promptToSend || inputPrompt;
     if (!text.trim() || isStreaming) return;
+
+    const reqId = `req-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+    setActiveRequestId(reqId);
 
     const userMsg: ChatMessage = {
       id: `user-${Date.now()}`,
@@ -113,10 +150,12 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
         text,
         "You are an expert AI software engineer assistant integrated in AetherIDE. Provide clear, accurate code solutions.",
         selectedModel,
-        activeFileContent ? `Active File: ${activeFilePath}\n\n${activeFileContent}` : undefined
+        activeFileContent ? `Active File: ${activeFilePath}\n\n${activeFileContent}` : undefined,
+        reqId,
+        "active-session"
       );
 
-      // Check if response contains a code diff or block
+      // Check if response contains a code snippet
       let diffSnippet: string | undefined;
       const codeMatch = resultText.match(/```[\w]*\n([\s\S]*?)```/);
       if (codeMatch) {
@@ -145,6 +184,19 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
     } finally {
       setIsStreaming(false);
       setStreamedResponse("");
+      setActiveRequestId(null);
+    }
+  };
+
+  const handleStopStream = async () => {
+    if (activeRequestId) {
+      try {
+        await TauriService.cancelAiStream(activeRequestId);
+      } catch (e) {
+        console.error("Cancel stream error:", e);
+      }
+      setIsStreaming(false);
+      setActiveRequestId(null);
     }
   };
 
@@ -166,6 +218,65 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
     }
   };
 
+  const handleOpenProposalReview = async (snippet: string) => {
+    if (!activeFilePath) {
+      alert("Please open a file in the editor first to review and apply code proposals.");
+      return;
+    }
+
+    const proposal: StructuredProposal = {
+      proposal_id: `prop-${Date.now()}`,
+      workspace_id: "",
+      relative_path: activeFilePath,
+      operation: "modify",
+      base_hash: "", // backend will read disk hash if empty
+      unified_diff: snippet,
+      proposed_content: snippet,
+    };
+
+    setActiveProposal(proposal);
+    try {
+      const preview = await TauriService.previewProposal(proposal);
+      setReviewPreview(preview);
+    } catch (e: any) {
+      console.error("Failed to preview proposal:", e);
+      setReviewPreview({
+        proposal_id: proposal.proposal_id,
+        relative_path: activeFilePath,
+        operation: "modify",
+        base_hash: "",
+        current_disk_hash: "",
+        has_conflict: false,
+        original_content: activeFileContent || "",
+        proposed_content: snippet,
+        unified_diff: snippet,
+      });
+    }
+  };
+
+  const handleExecuteApplyProposal = async (force = false) => {
+    if (!activeProposal) return;
+    setIsApplyingProposal(true);
+    setApplyMessage(null);
+
+    try {
+      const res = await TauriService.applyProposal(activeProposal, force);
+      if (res.success) {
+        onApplyDiff(activeProposal.proposed_content);
+        setApplyMessage(`Changes safely applied! Verified SHA-256: ${res.new_hash.slice(0, 10)}...`);
+        setTimeout(() => {
+          setActiveProposal(null);
+          setReviewPreview(null);
+          setApplyMessage(null);
+        }, 1500);
+      }
+    } catch (err: any) {
+      setApplyMessage(`Apply error: ${err}`);
+    } finally {
+      setIsApplyingProposal(false);
+    }
+  };
+
   return (
     <div
       className="assistant-panel"
@@ -178,6 +289,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
         height: "100%",
         flexShrink: 0,
         zIndex: 60,
+        position: "relative",
       }}
     >
       {/* Assistant Header */}
@@ -204,6 +316,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
           <select
             value={selectedModel}
             onChange={(e) => setSelectedModel(e.target.value)}
+            disabled={isStreaming}
             style={{
               padding: "2px 6px",
               borderRadius: 4,
@@ -222,44 +335,50 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                 </option>
               ))
             ) : (
-              <>
-                <option value="claude-3-5-sonnet">Claude 3.5 Sonnet</option>
-                <option value="gpt-4o">GPT-4o</option>
-                <option value="ollama/llama3">Llama 3 (Local Ollama)</option>
-              </>
+              <option value="gpt-4o">GPT-4o Omnimodal</option>
             )}
           </select>
-
-          <button
-            onClick={onClose}
-            style={{
-              background: "transparent",
-              border: "none",
-              color: "var(--text-muted)",
-              cursor: "pointer",
-              padding: 2,
-            }}
-          >
-            <X size={14} />
-          </button>
         </div>
       </div>
 
-      {/* Quick Action Pills */}
-      {activeFileContent && (
+      {/* Active Context Chip */}
+      {activeFilePath && (
         <div
           style={{
-            padding: "6px 10px",
-            borderBottom: "1px solid var(--border-color)",
+            padding: "4px 12px",
+            background: "rgba(0, 240, 255, 0.05)",
+            borderBottom: "1px solid var(--border-light)",
             display: "flex",
-            gap: 4,
-            overflowX: "auto",
+            alignItems: "center",
+            gap: 6,
+            fontSize: 11,
+            color: "var(--accent-cyan)",
             flexShrink: 0,
+          }}
+        >
+          <FileCode size={12} />
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {activeFilePath}
+          </span>
+        </div>
+      )}
+
+      {/* Quick Action Chips */}
+      {activeFilePath && (
+        <div
+          style={{
+            display: "flex",
+            gap: 6,
+            padding: "6px 12px",
+            overflowX: "auto",
+            borderBottom: "1px solid var(--border-color)",
             background: "var(--bg-root)",
+            flexShrink: 0,
           }}
         >
           <button
             onClick={() => handleQuickAction("explain")}
+            disabled={isStreaming}
             style={{
               display: "flex",
               alignItems: "center",
@@ -274,10 +393,11 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
               whiteSpace: "nowrap",
             }}
           >
-            <Code size={11} /> Explain
+            Explain
           </button>
           <button
             onClick={() => handleQuickAction("test")}
+            disabled={isStreaming}
             style={{
               display: "flex",
               alignItems: "center",
@@ -292,10 +412,11 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
               whiteSpace: "nowrap",
             }}
           >
-            <FileCheck size={11} /> Tests
+            Unit Tests
           </button>
           <button
             onClick={() => handleQuickAction("refactor")}
+            disabled={isStreaming}
             style={{
               display: "flex",
               alignItems: "center",
@@ -314,6 +435,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
           </button>
           <button
             onClick={() => handleQuickAction("security")}
+            disabled={isStreaming}
             style={{
               display: "flex",
               alignItems: "center",
@@ -364,9 +486,16 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                 color: "var(--text-dim)",
               }}
             >
-              {msg.sender === "user" ? <User size={12} /> : <Bot size={12} />}
-              <span>{msg.sender === "user" ? "You" : "Aether Assistant"}</span>
-              <span>• {msg.timestamp}</span>
+              {msg.sender === "assistant" ? (
+                <>
+                  <Bot size={12} style={{ color: "var(--accent-cyan)" }} />
+                  <span>Aether Assistant</span>
+                </>
+              ) : (
+                <span>You</span>
+              )}
+              <span>•</span>
+              <span>{msg.timestamp}</span>
             </div>
 
             <div
@@ -387,7 +516,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
               {msg.content}
             </div>
 
-            {/* Diff Preview & Apply */}
+            {/* Diff Preview & Review Button */}
             {msg.diff && (
               <div
                 style={{
@@ -410,22 +539,22 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                     Proposed Code Changes
                   </span>
                   <button
-                    onClick={() => onApplyDiff(msg.diff!)}
+                    onClick={() => handleOpenProposalReview(msg.diff!)}
                     style={{
                       display: "flex",
                       alignItems: "center",
                       gap: 4,
-                      padding: "2px 8px",
+                      padding: "3px 8px",
                       borderRadius: 4,
-                      background: "var(--success)",
+                      background: "var(--accent-cyan)",
                       border: "none",
-                      color: "#fff",
+                      color: "#0a0e1a",
                       fontSize: 10,
-                      fontWeight: 600,
+                      fontWeight: 700,
                       cursor: "pointer",
                     }}
                   >
-                    <Check size={11} /> Apply to Editor
+                    <Eye size={11} /> Review & Apply
                   </button>
                 </div>
                 <pre
@@ -467,6 +596,24 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
             >
               <Bot size={12} className="spin" />
               <span>Generating response...</span>
+              <button
+                onClick={handleStopStream}
+                style={{
+                  marginLeft: 8,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 3,
+                  padding: "1px 6px",
+                  borderRadius: 3,
+                  background: "rgba(239, 68, 68, 0.2)",
+                  border: "1px solid var(--danger)",
+                  color: "var(--danger)",
+                  fontSize: 10,
+                  cursor: "pointer",
+                }}
+              >
+                <Square size={9} fill="currentColor" /> Stop
+              </button>
             </div>
             <div
               style={{
@@ -522,25 +669,251 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
             resize: "none",
           }}
         />
-        <button
-          onClick={() => handleSendPrompt()}
-          disabled={!inputPrompt.trim() || isStreaming}
+        {isStreaming ? (
+          <button
+            onClick={handleStopStream}
+            style={{
+              width: 36,
+              height: "100%",
+              borderRadius: 6,
+              background: "rgba(239, 68, 68, 0.2)",
+              color: "var(--danger)",
+              border: "1px solid var(--danger)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              cursor: "pointer",
+            }}
+            title="Stop generation"
+          >
+            <Square size={14} fill="currentColor" />
+          </button>
+        ) : (
+          <button
+            onClick={() => handleSendPrompt()}
+            disabled={!inputPrompt.trim()}
+            style={{
+              width: 36,
+              height: "100%",
+              borderRadius: 6,
+              background: inputPrompt.trim() ? "var(--accent-cyan)" : "var(--bg-card)",
+              color: inputPrompt.trim() ? "#0a0e1a" : "var(--text-dim)",
+              border: "none",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              cursor: inputPrompt.trim() ? "pointer" : "default",
+            }}
+          >
+            <Send size={15} />
+          </button>
+        )}
+      </div>
+
+      {/* Safe Proposal Diff Review Modal */}
+      {activeProposal && reviewPreview && (
+        <div
           style={{
-            width: 36,
-            height: "100%",
-            borderRadius: 6,
-            background: inputPrompt.trim() && !isStreaming ? "var(--accent-cyan)" : "var(--bg-card)",
-            color: inputPrompt.trim() && !isStreaming ? "#0a0e1a" : "var(--text-dim)",
-            border: "none",
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: "rgba(0, 0, 0, 0.75)",
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            cursor: inputPrompt.trim() && !isStreaming ? "pointer" : "default",
+            zIndex: 1000,
           }}
         >
-          <Send size={15} />
-        </button>
-      </div>
+          <div
+            style={{
+              width: "720px",
+              maxHeight: "85vh",
+              background: "var(--bg-sidebar)",
+              border: "1px solid var(--border-color)",
+              borderRadius: 8,
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+              boxShadow: "0 20px 40px rgba(0,0,0,0.5)",
+            }}
+          >
+            {/* Modal Header */}
+            <div
+              style={{
+                height: 42,
+                padding: "0 16px",
+                borderBottom: "1px solid var(--border-color)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                background: "var(--bg-header)",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <ShieldAlert size={16} style={{ color: "var(--accent-cyan)" }} />
+                <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text-primary)" }}>
+                  Review AI Code Proposal — {reviewPreview.relative_path}
+                </span>
+              </div>
+              <button
+                onClick={() => {
+                  setActiveProposal(null);
+                  setReviewPreview(null);
+                }}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: "var(--text-muted)",
+                  cursor: "pointer",
+                }}
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            {/* Conflict Warning if Detected */}
+            {reviewPreview.has_conflict && (
+              <div
+                style={{
+                  padding: "8px 16px",
+                  background: "rgba(245, 158, 11, 0.15)",
+                  borderBottom: "1px solid var(--warning)",
+                  color: "var(--warning)",
+                  fontSize: 11,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                }}
+              >
+                <AlertTriangle size={15} />
+                <span>
+                  Conflict Detected: This file was modified on disk since the AI generated this proposal. Applying may overwrite local changes.
+                </span>
+              </div>
+            )}
+
+            {/* Diff Content Preview */}
+            <div style={{ flex: 1, overflowY: "auto", padding: 16 }}>
+              <div style={{ marginBottom: 8, fontSize: 11, color: "var(--text-muted)" }}>
+                Proposed Patch / Content Preview:
+              </div>
+              <pre
+                style={{
+                  fontSize: 12,
+                  fontFamily: 'Consolas, "Fira Code", monospace',
+                  background: "var(--bg-root)",
+                  padding: 12,
+                  borderRadius: 6,
+                  border: "1px solid var(--border-color)",
+                  color: "var(--text-primary)",
+                  overflowX: "auto",
+                  maxHeight: "360px",
+                  margin: 0,
+                  whiteSpace: "pre-wrap",
+                }}
+              >
+                {reviewPreview.proposed_content}
+              </pre>
+
+              {applyMessage && (
+                <div
+                  style={{
+                    marginTop: 12,
+                    padding: "8px 12px",
+                    borderRadius: 4,
+                    fontSize: 12,
+                    background: applyMessage.includes("error")
+                      ? "rgba(239, 68, 68, 0.2)"
+                      : "rgba(16, 185, 129, 0.2)",
+                    color: applyMessage.includes("error") ? "var(--danger)" : "var(--success)",
+                    border: `1px solid ${
+                      applyMessage.includes("error") ? "var(--danger)" : "var(--success)"
+                    }`,
+                  }}
+                >
+                  {applyMessage}
+                </div>
+              )}
+            </div>
+
+            {/* Modal Actions */}
+            <div
+              style={{
+                height: 48,
+                padding: "0 16px",
+                borderTop: "1px solid var(--border-color)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "flex-end",
+                gap: 10,
+                background: "var(--bg-header)",
+              }}
+            >
+              <button
+                onClick={() => {
+                  setActiveProposal(null);
+                  setReviewPreview(null);
+                }}
+                disabled={isApplyingProposal}
+                style={{
+                  padding: "5px 12px",
+                  borderRadius: 4,
+                  background: "var(--bg-card)",
+                  border: "1px solid var(--border-color)",
+                  color: "var(--text-secondary)",
+                  fontSize: 12,
+                  cursor: "pointer",
+                }}
+              >
+                Cancel
+              </button>
+              {reviewPreview.has_conflict ? (
+                <button
+                  onClick={() => handleExecuteApplyProposal(true)}
+                  disabled={isApplyingProposal}
+                  style={{
+                    padding: "5px 12px",
+                    borderRadius: 4,
+                    background: "var(--warning)",
+                    border: "none",
+                    color: "#0a0e1a",
+                    fontSize: 12,
+                    fontWeight: 700,
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                  }}
+                >
+                  <AlertTriangle size={13} /> Force Apply Over Conflict
+                </button>
+              ) : (
+                <button
+                  onClick={() => handleExecuteApplyProposal(false)}
+                  disabled={isApplyingProposal}
+                  style={{
+                    padding: "5px 14px",
+                    borderRadius: 4,
+                    background: "var(--success)",
+                    border: "none",
+                    color: "#fff",
+                    fontSize: 12,
+                    fontWeight: 700,
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                  }}
+                >
+                  <Check size={14} /> Safe Apply to Disk (Atomic)
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

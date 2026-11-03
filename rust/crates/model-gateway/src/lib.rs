@@ -55,11 +55,59 @@ pub struct CompletionResponse {
     pub latency_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StreamDelta {
+    Started {
+        request_id: String,
+        model: String,
+    },
+    Chunk {
+        request_id: String,
+        delta: String,
+    },
+    Completed {
+        request_id: String,
+        full_text: String,
+        completion_tokens: usize,
+    },
+    Error {
+        request_id: String,
+        message: String,
+    },
+}
+
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     fn provider_name(&self) -> &str;
     fn list_models(&self) -> Vec<ModelMetadata>;
     async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse>;
+
+    async fn stream_completion(
+        &self,
+        req: &CompletionRequest,
+        request_id: &str,
+        sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<CompletionResponse> {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(AetherError::ModelProvider(
+                "Request cancelled by user".into(),
+            ));
+        }
+        let resp = self.complete(req).await?;
+        if !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = sender.send(StreamDelta::Chunk {
+                request_id: request_id.to_string(),
+                delta: resp.content.clone(),
+            });
+            let _ = sender.send(StreamDelta::Completed {
+                request_id: request_id.to_string(),
+                full_text: resp.content.clone(),
+                completion_tokens: resp.completion_tokens,
+            });
+        }
+        Ok(resp)
+    }
 }
 
 #[derive(Clone)]
@@ -237,6 +285,48 @@ impl ModelGateway {
             ))
         }
     }
+
+    pub async fn execute_stream(
+        &self,
+        req: &CompletionRequest,
+        request_id: &str,
+        sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<CompletionResponse> {
+        let target_model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| "claude-3-5-sonnet".into());
+
+        let providers: Vec<Arc<dyn ModelProvider>> =
+            self.providers.read().values().cloned().collect();
+
+        for provider in &providers {
+            if provider.list_models().iter().any(|m| m.id == target_model) {
+                return provider
+                    .stream_completion(req, request_id, sender, cancel)
+                    .await;
+            }
+        }
+
+        for provider in &providers {
+            if target_model.starts_with(provider.provider_name()) {
+                return provider
+                    .stream_completion(req, request_id, sender, cancel)
+                    .await;
+            }
+        }
+
+        if let Some(first) = providers.first() {
+            first
+                .stream_completion(req, request_id, sender, cancel)
+                .await
+        } else {
+            Err(AetherError::ModelProvider(
+                "No AI model providers registered".into(),
+            ))
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -338,6 +428,99 @@ impl ModelProvider for LocalOllamaProvider {
             model: req.model.clone().unwrap_or_else(|| "llama3".into()),
             content,
             prompt_tokens,
+            completion_tokens,
+            latency_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+
+    async fn stream_completion(
+        &self,
+        req: &CompletionRequest,
+        request_id: &str,
+        sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<CompletionResponse> {
+        let client = reqwest::Client::new();
+        let model_name = req
+            .model
+            .clone()
+            .unwrap_or_else(|| "llama3".into())
+            .replace("ollama/", "");
+
+        let payload = serde_json::json!({
+            "model": model_name,
+            "prompt": req.prompt,
+            "system": req.system.as_deref().unwrap_or(""),
+            "stream": true
+        });
+
+        let start = std::time::Instant::now();
+        let url = format!("{}/api/generate", self.endpoint);
+        let resp = client.post(&url).json(&payload).send().await.map_err(|e| {
+            AetherError::ModelProvider(format!(
+                "Failed to connect to local Ollama daemon at {}. Is Ollama running? Error: {}",
+                self.endpoint, e
+            ))
+        })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AetherError::ModelProvider(format!(
+                "Ollama returned HTTP error {}: {}",
+                status, body
+            )));
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut full_text = String::new();
+        let mut completion_tokens = 0usize;
+        let mut buffer = String::new();
+
+        use futures::StreamExt;
+        while let Some(chunk_res) = stream.next().await {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(AetherError::ModelProvider(
+                    "Request cancelled by user".into(),
+                ));
+            }
+
+            let bytes = chunk_res.map_err(|e| AetherError::ModelProvider(e.to_string()))?;
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+            while let Some(pos) = buffer.find('\n') {
+                let line = buffer[..pos].trim().to_string();
+                buffer.drain(..=pos);
+
+                if line.is_empty() {
+                    continue;
+                }
+
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if let Some(token) = json.get("response").and_then(|v| v.as_str()) {
+                        if !token.is_empty() {
+                            full_text.push_str(token);
+                            completion_tokens += 1;
+                            let _ = sender.send(StreamDelta::Chunk {
+                                request_id: request_id.to_string(),
+                                delta: token.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let _ = sender.send(StreamDelta::Completed {
+            request_id: request_id.to_string(),
+            full_text: full_text.clone(),
+            completion_tokens,
+        });
+
+        Ok(CompletionResponse {
+            model: req.model.clone().unwrap_or_else(|| "llama3".into()),
+            content: full_text,
+            prompt_tokens: 0,
             completion_tokens,
             latency_ms: start.elapsed().as_millis() as u64,
         })
@@ -525,6 +708,140 @@ impl ModelProvider for OpenAiCompatibleProvider {
             model: target_model,
             content,
             prompt_tokens,
+            completion_tokens,
+            latency_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+
+    async fn stream_completion(
+        &self,
+        req: &CompletionRequest,
+        request_id: &str,
+        sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<CompletionResponse> {
+        let api_key = match self.api_key_env_var {
+            Some(env_var) => {
+                let key = std::env::var(env_var).unwrap_or_default();
+                if key.trim().is_empty() {
+                    return Err(AetherError::ModelProvider(format!(
+                        "{} environment variable is not set. Please configure your API key in environment or Settings.",
+                        env_var
+                    )));
+                }
+                Some(key)
+            }
+            None => None,
+        };
+
+        let target_model = req.model.clone().unwrap_or_else(|| {
+            if self.name == "lmstudio" {
+                "local-model".into()
+            } else {
+                "gpt-4o".into()
+            }
+        });
+
+        let mut messages = Vec::new();
+        if let Some(sys) = &req.system {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": sys
+            }));
+        }
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": &req.prompt
+        }));
+
+        let payload = serde_json::json!({
+            "model": target_model,
+            "messages": messages,
+            "temperature": req.temperature.unwrap_or(0.2),
+            "max_tokens": req.max_tokens.unwrap_or(2048),
+            "stream": true
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/chat/completions", self.endpoint);
+        let mut request = client.post(&url).json(&payload);
+
+        if let Some(key) = api_key {
+            request = request.header("Authorization", format!("Bearer {}", key));
+        }
+
+        let start = std::time::Instant::now();
+        let resp = request.send().await.map_err(|e| {
+            AetherError::ModelProvider(format!("Failed to connect to {}: {}", self.endpoint, e))
+        })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AetherError::ModelProvider(format!(
+                "{} streaming error (HTTP {}): {}",
+                self.name, status, body
+            )));
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut full_text = String::new();
+        let mut completion_tokens = 0usize;
+        let mut buffer = String::new();
+
+        use futures::StreamExt;
+        while let Some(chunk_res) = stream.next().await {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(AetherError::ModelProvider(
+                    "Request cancelled by user".into(),
+                ));
+            }
+
+            let bytes = chunk_res.map_err(|e| AetherError::ModelProvider(e.to_string()))?;
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+            while let Some(pos) = buffer.find('\n') {
+                let line = buffer[..pos].trim().to_string();
+                buffer.drain(..=pos);
+
+                if line.is_empty() || line.starts_with(':') {
+                    continue;
+                }
+
+                if let Some(data_str) = line.strip_prefix("data: ") {
+                    if data_str.trim() == "[DONE]" {
+                        break;
+                    }
+
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
+                        if let Some(delta) = json
+                            .pointer("/choices/0/delta/content")
+                            .and_then(|v| v.as_str())
+                        {
+                            if !delta.is_empty() {
+                                full_text.push_str(delta);
+                                completion_tokens += 1;
+                                let _ = sender.send(StreamDelta::Chunk {
+                                    request_id: request_id.to_string(),
+                                    delta: delta.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let _ = sender.send(StreamDelta::Completed {
+            request_id: request_id.to_string(),
+            full_text: full_text.clone(),
+            completion_tokens,
+        });
+
+        Ok(CompletionResponse {
+            model: target_model,
+            content: full_text,
+            prompt_tokens: 0,
             completion_tokens,
             latency_ms: start.elapsed().as_millis() as u64,
         })

@@ -1,71 +1,68 @@
-//! AetherIDE — Production-Grade AI-Native Software Engineering Studio
-//! Tauri 2 Desktop Host and Native Services Integration
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 pub mod commands;
+#[cfg(windows)]
 pub mod win32_dialogs;
 pub mod workspace_bridge;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::Manager;
+use tracing::info;
 
 pub fn run() {
-    tauri::Builder::default()
-        // Single-instance enforcement: if another instance is launched, focus the existing main window
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
-        }))
-        .setup(|app| {
-            let data_dir = std::env::var("LOCALAPPDATA")
-                .map(|p| PathBuf::from(p).join("AetherIDE"))
-                .unwrap_or_else(|_| PathBuf::from("data"));
+    info!("Starting AetherIDE Tauri standalone runtime...");
 
+    tauri::Builder::default()
+        .setup(|app| {
+            let data_dir = app
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."));
             let _ = std::fs::create_dir_all(&data_dir);
 
-            // 1. Workspace Session & Terminal
-            let session: commands::workspace::SharedWorkspace = Arc::new(parking_lot::Mutex::new(
+            // 1. Central Workspace Access Manager
+            let session: workspace_bridge::SharedWorkspace = Arc::new(parking_lot::Mutex::new(
                 workspace_bridge::WorkspaceSession::new(data_dir.clone()),
             ));
-            let term_mgr = Arc::new(parking_lot::Mutex::new(
-                terminal_manager::TerminalManager::new(),
-            ));
+
+            // 2. Terminal Manager
+            let term_mgr: commands::terminal::SharedTerminalManager = Arc::new(
+                parking_lot::Mutex::new(terminal_manager::TerminalManager::new()),
+            );
             let active_term: commands::terminal::ActiveTerminalId =
                 Arc::new(parking_lot::Mutex::new(None));
 
-            // 2. Database Engine (SQLite WAL)
+            // 3. Database Engine & Project Brain
             let db_engine = database_engine::DatabaseEngine::open(data_dir.join("aether.db"))
-                .unwrap_or_else(|_| database_engine::DatabaseEngine::open_in_memory().unwrap());
+                .expect("Failed to initialize SQLite database engine");
             let db: commands::memory::SharedDatabase =
                 Arc::new(parking_lot::Mutex::new(db_engine.clone()));
-
-            // 3. Project Brain
             let brain: commands::brain::SharedBrain = Arc::new(parking_lot::Mutex::new(
                 project_brain::ProjectBrain::new(db_engine.clone()),
             ));
 
             // 4. Model Gateway & Agent Orchestrator
             let gateway_inst = model_gateway::ModelGateway::new();
-            let gateway: commands::ai::SharedGateway =
-                Arc::new(gateway_inst.clone());
+            let gateway: commands::ai::SharedGateway = Arc::new(gateway_inst.clone());
             let orchestrator: commands::agents::SharedOrchestrator = Arc::new(
-                agent_orchestrator::AgentOrchestrator::new(
-                    gateway_inst,
-                    db_engine,
-                ),
+                agent_orchestrator::AgentOrchestrator::new(gateway_inst, db_engine),
             );
 
-            // 5. Mobile & Checkpoint & LSP
+            // 5. Streams, Storage Candidates & Build Tracking
+            let active_streams: commands::ai::ActiveAiStreams =
+                Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+            let storage_candidates: commands::storage::SharedStorageCandidates =
+                Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+            let active_builds: commands::build::SharedActiveBuilds =
+                Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+            // 6. Mobile, Checkpoint & LSP
             let metro_pid: commands::mobile::ActiveMetroPid =
                 Arc::new(parking_lot::Mutex::new(None));
-            let checkpoint_engine: commands::checkpoint::SharedCheckpointEngine = Arc::new(
-                parking_lot::Mutex::new(checkpoint_engine::CheckpointEngine::new(
-                    data_dir.join("checkpoints"),
-                )),
-            );
+            let checkpoint_engine: commands::checkpoint::SharedCheckpointEngine =
+                Arc::new(parking_lot::Mutex::new(
+                    checkpoint_engine::CheckpointEngine::new(data_dir.join("checkpoints")),
+                ));
             let lsp_mux: commands::lsp::SharedLspMultiplexer =
                 Arc::new(lsp_client::LspMultiplexer::new(data_dir));
 
@@ -77,6 +74,9 @@ pub fn run() {
             app.manage(brain);
             app.manage(gateway);
             app.manage(orchestrator);
+            app.manage(active_streams);
+            app.manage(storage_candidates);
+            app.manage(active_builds);
             app.manage(metro_pid);
             app.manage(checkpoint_engine);
             app.manage(lsp_mux);
@@ -120,6 +120,9 @@ pub fn run() {
             commands::ai_get_providers,
             commands::ai_complete,
             commands::ai_stream_prompt,
+            commands::ai_cancel_stream,
+            commands::ai_preview_proposal,
+            commands::ai_apply_proposal,
             // AI Agents & Swarm Orchestration
             commands::agent_list_personas,
             commands::agent_spawn_task,
@@ -136,12 +139,14 @@ pub fn run() {
             // Build Management
             commands::build_detect_systems,
             commands::build_run_task,
+            commands::build_cancel_task,
             // Storage Management
             commands::storage_analyze,
             commands::storage_cleanup,
             // Checkpoint Engine
             commands::checkpoint_create,
             commands::checkpoint_list,
+            commands::checkpoint_restore_preview,
             commands::checkpoint_restore,
             // Git Engine
             commands::git_get_status,
