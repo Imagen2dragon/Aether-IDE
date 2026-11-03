@@ -79,18 +79,40 @@ pub async fn checkpoint_restore_preview(
 pub async fn checkpoint_restore(
     app: AppHandle,
     checkpoint_id: String,
+    force: Option<bool>,
+    approved_conflicts: Option<Vec<String>>,
 ) -> Result<CheckpointRestoreReport, String> {
     let ws_arc = app.state::<SharedWorkspace>();
     let ws = ws_arc.lock();
     let root = ws
         .primary_root()
         .ok_or_else(|| "No active workspace root open to restore".to_string())?;
+    let ws_id = ws.workspace_id();
     drop(ws);
 
     let engine_arc = app.state::<SharedCheckpointEngine>();
     let engine = engine_arc.lock();
 
+    // 1. Create pre-restore safety snapshot before destructive restore
+    let _ = engine.create_checkpoint_with_root(
+        &format!("Pre-restore safety backup for {}", checkpoint_id),
+        &ws_id,
+        &root,
+        None,
+    );
+
+    // 2. Perform preview to evaluate conflicts
+    let preview = engine
+        .restore_preview(&checkpoint_id, &root)
+        .map_err(|e| format!("Failed to preview restore: {}", e))?;
+
+    let allow_overwrite = if force.unwrap_or(false) {
+        preview.conflicts.clone()
+    } else {
+        approved_conflicts.unwrap_or_default()
+    };
+
     engine
-        .restore_checkpoint_into(&checkpoint_id, &root, false)
+        .restore_checkpoint_with_token(&checkpoint_id, &root, &preview, &allow_overwrite)
         .map_err(|e| format!("Failed to restore checkpoint: {}", e))
 }
