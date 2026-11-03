@@ -1,10 +1,12 @@
 use application_core::{AetherError, AutonomyMode, Result};
 use database_engine::{DatabaseEngine, ProofOfWorkRecord};
+use filesystem_engine::WorkspaceCapability;
 use model_gateway::{CompletionRequest, ModelGateway};
 use permission_engine::{ActionType, AuthorizationDecision, PermissionEngine};
 use process_manager::ProcessManager;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskStatus {
@@ -50,24 +52,167 @@ pub struct ToolOutput {
     pub exit_code: i32,
 }
 
+/// AgentExecutionContext enforces cryptographic and filesystem-level capability boundaries
+/// for all tool operations invoked by autonomous agents.
+#[derive(Clone)]
+pub struct AgentExecutionContext {
+    pub workspace_id: String,
+    pub root_id: String,
+    pub canonical_root: PathBuf,
+    pub is_trusted: bool,
+    pub task_id: String,
+    pub capability: Arc<WorkspaceCapability>,
+}
+
+impl AgentExecutionContext {
+    pub fn new(
+        workspace_id: impl Into<String>,
+        root_id: impl Into<String>,
+        canonical_root: PathBuf,
+        is_trusted: bool,
+        task_id: impl Into<String>,
+        capability: Arc<WorkspaceCapability>,
+    ) -> Self {
+        Self {
+            workspace_id: workspace_id.into(),
+            root_id: root_id.into(),
+            canonical_root,
+            is_trusted,
+            task_id: task_id.into(),
+            capability,
+        }
+    }
+
+    /// Creates an execution context for a directory, opening a new WorkspaceCapability.
+    pub fn from_directory<P: AsRef<Path>>(
+        root: P,
+        is_trusted: bool,
+        task_id: impl Into<String>,
+    ) -> Result<Self> {
+        let root_ref = root.as_ref();
+        let canonical_root = root_ref.canonicalize().map_err(AetherError::Io)?;
+        let capability = Arc::new(WorkspaceCapability::open(&canonical_root)?);
+        let tid = task_id.into();
+        Ok(Self {
+            workspace_id: format!("ws-{}", uuid::Uuid::new_v4().simple()),
+            root_id: "root-0".to_string(),
+            canonical_root,
+            is_trusted,
+            task_id: tid,
+            capability,
+        })
+    }
+
+    /// Authorizes and reads a text file anchored strictly to the capability.
+    pub fn authorize_read(&self, user_path: &str) -> Result<String> {
+        self.capability.read_file(user_path)
+    }
+
+    /// Authorizes and reads raw bytes anchored strictly to the capability.
+    pub fn authorize_read_bytes(&self, user_path: &str) -> Result<Vec<u8>> {
+        self.capability.read_file_bytes(user_path)
+    }
+
+    /// Authorizes and writes text atomically anchored strictly to the capability.
+    pub fn authorize_write(&self, user_path: &str, content: &str) -> Result<PathBuf> {
+        self.capability.write_file_atomic(user_path, content)
+    }
+
+    /// Authorizes and writes raw bytes atomically anchored strictly to the capability.
+    pub fn authorize_write_bytes(&self, user_path: &str, bytes: &[u8]) -> Result<PathBuf> {
+        self.capability.write_file_bytes_atomic(user_path, bytes)
+    }
+
+    /// Authorizes and deletes a file anchored strictly to the capability.
+    pub fn authorize_delete(&self, user_path: &str) -> Result<()> {
+        self.capability.delete_file(user_path)
+    }
+
+    /// Authorizes a process working directory, enforcing boundary containment and trust status.
+    pub fn authorize_process(&self, requested_cwd: Option<&str>) -> Result<PathBuf> {
+        if !self.is_trusted {
+            return Err(AetherError::PermissionDenied(format!(
+                "Security Denial: Untrusted workspace '{}'. Process execution denied.",
+                self.workspace_id
+            )));
+        }
+
+        let target = match requested_cwd {
+            None => self.canonical_root.clone(),
+            Some(cwd) if cwd.trim().is_empty() => self.canonical_root.clone(),
+            Some(cwd) => {
+                let p = Path::new(cwd);
+                let full = if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    self.canonical_root.join(p)
+                };
+
+                let canon = full.canonicalize().map_err(|e| {
+                    AetherError::PermissionDenied(format!(
+                        "Invalid process working directory {:?}: {}",
+                        cwd, e
+                    ))
+                })?;
+
+                if !filesystem_engine::FilesystemEngine::is_within_boundary(
+                    &canon,
+                    &self.canonical_root,
+                ) {
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Security Denial: Working directory {:?} escapes workspace boundary {:?}",
+                        cwd, self.canonical_root
+                    )));
+                }
+
+                // Reject if path is an external symlink
+                if let Ok(meta) = std::fs::symlink_metadata(&full) {
+                    if meta.file_type().is_symlink() {
+                        let link_target = std::fs::read_link(&full).map_err(AetherError::Io)?;
+                        let resolved_target = if link_target.is_absolute() {
+                            link_target
+                        } else {
+                            full.parent()
+                                .unwrap_or(&self.canonical_root)
+                                .join(link_target)
+                        };
+                        let target_canon =
+                            resolved_target.canonicalize().map_err(AetherError::Io)?;
+                        if !filesystem_engine::FilesystemEngine::is_within_boundary(
+                            &target_canon,
+                            &self.canonical_root,
+                        ) {
+                            return Err(AetherError::PermissionDenied(format!(
+                                "Security Denial: Working directory symlink {:?} points outside workspace boundary",
+                                cwd
+                            )));
+                        }
+                    }
+                }
+
+                canon
+            }
+        };
+
+        Ok(target)
+    }
+}
+
 pub struct ToolDispatcher;
 
 impl ToolDispatcher {
     pub async fn dispatch(
         tool: &str,
         input: &serde_json::Value,
-        base_dir: Option<&Path>,
+        ctx: &AgentExecutionContext,
         db: &DatabaseEngine,
     ) -> Result<ToolOutput> {
-        let base_path = base_dir.unwrap_or_else(|| Path::new("."));
-
         match tool {
             "read_file" => {
                 let rel_path = input["path"].as_str().ok_or_else(|| {
                     AetherError::Agent("read_file requires 'path' parameter".into())
                 })?;
-                let safe_path = Self::resolve_safe_path(base_path, rel_path)?;
-                let content = filesystem_engine::FilesystemEngine::read_file_string(&safe_path)?;
+                let content = ctx.authorize_read(rel_path)?;
                 Ok(ToolOutput {
                     success: true,
                     output: content,
@@ -82,10 +227,11 @@ impl ToolDispatcher {
                 let content = input["content"].as_str().ok_or_else(|| {
                     AetherError::Agent("write_file requires 'content' parameter".into())
                 })?;
-                let safe_path = Self::resolve_safe_path(base_path, rel_path)?;
-                filesystem_engine::FilesystemEngine::write_file_atomic(&safe_path, content)?;
+                let safe_path = ctx.authorize_write(rel_path, content)?;
 
-                let diff = git_engine::GitEngine::get_diff(base_path).await.ok();
+                let diff = git_engine::GitEngine::get_diff(&ctx.canonical_root)
+                    .await
+                    .ok();
                 Ok(ToolOutput {
                     success: true,
                     output: format!(
@@ -101,14 +247,12 @@ impl ToolDispatcher {
                 let command = input["command"].as_str().ok_or_else(|| {
                     AetherError::Agent("run_command requires 'command' parameter".into())
                 })?;
-                let cwd = input["cwd"]
-                    .as_str()
-                    .map(PathBuf::from)
-                    .or_else(|| Some(base_path.to_path_buf()));
+                let cwd_opt = input.get("cwd").and_then(|v| v.as_str());
+                let safe_cwd = ctx.authorize_process(cwd_opt)?;
 
                 let res = ProcessManager::run_command_streaming(
                     command,
-                    cwd,
+                    Some(safe_cwd),
                     Some(std::time::Duration::from_secs(60)),
                     None,
                     None,
@@ -129,7 +273,7 @@ impl ToolDispatcher {
                 })
             }
             "git_diff" => {
-                let diff = git_engine::GitEngine::get_diff(base_path).await?;
+                let diff = git_engine::GitEngine::get_diff(&ctx.canonical_root).await?;
                 Ok(ToolOutput {
                     success: true,
                     output: if diff.is_empty() {
@@ -170,21 +314,11 @@ impl ToolDispatcher {
             ))),
         }
     }
-
-    fn resolve_safe_path(base: &Path, rel: &str) -> Result<PathBuf> {
-        let clean_rel = rel.trim_start_matches(['/', '\\']);
-        if rel.contains("..") {
-            return Err(AetherError::PermissionDenied(format!(
-                "Path traversal rejected: {}",
-                rel
-            )));
-        }
-        Ok(base.join(clean_rel))
-    }
 }
 
 pub struct AgentRuntime {
     pub task: AgentTask,
+    pub context: AgentExecutionContext,
     model_gateway: ModelGateway,
     db: DatabaseEngine,
 }
@@ -194,24 +328,25 @@ impl AgentRuntime {
         role: &str,
         objective: &str,
         autonomy_mode: AutonomyMode,
-        worktree_path: Option<PathBuf>,
+        context: AgentExecutionContext,
         model_gateway: ModelGateway,
         db: DatabaseEngine,
     ) -> Self {
-        let task_id = format!("task-{}", uuid::Uuid::new_v4().simple());
+        let task_id = context.task_id.clone();
         let task = AgentTask {
             task_id,
             role: role.to_string(),
             objective: objective.to_string(),
             autonomy_mode,
             status: TaskStatus::Pending,
-            worktree_path,
+            worktree_path: Some(context.canonical_root.clone()),
             steps: Vec::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
         };
 
         Self {
             task,
+            context,
             model_gateway,
             db,
         }
@@ -309,9 +444,8 @@ impl AgentRuntime {
                 step.approved = true;
                 self.task.status = TaskStatus::Executing;
 
-                let base_path = self.task.worktree_path.as_deref();
                 let tool_res =
-                    ToolDispatcher::dispatch(&tool, &params_json, base_path, &self.db).await?;
+                    ToolDispatcher::dispatch(&tool, &params_json, &self.context, &self.db).await?;
 
                 step.output_json = Some(tool_res.output.clone());
                 step.diff = tool_res.diff.clone();
@@ -362,8 +496,8 @@ impl AgentRuntime {
         let params: serde_json::Value =
             serde_json::from_str(&step.input_json).unwrap_or_else(|_| serde_json::json!({}));
 
-        let base_path = self.task.worktree_path.as_deref();
-        let tool_res = ToolDispatcher::dispatch(&step.tool, &params, base_path, &self.db).await?;
+        let tool_res =
+            ToolDispatcher::dispatch(&step.tool, &params, &self.context, &self.db).await?;
 
         step.output_json = Some(tool_res.output.clone());
         step.diff = tool_res.diff.clone();
@@ -436,12 +570,15 @@ mod tests {
         ));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
+        let ctx = AgentExecutionContext::from_directory(&temp_dir, true, "task-test-1")
+            .expect("Failed to create agent execution context");
+
         // 1. write_file
         let write_input = serde_json::json!({
             "path": "test.txt",
             "content": "AetherIDE autonomous tool execution verified."
         });
-        let write_res = ToolDispatcher::dispatch("write_file", &write_input, Some(&temp_dir), &db)
+        let write_res = ToolDispatcher::dispatch("write_file", &write_input, &ctx, &db)
             .await
             .expect("write_file failed");
         assert!(write_res.success);
@@ -449,7 +586,7 @@ mod tests {
 
         // 2. read_file
         let read_input = serde_json::json!({ "path": "test.txt" });
-        let read_res = ToolDispatcher::dispatch("read_file", &read_input, Some(&temp_dir), &db)
+        let read_res = ToolDispatcher::dispatch("read_file", &read_input, &ctx, &db)
             .await
             .expect("read_file failed");
         assert!(read_res.success);
@@ -463,25 +600,143 @@ mod tests {
     #[tokio::test]
     async fn test_tool_dispatcher_run_command() {
         let db = DatabaseEngine::open_in_memory().unwrap();
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether-test-cmd-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let ctx = AgentExecutionContext::from_directory(&temp_dir, true, "task-cmd-1")
+            .expect("Failed to create execution context");
+
         let cmd_input = serde_json::json!({ "command": "echo aether_agent_ok" });
-        let res = ToolDispatcher::dispatch("run_command", &cmd_input, None, &db)
+        let res = ToolDispatcher::dispatch("run_command", &cmd_input, &ctx, &db)
             .await
             .expect("run_command failed");
         assert!(res.success);
         assert!(res.output.contains("aether_agent_ok"));
         assert_eq!(res.exit_code, 0);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_sec_001_path_traversal_read_rejected() {
+        let db = DatabaseEngine::open_in_memory().unwrap();
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether-sec001-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let ctx = AgentExecutionContext::from_directory(&temp_dir, true, "task-sec-1").unwrap();
+
+        let read_input = serde_json::json!({ "path": "../../etc/passwd" });
+        let res = ToolDispatcher::dispatch("read_file", &read_input, &ctx, &db).await;
+        assert!(res.is_err(), "Path traversal in read_file must be rejected");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_sec_002_path_traversal_write_rejected() {
+        let db = DatabaseEngine::open_in_memory().unwrap();
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether-sec002-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let ctx = AgentExecutionContext::from_directory(&temp_dir, true, "task-sec-2").unwrap();
+
+        let write_input = serde_json::json!({
+            "path": "../../../escaped_secret.txt",
+            "content": "pwned"
+        });
+        let res = ToolDispatcher::dispatch("write_file", &write_input, &ctx, &db).await;
+        assert!(
+            res.is_err(),
+            "Path traversal in write_file must be rejected"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_sec_004_run_command_cwd_escape_rejected() {
+        let db = DatabaseEngine::open_in_memory().unwrap();
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether-sec004-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let ctx = AgentExecutionContext::from_directory(&temp_dir, true, "task-sec-4").unwrap();
+
+        // Target an outside directory
+        #[cfg(windows)]
+        let outside_dir = "C:\\Windows";
+        #[cfg(not(windows))]
+        let outside_dir = "/etc";
+
+        let cmd_input = serde_json::json!({
+            "command": "echo test",
+            "cwd": outside_dir
+        });
+        let res = ToolDispatcher::dispatch("run_command", &cmd_input, &ctx, &db).await;
+        assert!(
+            res.is_err(),
+            "run_command with cwd outside workspace root must be rejected"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_sec_005_untrusted_workspace_execution_denied() {
+        let db = DatabaseEngine::open_in_memory().unwrap();
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether-sec005-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let ctx = AgentExecutionContext::from_directory(&temp_dir, false, "task-sec-5").unwrap();
+
+        let cmd_input = serde_json::json!({ "command": "echo test" });
+        let res = ToolDispatcher::dispatch("run_command", &cmd_input, &ctx, &db).await;
+        assert!(
+            res.is_err(),
+            "run_command in untrusted workspace must be denied"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_sec_006_reserved_dos_names_rejected() {
+        let db = DatabaseEngine::open_in_memory().unwrap();
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether-sec006-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let ctx = AgentExecutionContext::from_directory(&temp_dir, true, "task-sec-6").unwrap();
+
+        let write_input = serde_json::json!({
+            "path": "CON",
+            "content": "crash"
+        });
+        let res = ToolDispatcher::dispatch("write_file", &write_input, &ctx, &db).await;
+        assert!(
+            res.is_err(),
+            "Writing to reserved DOS name CON must be rejected"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[tokio::test]
     async fn test_permission_engine_blocks_writes_in_observe_mode() {
         let db = DatabaseEngine::open_in_memory().unwrap();
         let gateway = ModelGateway::new();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether-test-observe-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let ctx = AgentExecutionContext::from_directory(&temp_dir, true, "task-observe-1").unwrap();
 
         let mut runtime = AgentRuntime::new(
             "Security Auditor",
             "write malicious changes",
             AutonomyMode::Observe,
-            None,
+            ctx,
             gateway,
             db,
         );
@@ -489,18 +744,25 @@ mod tests {
         let res = runtime.execute_next_step().await;
         assert!(res.is_err());
         assert_eq!(runtime.task.status, TaskStatus::Failed);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[tokio::test]
     async fn test_agent_runtime_step_execution_and_proof_of_work() {
         let db = DatabaseEngine::open_in_memory().unwrap();
         let gateway = ModelGateway::new();
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether-test-pow-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let ctx = AgentExecutionContext::from_directory(&temp_dir, true, "task-pow-1").unwrap();
 
         let mut runtime = AgentRuntime::new(
             "Rust Systems Architect",
             "run git status check",
             AutonomyMode::Autopilot,
-            None,
+            ctx,
             gateway,
             db.clone(),
         );
@@ -518,5 +780,7 @@ mod tests {
         let pows = db.get_proof_of_work(&runtime.task.task_id).unwrap();
         assert_eq!(pows.len(), 1);
         assert_eq!(pows[0].tool_name, "run_command");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

@@ -307,7 +307,7 @@ pub async fn ai_apply_proposal(
             &desc,
             &ws_id,
             &root,
-            Some(&[full_path.clone()]),
+            Some(std::slice::from_ref(&full_path)),
         ) {
             Ok(ckpt) => Some(ckpt.checkpoint_id),
             Err(e) => {

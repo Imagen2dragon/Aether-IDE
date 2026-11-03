@@ -255,10 +255,10 @@ impl WorkspaceCapability {
         self.read_file_bytes(&rel_str)
     }
 
-    /// Writes content to a file inside the capability using atomic handle-level operations.
+    /// Writes raw binary bytes to a file inside the capability using atomic handle-level operations.
     /// Creates a capability-isolated temporary file via `create_new(true)`, writes and syncs to disk,
     /// verifies the destination is not a symlink, and performs an atomic rename anchored to the capability.
-    pub fn write_file_atomic(&self, user_path: &str, content: &str) -> Result<PathBuf> {
+    pub fn write_file_bytes_atomic(&self, user_path: &str, bytes: &[u8]) -> Result<PathBuf> {
         let rel = sanitize_relative_path(user_path)?;
 
         // Ensure parent directory exists anchored inside capability
@@ -292,7 +292,7 @@ impl WorkspaceCapability {
             .dir
             .open_with(&temp_rel, &opts)
             .map_err(AetherError::Io)?;
-        f.write_all(content.as_bytes()).map_err(AetherError::Io)?;
+        f.write_all(bytes).map_err(AetherError::Io)?;
         f.sync_all().map_err(AetherError::Io)?;
         drop(f);
 
@@ -303,6 +303,11 @@ impl WorkspaceCapability {
         }
 
         Ok(self.root_path.join(rel))
+    }
+
+    /// Writes content to a file inside the capability using atomic handle-level operations.
+    pub fn write_file_atomic(&self, user_path: &str, content: &str) -> Result<PathBuf> {
+        self.write_file_bytes_atomic(user_path, content.as_bytes())
     }
 
     /// Creates directory inside workspace capability.
@@ -537,16 +542,20 @@ impl FilesystemEngine {
         cap.scan_workspace_files(exclude_patterns)
     }
 
-    pub fn write_file_atomic<P: AsRef<Path>>(path: P, content: &str) -> Result<()> {
+    pub fn write_file_bytes_atomic<P: AsRef<Path>>(path: P, bytes: &[u8]) -> Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
         let temp_path = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
-        fs::write(&temp_path, content)?;
+        fs::write(&temp_path, bytes)?;
         fs::rename(&temp_path, path)?;
         Ok(())
+    }
+
+    pub fn write_file_atomic<P: AsRef<Path>>(path: P, content: &str) -> Result<()> {
+        Self::write_file_bytes_atomic(path, content.as_bytes())
     }
 
     pub fn read_file_string<P: AsRef<Path>>(path: P) -> Result<String> {

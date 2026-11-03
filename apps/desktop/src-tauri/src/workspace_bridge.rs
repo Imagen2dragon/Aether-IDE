@@ -230,6 +230,51 @@ impl WorkspaceSession {
         ))
     }
 
+    /// Creates an AgentExecutionContext strictly bound to an authorized workspace root.
+    pub fn create_agent_context(
+        &self,
+        requested_root: Option<&Path>,
+        task_id: &str,
+    ) -> Result<agent_runtime::AgentExecutionContext, String> {
+        let roots = self.roots.lock().unwrap();
+        if roots.is_empty() {
+            return Err("No active workspace is open".into());
+        }
+
+        let target_root = match requested_root {
+            Some(req) => {
+                let canon = req
+                    .canonicalize()
+                    .map_err(|e| format!("Invalid workspace root {:?}: {}", req, e))?;
+                roots
+                    .iter()
+                    .find(|r| {
+                        r.canonical_path == canon
+                            || filesystem_engine::FilesystemEngine::is_within_boundary(
+                                &canon,
+                                &r.canonical_path,
+                            )
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "Security Denial: Directory {:?} is outside all authorized workspace roots.",
+                            canon
+                        )
+                    })?
+            }
+            None => &roots[0],
+        };
+
+        Ok(agent_runtime::AgentExecutionContext::new(
+            &target_root.workspace_id,
+            &target_root.root_id,
+            target_root.canonical_path.clone(),
+            target_root.is_trusted,
+            task_id,
+            target_root.capability.clone(),
+        ))
+    }
+
     /// Resolves an incoming user path against active workspace roots.
     /// Returns (Capability Arc, Canonical Root PathBuf, Relative Path String).
     pub fn resolve_in_workspace(

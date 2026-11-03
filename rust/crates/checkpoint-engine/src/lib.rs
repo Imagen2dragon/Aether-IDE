@@ -29,11 +29,14 @@ pub struct WorkspaceCheckpoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointRestorePreview {
     pub checkpoint_id: String,
+    pub preview_token: String,
     pub files_to_create: Vec<String>,
     pub files_to_overwrite: Vec<String>,
     pub conflicts: Vec<String>,
     pub missing_blobs: Vec<String>,
     pub integrity_valid: bool,
+    #[serde(default)]
+    pub disk_hashes: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,6 +264,7 @@ impl CheckpointEngine {
         let mut files_to_overwrite = Vec::new();
         let mut conflicts = Vec::new();
         let mut missing_blobs = Vec::new();
+        let mut disk_hashes = HashMap::new();
 
         for record in &ckpt.files {
             // Verify relative path security
@@ -282,6 +286,7 @@ impl CheckpointEngine {
             if dest_path.exists() {
                 if let Ok(current_bytes) = std::fs::read(&dest_path) {
                     let current_hash = Self::sha256_digest(&current_bytes);
+                    disk_hashes.insert(record.relative_path.clone(), current_hash.clone());
                     if current_hash != record.sha256 {
                         files_to_overwrite.push(record.relative_path.clone());
                         conflicts.push(record.relative_path.clone());
@@ -295,14 +300,17 @@ impl CheckpointEngine {
         }
 
         let integrity_valid = missing_blobs.is_empty();
+        let preview_token = format!("prev-{}", uuid::Uuid::new_v4().simple());
 
         Ok(CheckpointRestorePreview {
             checkpoint_id: checkpoint_id.to_string(),
+            preview_token,
             files_to_create,
             files_to_overwrite,
             conflicts,
             missing_blobs,
             integrity_valid,
+            disk_hashes,
         })
     }
 
@@ -313,7 +321,7 @@ impl CheckpointEngine {
             .first()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
-        let report = self.restore_checkpoint_into(&checkpoint.checkpoint_id, &root, false)?;
+        let report = self.restore_checkpoint_into(&checkpoint.checkpoint_id, &root, true)?;
         if !report.success {
             return Err(AetherError::Internal(format!(
                 "Restore failed: {:?}",
@@ -328,14 +336,64 @@ impl CheckpointEngine {
         &self,
         checkpoint_id: &str,
         root_dir: &Path,
-        _force: bool,
+        force: bool,
     ) -> Result<CheckpointRestoreReport> {
         let preview = self.restore_preview(checkpoint_id, root_dir)?;
+        let overwrite_list: Vec<String> = if force {
+            preview.conflicts.clone()
+        } else {
+            Vec::new()
+        };
+        self.restore_checkpoint_with_token(checkpoint_id, root_dir, &preview, &overwrite_list)
+    }
+
+    /// Restores a snapshot into target root directory with explicit conflict decisions,
+    /// race condition protection against post-preview modifications, byte-level atomic writes,
+    /// and post-restore cryptographic integrity verification.
+    pub fn restore_checkpoint_with_token(
+        &self,
+        checkpoint_id: &str,
+        root_dir: &Path,
+        preview: &CheckpointRestorePreview,
+        explicit_overwrite_conflicts: &[String],
+    ) -> Result<CheckpointRestoreReport> {
         if !preview.integrity_valid {
             return Err(AetherError::Internal(format!(
                 "Checkpoint integrity check failed: missing blobs {:?}",
                 preview.missing_blobs
             )));
+        }
+
+        // 1. Enforce default fail-closed policy: Abort on unresolved conflicts
+        let unapproved_conflicts: Vec<_> = preview
+            .conflicts
+            .iter()
+            .filter(|c| !explicit_overwrite_conflicts.contains(c))
+            .cloned()
+            .collect();
+
+        if !unapproved_conflicts.is_empty() {
+            return Err(AetherError::PermissionDenied(format!(
+                "Restore aborted: {} unresolved conflicts detected in {:?}. Explicit user authorization required to overwrite.",
+                unapproved_conflicts.len(),
+                unapproved_conflicts
+            )));
+        }
+
+        // 2. Protect against restore races: revalidate current file states against preview snapshot
+        for (rel_path, expected_hash) in &preview.disk_hashes {
+            let dest_path = root_dir.join(rel_path);
+            if dest_path.exists() {
+                if let Ok(current_bytes) = std::fs::read(&dest_path) {
+                    let current_hash = Self::sha256_digest(&current_bytes);
+                    if &current_hash != expected_hash {
+                        return Err(AetherError::PermissionDenied(format!(
+                            "Restore race detected: file '{}' was modified on disk after preview was generated (Expected: {}, Current: {}). Restore aborted to protect modifications.",
+                            rel_path, expected_hash, current_hash
+                        )));
+                    }
+                }
+            }
         }
 
         let snapshot_dir = self.storage_dir.join(checkpoint_id);
@@ -380,11 +438,10 @@ impl CheckpointEngine {
                 continue;
             }
 
-            // Write atomically via capability
-            let content_str = String::from_utf8_lossy(&blob_bytes);
-            match cap.write_file_atomic(&record.relative_path, &content_str) {
+            // Byte-perfect restoration: write raw bytes atomically via capability
+            match cap.write_file_bytes_atomic(&record.relative_path, &blob_bytes) {
                 Ok(_) => {
-                    // Verify resulting disk file
+                    // Cryptographic post-restore verification of file on disk
                     let dest = root_dir.join(&record.relative_path);
                     if let Ok(written_bytes) = std::fs::read(&dest) {
                         let written_hash = Self::sha256_digest(&written_bytes);
@@ -392,8 +449,8 @@ impl CheckpointEngine {
                             restored_files.push(record.relative_path.clone());
                         } else {
                             errors.push(format!(
-                                "Post-restore hash mismatch for '{}'",
-                                record.relative_path
+                                "Post-restore hash mismatch for '{}'. Expected {}, found on disk {}",
+                                record.relative_path, record.sha256, written_hash
                             ));
                         }
                     } else {
@@ -480,10 +537,18 @@ mod tests {
         assert_eq!(preview_after.conflicts.len(), 1);
         assert_eq!(preview_after.conflicts[0], "hello.txt");
 
-        // Restore snapshot
+        // Restore snapshot with force=false must abort due to conflict
+        let unapproved_res =
+            engine.restore_checkpoint_into(&ckpt.checkpoint_id, &workspace_dir, false);
+        assert!(
+            unapproved_res.is_err(),
+            "Default restore must abort on unresolved conflicts"
+        );
+
+        // Restore snapshot with explicit authorization (force=true)
         let report = engine
-            .restore_checkpoint_into(&ckpt.checkpoint_id, &workspace_dir, false)
-            .expect("Restore failed");
+            .restore_checkpoint_into(&ckpt.checkpoint_id, &workspace_dir, true)
+            .expect("Restore with explicit authorization failed");
 
         assert!(report.success);
         assert_eq!(report.restored_count, 2);
@@ -491,6 +556,127 @@ mod tests {
         // Verify content restored
         let restored_content = std::fs::read_to_string(&file1).unwrap();
         assert_eq!(restored_content, "Hello world");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_checkpoint_binary_and_invalid_utf8_byte_preservation() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_ckpt_bin_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        // 1. Valid binary image fixture (PNG magic header + binary data)
+        let png_bytes: Vec<u8> = vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89,
+        ];
+        let png_file = workspace_dir.join("image.png");
+        std::fs::write(&png_file, &png_bytes).unwrap();
+        let expected_png_hash = CheckpointEngine::sha256_digest(&png_bytes);
+
+        // 2. Raw binary file with invalid UTF-8 sequences (0xFF, 0xFE, 0x80, etc.)
+        let invalid_utf8_bytes: Vec<u8> =
+            vec![0xFF, 0xFE, 0xC0, 0xAF, 0x80, 0x81, 0x00, 0x12, 0x34];
+        let bin_file = workspace_dir.join("corrupt_or_raw.bin");
+        std::fs::write(&bin_file, &invalid_utf8_bytes).unwrap();
+        let expected_bin_hash = CheckpointEngine::sha256_digest(&invalid_utf8_bytes);
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("Binary test snapshot", "ws-bin", &workspace_dir, None)
+            .expect("Failed to create checkpoint");
+
+        assert_eq!(
+            ckpt.file_hashes.get("image.png").unwrap(),
+            &expected_png_hash
+        );
+        assert_eq!(
+            ckpt.file_hashes.get("corrupt_or_raw.bin").unwrap(),
+            &expected_bin_hash
+        );
+
+        // Corrupt files on disk
+        std::fs::write(&png_file, b"corrupted png bytes").unwrap();
+        std::fs::write(&bin_file, b"corrupted bin bytes").unwrap();
+
+        // Restore with explicit authorization
+        let report = engine
+            .restore_checkpoint_into(&ckpt.checkpoint_id, &workspace_dir, true)
+            .expect("Restore failed");
+
+        assert!(report.success);
+        assert_eq!(report.restored_count, 2);
+
+        // Verify restored bytes on disk are bit-for-bit identical to original
+        let restored_png_bytes = std::fs::read(&png_file).unwrap();
+        assert_eq!(
+            restored_png_bytes, png_bytes,
+            "PNG bytes must be restored without UTF-8 loss"
+        );
+        assert_eq!(
+            CheckpointEngine::sha256_digest(&restored_png_bytes),
+            expected_png_hash
+        );
+
+        let restored_bin_bytes = std::fs::read(&bin_file).unwrap();
+        assert_eq!(
+            restored_bin_bytes, invalid_utf8_bytes,
+            "Invalid UTF-8 bytes must be restored without substitution characters"
+        );
+        assert_eq!(
+            CheckpointEngine::sha256_digest(&restored_bin_bytes),
+            expected_bin_hash
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_checkpoint_restore_race_detection() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_ckpt_race_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let file = workspace_dir.join("race_target.txt");
+        std::fs::write(&file, "version 1").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("Race snapshot", "ws-race", &workspace_dir, None)
+            .expect("Failed to create checkpoint");
+
+        // User modifies file
+        std::fs::write(&file, "version 2 (user changes)").unwrap();
+
+        // Preview is requested
+        let preview = engine
+            .restore_preview(&ckpt.checkpoint_id, &workspace_dir)
+            .expect("Preview failed");
+        assert_eq!(preview.conflicts.len(), 1);
+
+        // Concurrent process mutates file on disk AFTER preview was generated!
+        std::fs::write(&file, "version 3 (concurrent edit)").unwrap();
+
+        // User attempts to restore with preview token
+        let res = engine.restore_checkpoint_with_token(
+            &ckpt.checkpoint_id,
+            &workspace_dir,
+            &preview,
+            &["race_target.txt".to_string()],
+        );
+
+        // Must abort because file was modified after preview!
+        assert!(res.is_err());
+        let err_str = format!("{:?}", res.err().unwrap());
+        assert!(err_str.contains("Restore race detected"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -7,7 +7,7 @@ pub use swarm::{
     SwarmTaskStatus,
 };
 
-use agent_runtime::{AgentRuntime, AgentTask};
+use agent_runtime::{AgentExecutionContext, AgentRuntime, AgentTask};
 use application_core::{AetherError, AutonomyMode, Result};
 use database_engine::DatabaseEngine;
 use model_gateway::ModelGateway;
@@ -154,6 +154,27 @@ impl AgentOrchestrator {
         self.spawn_task_with_worktree(role, objective, autonomy_mode, None)
     }
 
+    pub fn spawn_task_with_context(
+        &self,
+        role: &str,
+        objective: &str,
+        autonomy_mode: AutonomyMode,
+        context: AgentExecutionContext,
+    ) -> String {
+        let task_id = context.task_id.clone();
+        let runtime = AgentRuntime::new(
+            role,
+            objective,
+            autonomy_mode,
+            context,
+            self.model_gateway.clone(),
+            self.db.clone(),
+        );
+
+        self.tasks.lock().insert(task_id.clone(), runtime);
+        task_id
+    }
+
     pub fn spawn_task_with_worktree(
         &self,
         role: &str,
@@ -161,18 +182,17 @@ impl AgentOrchestrator {
         autonomy_mode: AutonomyMode,
         worktree_path: Option<std::path::PathBuf>,
     ) -> String {
-        let runtime = AgentRuntime::new(
-            role,
-            objective,
-            autonomy_mode,
-            worktree_path,
-            self.model_gateway.clone(),
-            self.db.clone(),
-        );
+        let task_id = format!("task-{}", uuid::Uuid::new_v4().simple());
+        let root = worktree_path.unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        });
+        let ctx =
+            AgentExecutionContext::from_directory(&root, true, &task_id).unwrap_or_else(|_| {
+                let temp = std::env::temp_dir();
+                AgentExecutionContext::from_directory(&temp, true, &task_id).unwrap()
+            });
 
-        let task_id = runtime.task.task_id.clone();
-        self.tasks.lock().insert(task_id.clone(), runtime);
-        task_id
+        self.spawn_task_with_context(role, objective, autonomy_mode, ctx)
     }
 
     pub fn get_task(&self, task_id: &str) -> Option<AgentTask> {

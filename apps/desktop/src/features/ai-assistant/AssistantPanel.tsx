@@ -76,6 +76,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
     let unlistenChunk: (() => void) | undefined;
     let unlistenComplete: (() => void) | undefined;
     let unlistenError: (() => void) | undefined;
+    let unlistenCancelled: (() => void) | undefined;
 
     TauriService.onEvent<any>("ai-stream-chunk", (payload) => {
       if (payload.chunk) {
@@ -89,6 +90,21 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
       // Completed payload
     }).then((un) => {
       unlistenComplete = un;
+    });
+
+    TauriService.onEvent<any>("ai-stream-cancelled", () => {
+      setIsStreaming(false);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `cancel-${Date.now()}`,
+          sender: "assistant",
+          content: "Streaming generation was cancelled by user.",
+          timestamp: new Date().toLocaleTimeString(),
+        },
+      ]);
+    }).then((un) => {
+      unlistenCancelled = un;
     });
 
     TauriService.onEvent<any>("ai-stream-error", (payload) => {
@@ -111,6 +127,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
       if (unlistenChunk) unlistenChunk();
       if (unlistenComplete) unlistenComplete();
       if (unlistenError) unlistenError();
+      if (unlistenCancelled) unlistenCancelled();
     };
   }, []);
 

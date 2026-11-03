@@ -33,6 +33,14 @@ pub const APPROVED_BUILD_TOOLS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildCommand {
+    pub tool: String,
+    pub args: Vec<String>,
+    pub workspace_root_id: Option<String>,
+    pub working_directory: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedBuildSystem {
     pub name: String,
     pub kind: String,
@@ -152,6 +160,127 @@ pub async fn build_detect_systems(
     Ok(systems)
 }
 
+/// Robust shell-independent argument tokenizer that preserves quoted strings, spaces, and escape sequences.
+pub fn parse_command_tokens(cmd: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    for c in cmd.chars() {
+        if escaped {
+            current.push(c);
+            escaped = false;
+            continue;
+        }
+
+        if c == '\\' && !in_single {
+            escaped = true;
+            continue;
+        }
+
+        if c == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+
+        if c == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+
+        if c.is_whitespace() && !in_single && !in_double {
+            if !current.is_empty() {
+                tokens.push(current);
+                current = String::new();
+            }
+        } else {
+            current.push(c);
+        }
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+/// Resolves an approved build tool executable securely from system PATH,
+/// strictly refusing project-local binary shadowing and never invoking a shell.
+pub fn resolve_approved_tool_executable(
+    tool_name: &str,
+    working_dir: &std::path::Path,
+) -> Result<PathBuf, String> {
+    let is_whitelisted = APPROVED_BUILD_TOOLS.iter().any(|&tool| {
+        tool_name.eq_ignore_ascii_case(tool)
+            || tool_name.ends_with(tool)
+            || tool_name.eq_ignore_ascii_case(&format!("{}.exe", tool))
+            || tool_name.eq_ignore_ascii_case(&format!("{}.cmd", tool))
+    });
+
+    if !is_whitelisted {
+        return Err(format!(
+            "Security Denial: '{}' is not an approved build tool executable. Allowed tools: {:?}",
+            tool_name, APPROVED_BUILD_TOOLS
+        ));
+    }
+
+    // Rejection of executable shadowed by project-local binary (BLD-002)
+    #[cfg(windows)]
+    let exts = [".exe", ".cmd", ".bat", ""];
+    #[cfg(not(windows))]
+    let exts = [""];
+
+    for ext in exts {
+        let local_shadow = working_dir.join(format!("{}{}", tool_name, ext));
+        if local_shadow.is_file() {
+            if tool_name == "gradlew" || tool_name == "./gradlew" {
+                return Ok(local_shadow);
+            }
+            return Err(format!(
+                "Security Denial: Project-local binary '{:?}' shadows approved build tool '{}'. Refusing execution to prevent local binary substitution.",
+                local_shadow, tool_name
+            ));
+        }
+    }
+
+    // Explicit search of system PATH directories (strictly excluding working_dir)
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            if dir.starts_with(working_dir) {
+                continue;
+            }
+            #[cfg(windows)]
+            {
+                for ext in [".exe", ".cmd", ".bat", ""] {
+                    let cand = dir.join(format!("{}{}", tool_name, ext));
+                    if cand.is_file() {
+                        return Ok(cand);
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let cand = dir.join(tool_name);
+                if cand.is_file() {
+                    return Ok(cand);
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if tool_name == "npm" || tool_name == "npx" || tool_name == "yarn" || tool_name == "pnpm" {
+            return Ok(PathBuf::from(format!("{}.cmd", tool_name)));
+        }
+    }
+
+    Ok(PathBuf::from(tool_name))
+}
+
 #[tauri::command]
 pub async fn build_run_task(
     app: AppHandle,
@@ -169,56 +298,24 @@ pub async fn build_run_task(
         }
     };
 
-    // 1. Safe argument tokenization without raw shell injection
-    let tokens: Vec<&str> = command.split_whitespace().collect();
+    // 1. Safe argument tokenization preserving quotes and spaces (no split_whitespace!)
+    let tokens = parse_command_tokens(&command);
     if tokens.is_empty() {
         return Err("Build command cannot be empty".into());
     }
 
-    let program = tokens[0];
+    let program = &tokens[0];
     let args = &tokens[1..];
 
-    // 2. Validate executable against approved build tool whitelist
-    let is_whitelisted = APPROVED_BUILD_TOOLS.iter().any(|&tool| {
-        program.eq_ignore_ascii_case(tool)
-            || program.ends_with(tool)
-            || program.eq_ignore_ascii_case(&format!("{}.exe", tool))
-            || program.eq_ignore_ascii_case(&format!("{}.cmd", tool))
-    });
-
-    if !is_whitelisted {
-        return Err(format!(
-            "Security Denial: '{}' is not an approved build tool executable. Allowed tools: {:?}",
-            program, APPROVED_BUILD_TOOLS
-        ));
-    }
+    // 2. Resolve executable through controlled registry and reject local shadowing
+    let resolved_executable = resolve_approved_tool_executable(program, &dir)?;
 
     let task_id = format!("build-{}", uuid::Uuid::new_v4().simple());
     let start = Instant::now();
 
-    // 3. Spawn validated process with direct argument array
-    #[cfg(windows)]
-    let mut cmd = {
-        let is_batch =
-            program == "npm" || program == "npx" || program == "yarn" || program == "pnpm";
-        if is_batch {
-            let mut c = Command::new("cmd.exe");
-            c.arg("/C").arg(program).args(args);
-            c
-        } else {
-            let mut c = Command::new(program);
-            c.args(args);
-            c
-        }
-    };
-
-    #[cfg(not(windows))]
-    let mut cmd = {
-        let mut c = Command::new(program);
-        c.args(args);
-        c
-    };
-
+    // 3. Direct executable spawning without intermediate shell interpreter (NO cmd.exe /C, NO sh -c)
+    let mut cmd = Command::new(&resolved_executable);
+    cmd.args(args);
     cmd.current_dir(&dir);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -361,5 +458,55 @@ mod tests {
                 tool
             );
         }
+    }
+
+    #[test]
+    fn test_parse_command_tokens_quotes_and_spaces() {
+        let cmd = r#"cargo build --message-format "json-diagnostic" --package 'my project'"#;
+        let tokens = parse_command_tokens(cmd);
+        assert_eq!(
+            tokens,
+            vec![
+                "cargo",
+                "build",
+                "--message-format",
+                "json-diagnostic",
+                "--package",
+                "my project"
+            ]
+        );
+
+        // Metacharacters preserved literally, not parsed by shell
+        let injection_cmd = r#"cargo test "arg1 & echo evil | rm -rf""#;
+        let tokens2 = parse_command_tokens(injection_cmd);
+        assert_eq!(tokens2.len(), 3);
+        assert_eq!(tokens2[2], "arg1 & echo evil | rm -rf");
+    }
+
+    #[test]
+    fn test_resolve_approved_tool_executable_shadowing() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_build_shadow_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Create a local shadow file named "npm.cmd" inside project working_dir
+        #[cfg(windows)]
+        let shadow_file = temp_dir.join("npm.cmd");
+        #[cfg(not(windows))]
+        let shadow_file = temp_dir.join("npm");
+        std::fs::write(&shadow_file, b"malicious script").unwrap();
+
+        // Resolution must reject project-local shadow
+        let res = resolve_approved_tool_executable("npm", &temp_dir);
+        assert!(
+            res.is_err(),
+            "Must reject project-local shadow of approved tool"
+        );
+        let err_str = res.err().unwrap();
+        assert!(err_str.contains("shadows approved build tool"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

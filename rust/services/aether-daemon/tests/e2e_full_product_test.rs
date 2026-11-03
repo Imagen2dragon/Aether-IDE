@@ -189,9 +189,10 @@ pub fn divide(a: i32, b: i32) -> Result<i32, &'static str> {
         "content": updated_code
     });
 
+    let agent_ctx = agent_runtime::AgentExecutionContext::from_directory(&temp_dir, true, &task_id)
+        .expect("Failed to create agent execution context for e2e test");
     let tool_res =
-        agent_runtime::ToolDispatcher::dispatch("write_file", &tool_input, Some(&temp_dir), &db)
-            .await;
+        agent_runtime::ToolDispatcher::dispatch("write_file", &tool_input, &agent_ctx, &db).await;
     assert!(tool_res.is_ok(), "Tool dispatch write_file must succeed");
     println!(" [Step 5] Agent tool dispatched write_file successfully");
 
