@@ -4,7 +4,6 @@ use agent_orchestrator::{AgentOrchestrator, AgentPersona};
 use agent_runtime::AgentTask;
 use application_core::AutonomyMode;
 use serde_json::json;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -24,15 +23,14 @@ pub async fn agent_spawn_task(
     autonomy_mode: Option<String>,
     workspace_root: Option<String>,
 ) -> Result<String, String> {
+    let task_id = format!("task-{}", uuid::Uuid::new_v4().simple());
+    let req_path = workspace_root.as_deref().map(std::path::Path::new);
+
     let ws_arc = app.state::<SharedWorkspace>();
     let ws = ws_arc.lock();
-    let root = if let Some(p) = workspace_root {
-        ws.validate_process_directory(&PathBuf::from(p))?
-    } else {
-        ws.primary_root()
-            .ok_or_else(|| "No active workspace root open for agent execution".to_string())?
-    };
-    let ws_id = ws.workspace_id();
+    let ctx = ws.create_agent_context(req_path, &task_id)?;
+    let ws_id = ctx.workspace_id.clone();
+    let root = ctx.canonical_root.clone();
     drop(ws);
 
     // Create safety recovery checkpoint for workspace before task begins
@@ -57,7 +55,7 @@ pub async fn agent_spawn_task(
     };
 
     let orch = app.state::<SharedOrchestrator>();
-    let task_id = orch.spawn_task_with_worktree(&role, &objective, mode, Some(root));
+    let task_id = orch.spawn_task_with_context(&role, &objective, mode, ctx);
 
     // Emit true initial lifecycle state: Pending
     let _ = app.emit(
@@ -67,7 +65,7 @@ pub async fn agent_spawn_task(
             "role": &role,
             "status": "Pending",
             "checkpoint_id": ckpt_id,
-            "message": "Task created with explicit workspace context"
+            "message": "Task created with explicit capability-isolated workspace context"
         }),
     );
 
