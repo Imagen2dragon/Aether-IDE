@@ -149,8 +149,22 @@ export const BuildStoragePanel: React.FC<BuildStoragePanelProps> = ({ onBuildLog
 
   const handleRestoreCheckpoint = async (id: string) => {
     try {
-      await TauriService.restoreCheckpoint(id);
-      setCkptMsg(`Restored snapshot ${id}`);
+      const preview = await TauriService.restoreCheckpointPreview(id);
+      if (preview.conflicts.length > 0) {
+        if (
+          !confirm(
+            `Warning: Restoring this checkpoint will overwrite ${preview.conflicts.length} modified file(s). Proceed with atomic restore?`
+          )
+        ) {
+          return;
+        }
+      }
+      const res = await TauriService.restoreCheckpoint(id);
+      if (res.success) {
+        setCkptMsg(`Restored snapshot ${id} (${res.restored_count} files safely verified)`);
+      } else {
+        setCkptMsg(`Restore completed with warnings: ${res.errors.join("; ")}`);
+      }
     } catch (err: any) {
       setCkptMsg(`Restore failed: ${err}`);
     }

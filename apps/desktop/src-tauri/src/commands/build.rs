@@ -1,12 +1,22 @@
 use crate::workspace_bridge::SharedWorkspace;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tracing::info;
 
+pub type SharedActiveBuilds = Arc<Mutex<HashMap<String, u32>>>;
+
+pub const APPROVED_BUILD_TOOLS: &[&str] = &[
+    "cargo", "rustc", "npm", "npx", "yarn", "pnpm", "bun", "python", "python3", "py",
+    "pytest", "gradle", "gradlew", "./gradlew", "make", "cmake",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedBuildSystem {
@@ -18,6 +28,7 @@ pub struct DetectedBuildSystem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildExecutionResult {
+    pub task_id: String,
     pub command: String,
     pub success: bool,
     pub exit_code: Option<i32>,
@@ -31,16 +42,15 @@ pub async fn build_detect_systems(
     app: AppHandle,
     path: Option<String>,
 ) -> Result<Vec<DetectedBuildSystem>, String> {
+    let ws_arc = app.state::<SharedWorkspace>();
+    let ws = ws_arc.lock();
     let root = if let Some(p) = path {
-        PathBuf::from(p)
+        ws.validate_process_directory(&PathBuf::from(p))?
     } else {
-        let ws_arc = app.state::<SharedWorkspace>();
-        let ws = ws_arc.lock();
-        ws.get_roots()
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| PathBuf::from("."))
+        ws.primary_root()
+            .ok_or_else(|| "No active workspace root open to detect build systems".to_string())?
     };
+    drop(ws);
 
     let mut systems = Vec::new();
 
@@ -106,27 +116,22 @@ pub async fn build_detect_systems(
             },
             available_commands: vec![
                 "python -m pytest".to_string(),
-                "pip install -r requirements.txt".to_string(),
+                "python -m unittest".to_string(),
             ],
         });
     }
 
     // Check Gradle
-    if root.join("build.gradle").exists()
-        || root.join("build.gradle.kts").exists()
-        || root.join("gradlew").exists()
-        || root.join("gradlew.bat").exists()
-    {
-        let cmd = if cfg!(windows) {
-            "gradlew.bat build"
-        } else {
-            "./gradlew build"
-        };
+    if root.join("build.gradle").exists() || root.join("build.gradle.kts").exists() {
         systems.push(DetectedBuildSystem {
-            name: "Gradle (Android/JVM)".to_string(),
+            name: "Gradle (Android / JVM)".to_string(),
             kind: "gradle".to_string(),
             build_file: "build.gradle".to_string(),
-            available_commands: vec![cmd.to_string()],
+            available_commands: vec![
+                "gradle build".to_string(),
+                "gradle test".to_string(),
+                "gradle assembleDebug".to_string(),
+            ],
         });
     }
 
@@ -139,30 +144,63 @@ pub async fn build_run_task(
     command: String,
     working_dir: Option<String>,
 ) -> Result<BuildExecutionResult, String> {
-    let dir = if let Some(d) = working_dir {
-        PathBuf::from(d)
-    } else {
+    let dir = {
         let ws_arc = app.state::<SharedWorkspace>();
         let ws = ws_arc.lock();
-        ws.get_roots()
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| PathBuf::from("."))
+        if let Some(d) = working_dir {
+            ws.validate_process_directory(&PathBuf::from(d))?
+        } else {
+            ws.primary_root()
+                .ok_or_else(|| "No active workspace root open for build execution".to_string())?
+        }
     };
 
+    // 1. Safe argument tokenization without raw shell injection
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Err("Build command cannot be empty".into());
+    }
+
+    let program = tokens[0];
+    let args = &tokens[1..];
+
+    // 2. Validate executable against approved build tool whitelist
+    let is_whitelisted = APPROVED_BUILD_TOOLS.iter().any(|&tool| {
+        program.eq_ignore_ascii_case(tool)
+            || program.ends_with(tool)
+            || program.eq_ignore_ascii_case(&format!("{}.exe", tool))
+            || program.eq_ignore_ascii_case(&format!("{}.cmd", tool))
+    });
+
+    if !is_whitelisted {
+        return Err(format!(
+            "Security Denial: '{}' is not an approved build tool executable. Allowed tools: {:?}",
+            program, APPROVED_BUILD_TOOLS
+        ));
+    }
+
+    let task_id = format!("build-{}", uuid::Uuid::new_v4().simple());
     let start = Instant::now();
 
+    // 3. Spawn validated process with direct argument array
     #[cfg(windows)]
     let mut cmd = {
-        let mut c = Command::new("cmd.exe");
-        c.args(["/C", &command]);
-        c
+        let is_batch = program == "npm" || program == "npx" || program == "yarn" || program == "pnpm";
+        if is_batch {
+            let mut c = Command::new("cmd.exe");
+            c.arg("/C").arg(program).args(args);
+            c
+        } else {
+            let mut c = Command::new(program);
+            c.args(args);
+            c
+        }
     };
 
     #[cfg(not(windows))]
     let mut cmd = {
-        let mut c = Command::new("sh");
-        c.args(["-c", &command]);
+        let mut c = Command::new(program);
+        c.args(args);
         c
     };
 
@@ -172,7 +210,16 @@ pub async fn build_run_task(
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("Failed to spawn command '{}': {}", command, e))?;
+        .map_err(|e| format!("Failed to spawn build command '{}': {}", command, e))?;
+
+    let pid = child.id().unwrap_or(0);
+
+    // Track active process ID for cancellation
+    let active_builds = app.state::<SharedActiveBuilds>();
+    {
+        let mut map = active_builds.lock();
+        map.insert(task_id.clone(), pid);
+    }
 
     let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
     let stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
@@ -206,11 +253,18 @@ pub async fn build_run_task(
         .await
         .map_err(|e| format!("Failed to wait for build process: {}", e))?;
 
+    // Remove from active map
+    {
+        let mut map = active_builds.lock();
+        map.remove(&task_id);
+    }
+
     let out_str = stdout_handle.await.unwrap_or_default();
     let err_str = stderr_handle.await.unwrap_or_default();
     let duration = start.elapsed().as_millis();
 
     let result = BuildExecutionResult {
+        task_id,
         command,
         success: status.success(),
         exit_code: status.code(),
@@ -222,4 +276,52 @@ pub async fn build_run_task(
     let _ = app.emit("build-task-finished", json!({ "result": &result }));
 
     Ok(result)
+}
+
+#[tauri::command]
+pub async fn build_cancel_task(app: AppHandle, task_id: String) -> Result<bool, String> {
+    let active_builds = app.state::<SharedActiveBuilds>();
+    let mut map = active_builds.lock();
+    if let Some(pid) = map.remove(&task_id) {
+        #[cfg(windows)]
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .status();
+
+        #[cfg(not(windows))]
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+
+        info!("Cancelled build task {} (PID {})", task_id, pid);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_approved_build_tools_whitelist() {
+        let allowed = ["cargo", "npm", "npx", "yarn", "pnpm", "bun", "python", "gradle", "make", "cmake"];
+        for tool in allowed {
+            assert!(
+                APPROVED_BUILD_TOOLS.iter().any(|&t| t == tool || tool.ends_with(t)),
+                "Tool '{}' should be in approved build tools",
+                tool
+            );
+        }
+
+        let dangerous = ["cmd", "cmd.exe", "powershell", "pwsh", "bash", "sh", "curl", "wget", "rm", "del"];
+        for tool in dangerous {
+            assert!(
+                !APPROVED_BUILD_TOOLS.iter().any(|&t| t.eq_ignore_ascii_case(tool)),
+                "Dangerous tool '{}' must NOT be in approved build tools",
+                tool
+            );
+        }
+    }
 }

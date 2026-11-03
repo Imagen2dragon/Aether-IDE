@@ -1,18 +1,16 @@
 use crate::workspace_bridge::SharedWorkspace;
+use filesystem_engine::sanitize_relative_path;
 use git_engine::{GitEngine, GitStatusResult};
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
-
 fn resolve_repo_path(app: &AppHandle, path: Option<String>) -> Result<PathBuf, String> {
+    let ws_arc = app.state::<SharedWorkspace>();
+    let ws = ws_arc.lock();
     if let Some(p) = path {
-        Ok(PathBuf::from(p))
+        ws.validate_process_directory(&PathBuf::from(p))
     } else {
-        let ws_arc = app.state::<SharedWorkspace>();
-        let ws = ws_arc.lock();
-        ws.get_roots()
-            .into_iter()
-            .next()
+        ws.primary_root()
             .ok_or_else(|| "No workspace root currently open".to_string())
     }
 }
@@ -35,7 +33,9 @@ pub async fn git_stage_file(
     path: Option<String>,
 ) -> Result<bool, String> {
     let repo_path = resolve_repo_path(&app, path)?;
-    GitEngine::stage_file(&repo_path, &file)
+    let rel_sanitized = sanitize_relative_path(&file)
+        .map_err(|e| format!("Invalid git target file: {}", e))?;
+    GitEngine::stage_file(&repo_path, &rel_sanitized.to_string_lossy())
         .await
         .map_err(|e| format!("Failed to stage file: {}", e))?;
     Ok(true)
@@ -48,7 +48,9 @@ pub async fn git_unstage_file(
     path: Option<String>,
 ) -> Result<bool, String> {
     let repo_path = resolve_repo_path(&app, path)?;
-    GitEngine::unstage_file(&repo_path, &file)
+    let rel_sanitized = sanitize_relative_path(&file)
+        .map_err(|e| format!("Invalid git target file: {}", e))?;
+    GitEngine::unstage_file(&repo_path, &rel_sanitized.to_string_lossy())
         .await
         .map_err(|e| format!("Failed to unstage file: {}", e))?;
     Ok(true)
@@ -61,6 +63,9 @@ pub async fn git_commit(
     path: Option<String>,
 ) -> Result<String, String> {
     let repo_path = resolve_repo_path(&app, path)?;
+    if message.trim().is_empty() {
+        return Err("Commit message cannot be empty".into());
+    }
     GitEngine::commit(&repo_path, &message)
         .await
         .map_err(|e| format!("Failed to commit changes: {}", e))

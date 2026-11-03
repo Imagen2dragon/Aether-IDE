@@ -3,8 +3,11 @@ import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AgentPersona,
   AgentTask,
+  ApplyProposalResult,
   BrainReconcileReport,
   BuildExecutionResult,
+  CheckpointRestorePreview,
+  CheckpointRestoreReport,
   DetectedBuildSystem,
   Diagnostic,
   EasCliStatus,
@@ -15,9 +18,11 @@ import type {
   ModelMetadata,
   ProjectBrainGraph,
   ProjectMemoryNote,
+  ProposalReviewPreview,
   ProviderStatus,
   StorageAnalysisReport,
   StorageCleanupReport,
+  StructuredProposal,
   WorkspaceCheckpoint,
   WorkspaceNode,
   WorkspaceSummary,
@@ -33,7 +38,7 @@ export class TauriService {
     return invoke("workspace_add_folder", { path });
   }
 
-  static async getTree(rootPath: string): Promise<WorkspaceNode[]> {
+  static async getTree(rootPath?: string): Promise<WorkspaceNode[]> {
     return invoke("workspace_get_tree", { rootPath });
   }
 
@@ -65,21 +70,28 @@ export class TauriService {
     return invoke("workspace_reveal_in_explorer", { path });
   }
 
+  static async setWorkspaceTrust(rootPath: string, isTrusted: boolean): Promise<{ root: string; trusted: boolean }> {
+    return invoke("workspace_set_trust", { rootPath, isTrusted });
+  }
+
   // --- Terminal ---
-  static async spawnTerminal(cols = 80, rows = 24): Promise<string> {
-    return invoke("terminal_spawn", { cols, rows });
+  static async spawnTerminal(cols = 80, rows = 24, cwd?: string): Promise<any> {
+    return invoke("terminal_spawn", { cwd, cols, rows });
   }
 
-  static async writeTerminal(id: string, data: string): Promise<boolean> {
-    return invoke("terminal_write", { id, data });
+  static async writeTerminal(idOrData: string, data?: string): Promise<boolean> {
+    const text = data !== undefined ? data : idOrData;
+    return invoke("terminal_write", { data: text });
   }
 
-  static async resizeTerminal(id: string, cols: number, rows: number): Promise<boolean> {
-    return invoke("terminal_resize", { id, cols, rows });
+  static async resizeTerminal(idOrCols: string | number, colsOrRows: number, rowsOptional?: number): Promise<boolean> {
+    const cols = typeof idOrCols === "number" ? idOrCols : colsOrRows;
+    const rows = rowsOptional !== undefined ? rowsOptional : colsOrRows;
+    return invoke("terminal_resize", { cols, rows });
   }
 
-  static async killTerminal(id: string): Promise<boolean> {
-    return invoke("terminal_kill", { id });
+  static async killTerminal(_id?: string): Promise<boolean> {
+    return invoke("terminal_kill");
   }
 
   // --- System ---
@@ -157,9 +169,30 @@ export class TauriService {
     prompt: string,
     system?: string,
     model?: string,
-    fileContext?: string
+    fileContext?: string,
+    requestId?: string,
+    conversationId?: string
   ): Promise<string> {
-    return invoke("ai_stream_prompt", { prompt, system, model, fileContext });
+    return invoke("ai_stream_prompt", {
+      prompt,
+      system,
+      model,
+      fileContext,
+      requestId,
+      conversationId,
+    });
+  }
+
+  static async cancelAiStream(requestId: string): Promise<boolean> {
+    return invoke("ai_cancel_stream", { requestId });
+  }
+
+  static async previewProposal(proposal: StructuredProposal): Promise<ProposalReviewPreview> {
+    return invoke("ai_preview_proposal", { proposal });
+  }
+
+  static async applyProposal(proposal: StructuredProposal, force = false): Promise<ApplyProposalResult> {
+    return invoke("ai_apply_proposal", { proposal, force });
   }
 
   // --- AI Agents & Swarm Orchestration ---
@@ -170,9 +203,10 @@ export class TauriService {
   static async spawnAgentTask(
     role: string,
     objective: string,
-    autonomyMode?: string
+    autonomyMode?: string,
+    workspaceRoot?: string
   ): Promise<string> {
-    return invoke("agent_spawn_task", { role, objective, autonomyMode });
+    return invoke("agent_spawn_task", { role, objective, autonomyMode, workspaceRoot });
   }
 
   static async getAgentTask(taskId: string): Promise<AgentTask> {
@@ -214,9 +248,17 @@ export class TauriService {
   static async scaffoldMobileApp(
     template: string,
     name: string,
-    targetDir: string
+    targetDir: string,
+    bundleId?: string
   ): Promise<string> {
-    return invoke("mobile_scaffold_app", { template, name, targetDir });
+    return invoke("mobile_scaffold_app", {
+      params: {
+        template,
+        name,
+        target_dir: targetDir,
+        bundle_id: bundleId,
+      },
+    });
   }
 
   // --- Build Systems ---
@@ -229,6 +271,10 @@ export class TauriService {
     workingDir?: string
   ): Promise<BuildExecutionResult> {
     return invoke("build_run_task", { command, workingDir });
+  }
+
+  static async cancelBuildTask(taskId: string): Promise<boolean> {
+    return invoke("build_cancel_task", { taskId });
   }
 
   // --- Storage Management ---
@@ -255,7 +301,11 @@ export class TauriService {
     return invoke("checkpoint_list");
   }
 
-  static async restoreCheckpoint(checkpointId: string): Promise<boolean> {
+  static async restoreCheckpointPreview(checkpointId: string): Promise<CheckpointRestorePreview> {
+    return invoke("checkpoint_restore_preview", { checkpointId });
+  }
+
+  static async restoreCheckpoint(checkpointId: string): Promise<CheckpointRestoreReport> {
     return invoke("checkpoint_restore", { checkpointId });
   }
 

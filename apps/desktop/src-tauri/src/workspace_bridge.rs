@@ -1,9 +1,10 @@
+use filesystem_engine::WorkspaceCapability;
 use serde::{Deserialize, Serialize};
 use std::fs;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,19 +40,35 @@ pub struct WorkspaceFolderConfig {
     pub name: Option<String>,
 }
 
+pub struct AuthorizedWorkspaceRoot {
+    pub workspace_id: String,
+    pub root_id: String,
+    pub canonical_path: PathBuf,
+    pub name: String,
+    pub is_trusted: bool,
+    pub capability: Arc<WorkspaceCapability>,
+}
+
 pub type SharedWorkspace = std::sync::Arc<parking_lot::Mutex<WorkspaceSession>>;
 
 pub struct WorkspaceSession {
-    roots: Mutex<Vec<PathBuf>>,
+    roots: Mutex<Vec<AuthorizedWorkspaceRoot>>,
     user_data_dir: PathBuf,
+    active_workspace_id: Mutex<String>,
 }
 
 impl WorkspaceSession {
     pub fn new(user_data_dir: PathBuf) -> Self {
+        let ws_id = format!("ws-{}", uuid::Uuid::new_v4().simple());
         Self {
             roots: Mutex::new(Vec::new()),
             user_data_dir,
+            active_workspace_id: Mutex::new(ws_id),
         }
+    }
+
+    pub fn workspace_id(&self) -> String {
+        self.active_workspace_id.lock().unwrap().clone()
     }
 
     /// Sets a single folder as the active workspace root.
@@ -64,10 +81,32 @@ impl WorkspaceSession {
             return Err(format!("Path {:?} is not a directory", canonical));
         }
 
+        let cap = WorkspaceCapability::open(&canonical)
+            .map_err(|e| format!("Failed to initialize capability for {:?}: {}", canonical, e))?;
+
+        let ws_id = format!("ws-{}", uuid::Uuid::new_v4().simple());
+        *self.active_workspace_id.lock().unwrap() = ws_id.clone();
+
+        let name = canonical
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Workspace 1".to_string());
+
+        let is_trusted = self.is_path_trusted(&canonical);
+
+        let root_entry = AuthorizedWorkspaceRoot {
+            workspace_id: ws_id,
+            root_id: "root-0".to_string(),
+            canonical_path: canonical.clone(),
+            name,
+            is_trusted,
+            capability: Arc::new(cap),
+        };
+
         {
             let mut roots = self.roots.lock().unwrap();
             roots.clear();
-            roots.push(canonical.clone());
+            roots.push(root_entry);
         }
 
         info!("Active workspace set to: {:?}", canonical);
@@ -84,75 +123,194 @@ impl WorkspaceSession {
             return Err(format!("Path {:?} is not a directory", canonical));
         }
 
-        {
-            let mut roots = self.roots.lock().unwrap();
-            if !roots.contains(&canonical) {
-                roots.push(canonical.clone());
-            }
+        let ws_id = self.workspace_id();
+        let cap = WorkspaceCapability::open(&canonical)
+            .map_err(|e| format!("Failed to initialize capability for {:?}: {}", canonical, e))?;
+
+        let mut roots = self.roots.lock().unwrap();
+        if roots.iter().any(|r| r.canonical_path == canonical) {
+            drop(roots);
+            return self.get_workspace_summary();
         }
 
+        let idx = roots.len();
+        let root_id = format!("root-{}", idx);
+        let name = canonical
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("Workspace {}", idx + 1));
+        let is_trusted = self.is_path_trusted(&canonical);
+
+        roots.push(AuthorizedWorkspaceRoot {
+            workspace_id: ws_id,
+            root_id,
+            canonical_path: canonical.clone(),
+            name,
+            is_trusted,
+            capability: Arc::new(cap),
+        });
+
+        drop(roots);
         info!("Added workspace root: {:?}", canonical);
         self.get_workspace_summary()
     }
 
     /// Removes a folder from active workspace roots.
-    pub fn remove_root(&self, path: &Path) -> Result<serde_json::Value, String> {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    pub fn remove_root(&self, path_or_id: &Path) -> Result<serde_json::Value, String> {
+        let id_str = path_or_id.to_string_lossy();
+        let canonical = path_or_id.canonicalize().unwrap_or_else(|_| path_or_id.to_path_buf());
+
         {
             let mut roots = self.roots.lock().unwrap();
-            roots.retain(|r| r != &canonical && r != path);
+            roots.retain(|r| {
+                r.root_id != id_str && r.canonical_path != canonical && r.canonical_path != path_or_id
+            });
+
+            // Re-index root IDs
+            for (idx, r) in roots.iter_mut().enumerate() {
+                r.root_id = format!("root-{}", idx);
+            }
         }
+
+        self.get_workspace_summary()
+    }
+
+    /// Completely revokes active workspace and drops all capabilities.
+    pub fn revoke_workspace(&self) -> Result<serde_json::Value, String> {
+        {
+            let mut roots = self.roots.lock().unwrap();
+            roots.clear();
+        }
+        *self.active_workspace_id.lock().unwrap() = format!("ws-{}", uuid::Uuid::new_v4().simple());
+        info!("Active workspace revoked and all capabilities closed");
         self.get_workspace_summary()
     }
 
     /// Returns the primary active root directory, if any.
     pub fn primary_root(&self) -> Option<PathBuf> {
         let roots = self.roots.lock().unwrap();
-        roots.first().cloned()
+        roots.first().map(|r| r.canonical_path.clone())
     }
 
+    /// Returns list of canonical root paths.
     pub fn get_roots(&self) -> Vec<PathBuf> {
         let roots = self.roots.lock().unwrap();
-        roots.clone()
+        roots.iter().map(|r| r.canonical_path.clone()).collect()
+    }
+
+    /// Validates that a requested working directory is strictly within an authorized and trusted workspace root.
+    pub fn validate_process_directory(&self, dir: &Path) -> Result<PathBuf, String> {
+        let canonical = dir
+            .canonicalize()
+            .map_err(|e| format!("Invalid process working directory {:?}: {}", dir, e))?;
+
+        let roots = self.roots.lock().unwrap();
+        for r in roots.iter() {
+            if filesystem_engine::FilesystemEngine::is_within_boundary(&canonical, &r.canonical_path) {
+                if !r.is_trusted {
+                    return Err(format!(
+                        "Security Denial: Directory {:?} is inside untrusted workspace root '{}'. Process execution denied.",
+                        canonical, r.name
+                    ));
+                }
+                return Ok(canonical);
+            }
+        }
+
+        Err(format!(
+            "Security Denial: Directory {:?} is outside all authorized workspace roots.",
+            canonical
+        ))
+    }
+
+    /// Resolves an incoming user path against active workspace roots.
+    /// Returns (Capability Arc, Canonical Root PathBuf, Relative Path String).
+    pub fn resolve_in_workspace(
+        &self,
+        user_path: &str,
+    ) -> Result<(Arc<WorkspaceCapability>, PathBuf, String), String> {
+        let roots = self.roots.lock().unwrap();
+        if roots.is_empty() {
+            return Err("No active workspace is open".into());
+        }
+
+        let p = Path::new(user_path);
+
+        // Case 1: Absolute path
+        if p.is_absolute() {
+            let canon = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            for root in roots.iter() {
+                if filesystem_engine::FilesystemEngine::is_within_boundary(&canon, &root.canonical_path) {
+                    if let Ok(rel) = canon.strip_prefix(&root.canonical_path) {
+                        let rel_str = rel.to_string_lossy().replace('\\', "/");
+                        return Ok((root.capability.clone(), root.canonical_path.clone(), rel_str));
+                    }
+                }
+            }
+            return Err(format!(
+                "Security Denial: Absolute path '{:?}' is outside active workspace roots",
+                p
+            ));
+        }
+
+        // Case 2: Relative path with explicit root-ID prefix (e.g. "root-0/src/main.rs")
+        let norm_slashes = user_path.replace('\\', "/");
+        if let Some(slash_idx) = norm_slashes.find('/') {
+            let prefix = &norm_slashes[..slash_idx];
+            if let Some(rest) = prefix.strip_prefix("root-") {
+                if let Ok(idx) = rest.parse::<usize>() {
+                    if let Some(target_root) = roots.get(idx) {
+                        let rel = &norm_slashes[slash_idx + 1..];
+                        return Ok((
+                            target_root.capability.clone(),
+                            target_root.canonical_path.clone(),
+                            rel.to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Case 3: Relative path defaults to primary root
+        let primary = &roots[0];
+        Ok((
+            primary.capability.clone(),
+            primary.canonical_path.clone(),
+            norm_slashes,
+        ))
     }
 
     /// Gets summary of all active roots with file trees.
     pub fn get_workspace_summary(&self) -> Result<serde_json::Value, String> {
-        let roots = self.roots.lock().unwrap().clone();
+        let roots = self.roots.lock().unwrap();
         let mut root_infos = Vec::new();
 
-        for (idx, root) in roots.iter().enumerate() {
-            let name = root
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| format!("Workspace {}", idx + 1));
-
-            let id = format!("root-{}", idx);
-            let is_trusted = self.is_path_trusted(root);
-            let tree = self.build_file_tree(root, 0, 5)?;
-
+        for root in roots.iter() {
+            let tree = self.build_file_tree(&root.canonical_path, 0, 5)?;
             root_infos.push(WorkspaceRootInfo {
-                id,
-                path: root.to_string_lossy().to_string(),
-                name,
-                is_trusted,
+                id: root.root_id.clone(),
+                path: root.canonical_path.to_string_lossy().to_string(),
+                name: root.name.clone(),
+                is_trusted: root.is_trusted,
                 tree,
             });
         }
 
+        let primary = roots.first().map(|r| r.canonical_path.to_string_lossy().to_string());
+        let count = root_infos.len();
+        drop(roots);
+
         Ok(serde_json::json!({
+            "workspace_id": self.workspace_id(),
             "roots": root_infos,
-            "root_count": root_infos.len(),
-            "primary_path": roots.first().map(|p| p.to_string_lossy().to_string()),
+            "root_count": count,
+            "primary_path": primary,
         }))
     }
 
     /// Reads a file contained in any of the active workspace roots.
     pub fn read_file(&self, user_path: &str) -> Result<serde_json::Value, String> {
-        let (root, rel_path) = self.resolve_in_workspace(user_path)?;
-        let cap = filesystem_engine::WorkspaceCapability::open(&root)
-            .map_err(|e| format!("Failed to open workspace capability: {}", e))?;
-
+        let (cap, root, rel_path) = self.resolve_in_workspace(user_path)?;
         let content = cap
             .read_file(&rel_path)
             .map_err(|e| format!("Read failed for '{}': {}", rel_path, e))?;
@@ -167,10 +325,7 @@ impl WorkspaceSession {
 
     /// Atomically writes content to a file in an active workspace root.
     pub fn write_file(&self, user_path: &str, content: &str) -> Result<serde_json::Value, String> {
-        let (root, rel_path) = self.resolve_in_workspace(user_path)?;
-        let cap = filesystem_engine::WorkspaceCapability::open(&root)
-            .map_err(|e| format!("Failed to open workspace capability: {}", e))?;
-
+        let (cap, _, rel_path) = self.resolve_in_workspace(user_path)?;
         let saved_path = cap
             .write_file_atomic(&rel_path, content)
             .map_err(|e| format!("Atomic write failed for '{}': {}", rel_path, e))?;
@@ -190,10 +345,7 @@ impl WorkspaceSession {
 
     /// Creates a directory in an active workspace root.
     pub fn create_directory(&self, user_path: &str) -> Result<serde_json::Value, String> {
-        let (root, rel_path) = self.resolve_in_workspace(user_path)?;
-        let cap = filesystem_engine::WorkspaceCapability::open(&root)
-            .map_err(|e| format!("Failed to open workspace capability: {}", e))?;
-
+        let (cap, _, rel_path) = self.resolve_in_workspace(user_path)?;
         let dir_path = cap
             .create_dir(&rel_path)
             .map_err(|e| format!("Create directory failed for '{}': {}", rel_path, e))?;
@@ -211,17 +363,15 @@ impl WorkspaceSession {
         old_path: &str,
         new_path: &str,
     ) -> Result<serde_json::Value, String> {
-        let (root_old, rel_old) = self.resolve_in_workspace(old_path)?;
-        let (root_new, rel_new) = self.resolve_in_workspace(new_path)?;
+        let (cap_old, root_old, rel_old) = self.resolve_in_workspace(old_path)?;
+        let (_, root_new, rel_new) = self.resolve_in_workspace(new_path)?;
 
         if root_old != root_new {
             return Err("Cross-workspace root renames are not permitted".into());
         }
 
-        let cap = filesystem_engine::WorkspaceCapability::open(&root_old)
-            .map_err(|e| format!("Failed to open workspace capability: {}", e))?;
-
-        cap.rename(&rel_old, &rel_new)
+        cap_old
+            .rename(&rel_old, &rel_new)
             .map_err(|e| format!("Rename failed from '{}' to '{}': {}", rel_old, rel_new, e))?;
 
         Ok(serde_json::json!({
@@ -233,12 +383,21 @@ impl WorkspaceSession {
 
     /// Deletes a file in an active workspace root.
     pub fn delete_entry(&self, user_path: &str) -> Result<serde_json::Value, String> {
-        let (root, rel_path) = self.resolve_in_workspace(user_path)?;
-        let cap = filesystem_engine::WorkspaceCapability::open(&root)
-            .map_err(|e| format!("Failed to open workspace capability: {}", e))?;
-
+        let (cap, _, rel_path) = self.resolve_in_workspace(user_path)?;
         cap.delete_file(&rel_path)
             .map_err(|e| format!("Delete failed for '{}': {}", rel_path, e))?;
+
+        Ok(serde_json::json!({
+            "path": user_path,
+            "success": true
+        }))
+    }
+
+    /// Deletes a directory recursively in an active workspace root.
+    pub fn delete_directory(&self, user_path: &str) -> Result<serde_json::Value, String> {
+        let (cap, _, rel_path) = self.resolve_in_workspace(user_path)?;
+        cap.delete_dir_all(&rel_path)
+            .map_err(|e| format!("Delete directory failed for '{}': {}", rel_path, e))?;
 
         Ok(serde_json::json!({
             "path": user_path,
@@ -252,7 +411,7 @@ impl WorkspaceSession {
         let resolved = if path.is_absolute() {
             path.to_path_buf()
         } else {
-            let (root, rel) = self.resolve_in_workspace(target_path)?;
+            let (_, root, rel) = self.resolve_in_workspace(target_path)?;
             root.join(rel)
         };
 
@@ -308,6 +467,16 @@ impl WorkspaceSession {
             serde_json::to_string_pretty(&map).unwrap_or_default(),
         );
 
+        // Update in-memory state
+        {
+            let mut roots = self.roots.lock().unwrap();
+            for r in roots.iter_mut() {
+                if r.canonical_path.to_string_lossy() == norm_path {
+                    r.is_trusted = is_trusted;
+                }
+            }
+        }
+
         Ok(serde_json::json!({
             "root": norm_path,
             "trusted": is_trusted
@@ -334,53 +503,8 @@ impl WorkspaceSession {
                 }
             }
         }
-        // Default to trusted if it's the AetherIDE development repo or a user-explicitly opened directory
+        // Default to trusted for user explicitly opened directories unless revoked
         true
-    }
-
-    /// Resolves an incoming user path against active workspace roots.
-    /// Returns (Root PathBuf, Normalized Relative Path String).
-    fn resolve_in_workspace(&self, user_path: &str) -> Result<(PathBuf, String), String> {
-        let roots = self.roots.lock().unwrap().clone();
-        if roots.is_empty() {
-            return Err("No active workspace is open".into());
-        }
-
-        let p = Path::new(user_path);
-
-        // Case 1: Absolute path
-        if p.is_absolute() {
-            let canon = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-            for root in &roots {
-                if filesystem_engine::FilesystemEngine::is_within_boundary(&canon, root) {
-                    if let Ok(rel) = canon.strip_prefix(root) {
-                        return Ok((root.clone(), rel.to_string_lossy().replace('\\', "/")));
-                    }
-                }
-            }
-            return Err(format!(
-                "Security Denial: Absolute path '{:?}' is outside active workspace roots",
-                p
-            ));
-        }
-
-        // Case 2: Relative path with explicit root-ID prefix (e.g. "root-0/src/main.rs")
-        let norm_slashes = user_path.replace('\\', "/");
-        if let Some(slash_idx) = norm_slashes.find('/') {
-            let prefix = &norm_slashes[..slash_idx];
-            if let Some(rest) = prefix.strip_prefix("root-") {
-                if let Ok(idx) = rest.parse::<usize>() {
-                    if let Some(target_root) = roots.get(idx) {
-                        let rel = &norm_slashes[slash_idx + 1..];
-                        return Ok((target_root.clone(), rel.to_string()));
-                    }
-                }
-            }
-        }
-
-        // Case 3: Relative path defaults to primary root
-        let primary = &roots[0];
-        Ok((primary.clone(), norm_slashes))
     }
 
     /// Builds hierarchical file tree up to max_depth.
@@ -521,6 +645,13 @@ mod tests {
         let trav_err = session.read_file("../../windows/system32/cmd.exe");
         assert!(trav_err.is_err());
 
+        // Validate process directory
+        let valid_proc = session.validate_process_directory(&temp_dir);
+        assert!(valid_proc.is_ok());
+
+        let invalid_proc = session.validate_process_directory(&std::env::temp_dir());
+        assert!(invalid_proc.is_err());
+
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
@@ -542,6 +673,11 @@ mod tests {
 
         let summary = session.get_workspace_summary().unwrap();
         assert_eq!(summary.get("root_count").and_then(|v| v.as_u64()), Some(2));
+
+        // Revoke workspace
+        session.revoke_workspace().unwrap();
+        let summary_after = session.get_workspace_summary().unwrap();
+        assert_eq!(summary_after.get("root_count").and_then(|v| v.as_u64()), Some(0));
 
         let _ = std::fs::remove_dir_all(&temp_base);
     }

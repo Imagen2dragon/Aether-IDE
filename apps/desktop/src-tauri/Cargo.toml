@@ -27,6 +27,7 @@ uuid = { version = "1.13", features = ["v4", "serde"] }
 tokio = { version = "1.43", features = ["full"] }
 parking_lot = "0.12"
 tracing = "0.1"
+sha2 = "0.10"
 
 # AetherIDE Workspace Crates
 application-core = { path = "../../../rust/crates/application-core" }

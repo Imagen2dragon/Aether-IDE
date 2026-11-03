@@ -19,11 +19,13 @@ export interface WorkspaceNode {
 }
 
 export interface WorkspaceSummary {
-  workspace_id: string;
-  name: string;
-  roots: string[];
-  is_trusted: boolean;
-  open_editors: string[];
+  workspace_id?: string;
+  name?: string;
+  roots: any[];
+  root_count?: number;
+  primary_path?: string;
+  is_trusted?: boolean;
+  open_editors?: string[];
   active_editor?: string;
 }
 
@@ -110,6 +112,37 @@ export interface CompletionResponse {
   finish_reason: string;
 }
 
+// Safe AI Code Editing
+export interface StructuredProposal {
+  proposal_id: string;
+  workspace_id: string;
+  relative_path: string;
+  operation: "modify" | "create" | "delete";
+  base_hash: string;
+  unified_diff: string;
+  proposed_content: string;
+}
+
+export interface ProposalReviewPreview {
+  proposal_id: string;
+  relative_path: string;
+  operation: string;
+  base_hash: string;
+  current_disk_hash: string;
+  has_conflict: boolean;
+  original_content: string;
+  proposed_content: string;
+  unified_diff: string;
+}
+
+export interface ApplyProposalResult {
+  success: boolean;
+  relative_path: string;
+  new_hash: string;
+  message: string;
+  backup_checkpoint_id?: string;
+}
+
 // AI Agents
 export interface AgentPersona {
   role_id: string;
@@ -123,7 +156,7 @@ export interface AgentTask {
   id: string;
   role: string;
   objective: string;
-  status: "Queued" | "Running" | "Paused" | "Completed" | "Failed";
+  status: "Queued" | "Pending" | "Planning" | "Executing" | "WaitingForApproval" | "Running" | "Paused" | "Completed" | "Failed" | "Cancelled";
   current_step: number;
   total_steps: number;
   logs: string[];
@@ -163,6 +196,7 @@ export interface DetectedBuildSystem {
 }
 
 export interface BuildExecutionResult {
+  task_id?: string;
   command: string;
   success: boolean;
   exit_code?: number;
@@ -173,8 +207,10 @@ export interface BuildExecutionResult {
 
 // Storage Management
 export interface StorageItem {
+  candidate_id?: string;
   name: string;
   path: string;
+  relative_path?: string;
   category: string;
   size_bytes: number;
   human_size: string;
@@ -199,11 +235,37 @@ export interface StorageCleanupReport {
 }
 
 // Checkpoint Engine
+export interface CheckpointFileRecord {
+  root_id: string;
+  relative_path: string;
+  sha256: string;
+  size_bytes: number;
+}
+
 export interface WorkspaceCheckpoint {
   checkpoint_id: string;
+  workspace_id?: string;
   description: string;
   created_at: string;
-  file_hashes: Record<string, string>;
+  files?: CheckpointFileRecord[];
+  file_hashes?: Record<string, string>;
+}
+
+export interface CheckpointRestorePreview {
+  checkpoint_id: string;
+  files_to_create: string[];
+  files_to_overwrite: string[];
+  conflicts: string[];
+  missing_blobs: string[];
+  integrity_valid: boolean;
+}
+
+export interface CheckpointRestoreReport {
+  checkpoint_id: string;
+  restored_count: number;
+  restored_files: string[];
+  errors: string[];
+  success: boolean;
 }
 
 // Git Engine

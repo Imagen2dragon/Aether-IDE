@@ -1,5 +1,7 @@
 use crate::workspace_bridge::SharedWorkspace;
-use checkpoint_engine::{CheckpointEngine, WorkspaceCheckpoint};
+use checkpoint_engine::{
+    CheckpointEngine, CheckpointRestorePreview, CheckpointRestoreReport, WorkspaceCheckpoint,
+};
 use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,32 +15,38 @@ pub async fn checkpoint_create(
     description: String,
     files: Option<Vec<String>>,
 ) -> Result<WorkspaceCheckpoint, String> {
-    let files_to_snapshot = if let Some(flist) = files {
-        flist.into_iter().map(PathBuf::from).collect()
-    } else {
-        // Collect files from active workspace
-        let ws_arc = app.state::<SharedWorkspace>();
-        let ws = ws_arc.lock();
-        let roots = ws.get_roots();
-        let mut paths = Vec::new();
-        for root in roots {
-            if let Ok(entries) = std::fs::read_dir(&root) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.is_file() {
-                        paths.push(p);
-                    }
+    let ws_arc = app.state::<SharedWorkspace>();
+    let ws = ws_arc.lock();
+    let root = ws
+        .primary_root()
+        .ok_or_else(|| "No active workspace root open to snapshot".to_string())?;
+    let ws_id = ws.workspace_id();
+    drop(ws);
+
+    let explicit_paths: Option<Vec<PathBuf>> = files.map(|flist| {
+        flist
+            .into_iter()
+            .map(|f| {
+                let p = PathBuf::from(&f);
+                if p.is_absolute() {
+                    p
+                } else {
+                    root.join(p)
                 }
-            }
-        }
-        paths
-    };
+            })
+            .collect()
+    });
 
     let engine_arc = app.state::<SharedCheckpointEngine>();
     let engine = engine_arc.lock();
 
     engine
-        .create_checkpoint(&description, &files_to_snapshot)
+        .create_checkpoint_with_root(
+            &description,
+            &ws_id,
+            &root,
+            explicit_paths.as_deref(),
+        )
         .map_err(|e| format!("Failed to create checkpoint: {}", e))
 }
 
@@ -53,22 +61,41 @@ pub async fn checkpoint_list(app: AppHandle) -> Result<Vec<WorkspaceCheckpoint>,
 }
 
 #[tauri::command]
-pub async fn checkpoint_restore(app: AppHandle, checkpoint_id: String) -> Result<bool, String> {
+pub async fn checkpoint_restore_preview(
+    app: AppHandle,
+    checkpoint_id: String,
+) -> Result<CheckpointRestorePreview, String> {
+    let ws_arc = app.state::<SharedWorkspace>();
+    let ws = ws_arc.lock();
+    let root = ws
+        .primary_root()
+        .ok_or_else(|| "No active workspace root open to preview restore".to_string())?;
+    drop(ws);
+
     let engine_arc = app.state::<SharedCheckpointEngine>();
     let engine = engine_arc.lock();
 
-    let list = engine
-        .list_checkpoints()
-        .map_err(|e| format!("Failed to list checkpoints: {}", e))?;
+    engine
+        .restore_preview(&checkpoint_id, &root)
+        .map_err(|e| format!("Failed to preview restore: {}", e))
+}
 
-    let ckpt = list
-        .into_iter()
-        .find(|c| c.checkpoint_id == checkpoint_id)
-        .ok_or_else(|| format!("Checkpoint '{}' not found", checkpoint_id))?;
+#[tauri::command]
+pub async fn checkpoint_restore(
+    app: AppHandle,
+    checkpoint_id: String,
+) -> Result<CheckpointRestoreReport, String> {
+    let ws_arc = app.state::<SharedWorkspace>();
+    let ws = ws_arc.lock();
+    let root = ws
+        .primary_root()
+        .ok_or_else(|| "No active workspace root open to restore".to_string())?;
+    drop(ws);
+
+    let engine_arc = app.state::<SharedCheckpointEngine>();
+    let engine = engine_arc.lock();
 
     engine
-        .restore_checkpoint(&ckpt)
-        .map_err(|e| format!("Failed to restore checkpoint: {}", e))?;
-
-    Ok(true)
+        .restore_checkpoint_into(&checkpoint_id, &root, false)
+        .map_err(|e| format!("Failed to restore checkpoint: {}", e))
 }
