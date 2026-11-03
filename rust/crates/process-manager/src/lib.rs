@@ -160,6 +160,46 @@ pub struct ProcessOutput {
 pub struct ProcessManager;
 
 impl ProcessManager {
+    pub fn parse_command_tokens(cmd: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut current = String::new();
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escaped = false;
+
+        for c in cmd.chars() {
+            if escaped {
+                current.push(c);
+                escaped = false;
+                continue;
+            }
+            if c == '\\' && !in_single {
+                escaped = true;
+                continue;
+            }
+            if c == '\'' && !in_double {
+                in_single = !in_single;
+                continue;
+            }
+            if c == '"' && !in_single {
+                in_double = !in_double;
+                continue;
+            }
+            if c.is_whitespace() && !in_single && !in_double {
+                if !current.is_empty() {
+                    tokens.push(current);
+                    current = String::new();
+                }
+            } else {
+                current.push(c);
+            }
+        }
+        if !current.is_empty() {
+            tokens.push(current);
+        }
+        tokens
+    }
+
     pub async fn run_command_streaming(
         command_str: &str,
         cwd: Option<PathBuf>,
@@ -167,17 +207,52 @@ impl ProcessManager {
         stdout_tx: Option<mpsc::Sender<String>>,
         stderr_tx: Option<mpsc::Sender<String>>,
     ) -> Result<ProcessOutput> {
+        let tokens = Self::parse_command_tokens(command_str);
+        if tokens.is_empty() {
+            return Err(AetherError::Process(
+                "Command string cannot be empty".into(),
+            ));
+        }
+
+        let program = &tokens[0];
+        let args: Vec<&str> = tokens[1..].iter().map(|s| s.as_str()).collect();
+
+        Self::run_command_direct_streaming(program, &args, cwd, timeout, stdout_tx, stderr_tx).await
+    }
+
+    /// Spawns an executable directly with arguments, without intermediate shell interpretation (NO cmd.exe /C, NO sh -c).
+    pub async fn run_command_direct_streaming(
+        program: &str,
+        args: &[&str],
+        cwd: Option<PathBuf>,
+        timeout: Option<Duration>,
+        stdout_tx: Option<mpsc::Sender<String>>,
+        stderr_tx: Option<mpsc::Sender<String>>,
+    ) -> Result<ProcessOutput> {
         #[cfg(target_os = "windows")]
-        let mut cmd = {
+        let mut cmd = if program.eq_ignore_ascii_case("echo") {
             let mut c = Command::new("cmd.exe");
-            c.args(["/C", command_str]);
+            c.arg("/C").arg("echo");
+            for a in args {
+                c.arg(a);
+            }
+            c
+        } else {
+            let executable =
+                if program == "npm" || program == "npx" || program == "yarn" || program == "pnpm" {
+                    format!("{}.cmd", program)
+                } else {
+                    program.to_string()
+                };
+            let mut c = Command::new(&executable);
+            c.args(args);
             c
         };
 
         #[cfg(not(target_os = "windows"))]
         let mut cmd = {
-            let mut c = Command::new("sh");
-            c.args(["-c", command_str]);
+            let mut c = Command::new(program);
+            c.args(args);
             c
         };
 
@@ -305,7 +380,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_command_timeout_clean_termination() {
         #[cfg(windows)]
-        let sleep_cmd = "ping 127.0.0.1 -n 5 > nul";
+        let sleep_cmd = "ping 127.0.0.1 -n 5";
         #[cfg(not(windows))]
         let sleep_cmd = "sleep 5";
 
