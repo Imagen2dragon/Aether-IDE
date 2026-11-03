@@ -150,6 +150,8 @@ export const BuildStoragePanel: React.FC<BuildStoragePanelProps> = ({ onBuildLog
   const handleRestoreCheckpoint = async (id: string) => {
     try {
       const preview = await TauriService.restoreCheckpointPreview(id);
+      let force = false;
+      let approvedConflicts: string[] = [];
       if (preview.conflicts.length > 0) {
         if (
           !confirm(
@@ -158,8 +160,10 @@ export const BuildStoragePanel: React.FC<BuildStoragePanelProps> = ({ onBuildLog
         ) {
           return;
         }
+        force = true;
+        approvedConflicts = preview.conflicts;
       }
-      const res = await TauriService.restoreCheckpoint(id);
+      const res = await TauriService.restoreCheckpoint(id, preview.preview_token, force, approvedConflicts);
       if (res.success) {
         setCkptMsg(`Restored snapshot ${id} (${res.restored_count} files safely verified)`);
       } else {
