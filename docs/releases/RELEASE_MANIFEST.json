@@ -1,0 +1,15 @@
+{
+  "version": "0.1.0-beta.2",
+  "release_name": "AetherIDE Beta.2 \u2014 Sprint 23 Release Candidate Hardening",
+  "release_date": "2026-11-04",
+  "framework": "Tauri 2 + React 19 + Monaco Editor + Rust Core",
+  "artifacts": [
+    {
+      "name": "AetherIDE-v0.1.0-beta.2-windows-x64-setup.exe",
+      "platform": "windows-x64",
+      "format": "nsis-installer",
+      "size_bytes": 6901954,
+      "sha256": "d3de3b7447d6c14ea613f9a4fb54e29223952845d6854804d471297de551742c"
+    }
+  ]
+}
