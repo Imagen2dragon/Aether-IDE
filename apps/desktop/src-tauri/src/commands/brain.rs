@@ -42,7 +42,9 @@ pub async fn brain_scan_workspace(
                 combined_report.errors.extend(rep.errors);
             }
             Err(e) => {
-                combined_report.errors.push(format!("Scan failed for {:?}: {}", root_path, e));
+                combined_report
+                    .errors
+                    .push(format!("Scan failed for {:?}: {}", root_path, e));
                 combined_report.is_complete = false;
             }
         }

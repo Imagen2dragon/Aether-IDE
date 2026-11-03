@@ -1,7 +1,5 @@
 use crate::workspace_bridge::SharedWorkspace;
-use mobile_build_manager::{
-    EasCliStatus, ExpoDevServerInfo, MobileBuildManager, MobileDeviceInfo,
-};
+use mobile_build_manager::{EasCliStatus, ExpoDevServerInfo, MobileBuildManager, MobileDeviceInfo};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -64,13 +62,13 @@ pub async fn mobile_get_dev_server(
         if let Some(p) = project_dir {
             ws.validate_process_directory(&PathBuf::from(p))?
         } else {
-            ws.primary_root()
-                .ok_or_else(|| "No active workspace root open for mobile server inspection".to_string())?
+            ws.primary_root().ok_or_else(|| {
+                "No active workspace root open for mobile server inspection".to_string()
+            })?
         }
     };
 
-    MobileBuildManager::get_expo_dev_server_info(&dir, port)
-        .map_err(|e| e.to_string())
+    MobileBuildManager::get_expo_dev_server_info(&dir, port).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -121,7 +119,14 @@ pub async fn mobile_start_metro(
     #[cfg(windows)]
     let mut cmd = {
         let mut c = Command::new("cmd.exe");
-        c.args(["/C", "npx", "expo", "start", "--port", &port_num.to_string()]);
+        c.args([
+            "/C",
+            "npx",
+            "expo",
+            "start",
+            "--port",
+            &port_num.to_string(),
+        ]);
         c
     };
 
@@ -155,7 +160,10 @@ pub async fn mobile_start_metro(
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 // Detect actual readiness from output stream
-                if line.contains("Waiting on") || line.contains("Metro waiting on") || line.contains("Logs for your project") {
+                if line.contains("Waiting on")
+                    || line.contains("Metro waiting on")
+                    || line.contains("Logs for your project")
+                {
                     let _ = app_handle.emit("mobile-metro-ready", json!({ "port": port_num }));
                 }
                 let _ = app_handle.emit("mobile-process-output", json!({ "line": line }));

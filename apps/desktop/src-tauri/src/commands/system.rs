@@ -167,10 +167,7 @@ pub async fn ide_dispatch(
                 .and_then(|v| v.as_str())
                 .ok_or("Missing rootPath")?
                 .to_string();
-            let is_trusted = p
-                .get("isTrusted")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
+            let is_trusted = p.get("isTrusted").and_then(|v| v.as_bool()).unwrap_or(true);
             workspace_set_trust(app, root_path, is_trusted).await
         }
         "TerminalSpawn" => {
@@ -187,9 +184,7 @@ pub async fn ide_dispatch(
             let rows = p.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
             terminal_resize(app, cols, rows).await
         }
-        "TerminalClose" => {
-            terminal_kill(app).await
-        }
+        "TerminalClose" => terminal_kill(app).await,
         _ => Err(format!("Unknown ide_dispatch action: {}", action)),
     }
 }

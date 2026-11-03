@@ -189,9 +189,7 @@ pub async fn ai_stream_prompt(
         accumulated
     });
 
-    let exec_res = gw
-        .execute_stream(&req, &req_id, tx, cancel_token)
-        .await;
+    let exec_res = gw.execute_stream(&req, &req_id, tx, cancel_token).await;
 
     // Clean up active streams map
     {
@@ -225,10 +223,7 @@ pub async fn ai_cancel_stream(app: AppHandle, request_id: String) -> Result<bool
     let mut streams = streams_arc.lock();
     if let Some(token) = streams.remove(&request_id) {
         token.store(true, Ordering::Relaxed);
-        let _ = app.emit(
-            "ai-stream-cancelled",
-            json!({ "request_id": &request_id }),
-        );
+        let _ = app.emit("ai-stream-cancelled", json!({ "request_id": &request_id }));
         info!("Cancelled active AI streaming request: {}", request_id);
         Ok(true)
     } else {
@@ -308,7 +303,12 @@ pub async fn ai_apply_proposal(
         let ckpt_engine_arc = app.state::<SharedCheckpointEngine>();
         let ckpt_engine = ckpt_engine_arc.lock();
         let desc = format!("Pre-AI edit backup for {}", rel_path);
-        match ckpt_engine.create_checkpoint_with_root(&desc, &ws_id, &root, Some(&[full_path.clone()])) {
+        match ckpt_engine.create_checkpoint_with_root(
+            &desc,
+            &ws_id,
+            &root,
+            Some(&[full_path.clone()]),
+        ) {
             Ok(ckpt) => Some(ckpt.checkpoint_id),
             Err(e) => {
                 warn!("Failed to create pre-edit checkpoint: {}", e);
@@ -358,8 +358,9 @@ mod tests {
         let base_hash = original_hash.clone();
         let current_disk_hash = modified_hash.clone();
 
-        let has_conflict =
-            !base_hash.is_empty() && !current_disk_hash.is_empty() && base_hash != current_disk_hash;
+        let has_conflict = !base_hash.is_empty()
+            && !current_disk_hash.is_empty()
+            && base_hash != current_disk_hash;
         assert!(
             has_conflict,
             "Conflict must be flagged when base hash differs from disk hash"

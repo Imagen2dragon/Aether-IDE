@@ -21,14 +21,14 @@ pub fn run() {
             let _ = std::fs::create_dir_all(&data_dir);
 
             // 1. Central Workspace Access Manager
-            let session: workspace_bridge::SharedWorkspace =
-                Arc::new(parking_lot::Mutex::new(workspace_bridge::WorkspaceSession::new(
-                    data_dir.clone(),
-                )));
+            let session: workspace_bridge::SharedWorkspace = Arc::new(parking_lot::Mutex::new(
+                workspace_bridge::WorkspaceSession::new(data_dir.clone()),
+            ));
 
             // 2. Terminal Manager
-            let term_mgr: commands::terminal::SharedTerminalManager =
-                Arc::new(parking_lot::Mutex::new(terminal_manager::TerminalManager::new()));
+            let term_mgr: commands::terminal::SharedTerminalManager = Arc::new(
+                parking_lot::Mutex::new(terminal_manager::TerminalManager::new()),
+            );
             let active_term: commands::terminal::ActiveTerminalId =
                 Arc::new(parking_lot::Mutex::new(None));
 
@@ -43,13 +43,9 @@ pub fn run() {
 
             // 4. Model Gateway & Agent Orchestrator
             let gateway_inst = model_gateway::ModelGateway::new();
-            let gateway: commands::ai::SharedGateway =
-                Arc::new(gateway_inst.clone());
+            let gateway: commands::ai::SharedGateway = Arc::new(gateway_inst.clone());
             let orchestrator: commands::agents::SharedOrchestrator = Arc::new(
-                agent_orchestrator::AgentOrchestrator::new(
-                    gateway_inst,
-                    db_engine,
-                ),
+                agent_orchestrator::AgentOrchestrator::new(gateway_inst, db_engine),
             );
 
             // 5. Streams, Storage Candidates & Build Tracking
@@ -63,11 +59,10 @@ pub fn run() {
             // 6. Mobile, Checkpoint & LSP
             let metro_pid: commands::mobile::ActiveMetroPid =
                 Arc::new(parking_lot::Mutex::new(None));
-            let checkpoint_engine: commands::checkpoint::SharedCheckpointEngine = Arc::new(
-                parking_lot::Mutex::new(checkpoint_engine::CheckpointEngine::new(
-                    data_dir.join("checkpoints"),
-                )),
-            );
+            let checkpoint_engine: commands::checkpoint::SharedCheckpointEngine =
+                Arc::new(parking_lot::Mutex::new(
+                    checkpoint_engine::CheckpointEngine::new(data_dir.join("checkpoints")),
+                ));
             let lsp_mux: commands::lsp::SharedLspMultiplexer =
                 Arc::new(lsp_client::LspMultiplexer::new(data_dir));
 

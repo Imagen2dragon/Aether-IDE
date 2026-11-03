@@ -57,10 +57,23 @@ pub struct CompletionResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StreamDelta {
-    Started { request_id: String, model: String },
-    Chunk { request_id: String, delta: String },
-    Completed { request_id: String, full_text: String, completion_tokens: usize },
-    Error { request_id: String, message: String },
+    Started {
+        request_id: String,
+        model: String,
+    },
+    Chunk {
+        request_id: String,
+        delta: String,
+    },
+    Completed {
+        request_id: String,
+        full_text: String,
+        completion_tokens: usize,
+    },
+    Error {
+        request_id: String,
+        message: String,
+    },
 }
 
 #[async_trait]
@@ -77,7 +90,9 @@ pub trait ModelProvider: Send + Sync {
         cancel: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<CompletionResponse> {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(AetherError::ModelProvider("Request cancelled by user".into()));
+            return Err(AetherError::ModelProvider(
+                "Request cancelled by user".into(),
+            ));
         }
         let resp = self.complete(req).await?;
         if !cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -288,20 +303,28 @@ impl ModelGateway {
 
         for provider in &providers {
             if provider.list_models().iter().any(|m| m.id == target_model) {
-                return provider.stream_completion(req, request_id, sender, cancel).await;
+                return provider
+                    .stream_completion(req, request_id, sender, cancel)
+                    .await;
             }
         }
 
         for provider in &providers {
             if target_model.starts_with(provider.provider_name()) {
-                return provider.stream_completion(req, request_id, sender, cancel).await;
+                return provider
+                    .stream_completion(req, request_id, sender, cancel)
+                    .await;
             }
         }
 
         if let Some(first) = providers.first() {
-            first.stream_completion(req, request_id, sender, cancel).await
+            first
+                .stream_completion(req, request_id, sender, cancel)
+                .await
         } else {
-            Err(AetherError::ModelProvider("No AI model providers registered".into()))
+            Err(AetherError::ModelProvider(
+                "No AI model providers registered".into(),
+            ))
         }
     }
 }
@@ -457,7 +480,9 @@ impl ModelProvider for LocalOllamaProvider {
         use futures::StreamExt;
         while let Some(chunk_res) = stream.next().await {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(AetherError::ModelProvider("Request cancelled by user".into()));
+                return Err(AetherError::ModelProvider(
+                    "Request cancelled by user".into(),
+                ));
             }
 
             let bytes = chunk_res.map_err(|e| AetherError::ModelProvider(e.to_string()))?;
@@ -767,7 +792,9 @@ impl ModelProvider for OpenAiCompatibleProvider {
         use futures::StreamExt;
         while let Some(chunk_res) = stream.next().await {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(AetherError::ModelProvider("Request cancelled by user".into()));
+                return Err(AetherError::ModelProvider(
+                    "Request cancelled by user".into(),
+                ));
             }
 
             let bytes = chunk_res.map_err(|e| AetherError::ModelProvider(e.to_string()))?;
@@ -787,7 +814,10 @@ impl ModelProvider for OpenAiCompatibleProvider {
                     }
 
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
-                        if let Some(delta) = json.pointer("/choices/0/delta/content").and_then(|v| v.as_str()) {
+                        if let Some(delta) = json
+                            .pointer("/choices/0/delta/content")
+                            .and_then(|v| v.as_str())
+                        {
                             if !delta.is_empty() {
                                 full_text.push_str(delta);
                                 completion_tokens += 1;

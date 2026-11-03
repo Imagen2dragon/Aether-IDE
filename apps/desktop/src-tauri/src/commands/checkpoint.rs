@@ -41,12 +41,7 @@ pub async fn checkpoint_create(
     let engine = engine_arc.lock();
 
     engine
-        .create_checkpoint_with_root(
-            &description,
-            &ws_id,
-            &root,
-            explicit_paths.as_deref(),
-        )
+        .create_checkpoint_with_root(&description, &ws_id, &root, explicit_paths.as_deref())
         .map_err(|e| format!("Failed to create checkpoint: {}", e))
 }
 

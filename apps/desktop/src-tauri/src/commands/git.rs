@@ -33,8 +33,8 @@ pub async fn git_stage_file(
     path: Option<String>,
 ) -> Result<bool, String> {
     let repo_path = resolve_repo_path(&app, path)?;
-    let rel_sanitized = sanitize_relative_path(&file)
-        .map_err(|e| format!("Invalid git target file: {}", e))?;
+    let rel_sanitized =
+        sanitize_relative_path(&file).map_err(|e| format!("Invalid git target file: {}", e))?;
     GitEngine::stage_file(&repo_path, &rel_sanitized.to_string_lossy())
         .await
         .map_err(|e| format!("Failed to stage file: {}", e))?;
@@ -48,8 +48,8 @@ pub async fn git_unstage_file(
     path: Option<String>,
 ) -> Result<bool, String> {
     let repo_path = resolve_repo_path(&app, path)?;
-    let rel_sanitized = sanitize_relative_path(&file)
-        .map_err(|e| format!("Invalid git target file: {}", e))?;
+    let rel_sanitized =
+        sanitize_relative_path(&file).map_err(|e| format!("Invalid git target file: {}", e))?;
     GitEngine::unstage_file(&repo_path, &rel_sanitized.to_string_lossy())
         .await
         .map_err(|e| format!("Failed to unstage file: {}", e))?;

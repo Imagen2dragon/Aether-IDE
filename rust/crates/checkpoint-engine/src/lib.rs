@@ -120,7 +120,10 @@ impl CheckpointEngine {
         files: &[PathBuf],
     ) -> Result<WorkspaceCheckpoint> {
         let root = if let Some(first) = files.first() {
-            first.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+            first
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
         } else {
             PathBuf::from(".")
         };
@@ -348,7 +351,10 @@ impl CheckpointEngine {
         for record in &ckpt.files {
             // Verify path strictly
             if let Err(e) = sanitize_relative_path(&record.relative_path) {
-                errors.push(format!("Skipping unsafe path '{}': {}", record.relative_path, e));
+                errors.push(format!(
+                    "Skipping unsafe path '{}': {}",
+                    record.relative_path, e
+                ));
                 continue;
             }
 
@@ -356,7 +362,10 @@ impl CheckpointEngine {
             let blob_bytes = match std::fs::read(&blob_path) {
                 Ok(b) => b,
                 Err(e) => {
-                    errors.push(format!("Failed reading blob for '{}': {}", record.relative_path, e));
+                    errors.push(format!(
+                        "Failed reading blob for '{}': {}",
+                        record.relative_path, e
+                    ));
                     continue;
                 }
             };
@@ -395,7 +404,10 @@ impl CheckpointEngine {
                     }
                 }
                 Err(e) => {
-                    errors.push(format!("Failed restoring '{}': {}", record.relative_path, e));
+                    errors.push(format!(
+                        "Failed restoring '{}': {}",
+                        record.relative_path, e
+                    ));
                 }
             }
         }
@@ -518,7 +530,9 @@ mod tests {
         // Must fail with PermissionDenied because of malicious path traversal
         assert!(res.is_err());
         let err_str = format!("{:?}", res.err().unwrap());
-        assert!(err_str.contains("Malicious relative path") || err_str.contains("PermissionDenied"));
+        assert!(
+            err_str.contains("Malicious relative path") || err_str.contains("PermissionDenied")
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

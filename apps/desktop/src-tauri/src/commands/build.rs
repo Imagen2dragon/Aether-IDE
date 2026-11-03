@@ -14,8 +14,22 @@ use tracing::info;
 pub type SharedActiveBuilds = Arc<Mutex<HashMap<String, u32>>>;
 
 pub const APPROVED_BUILD_TOOLS: &[&str] = &[
-    "cargo", "rustc", "npm", "npx", "yarn", "pnpm", "bun", "python", "python3", "py",
-    "pytest", "gradle", "gradlew", "./gradlew", "make", "cmake",
+    "cargo",
+    "rustc",
+    "npm",
+    "npx",
+    "yarn",
+    "pnpm",
+    "bun",
+    "python",
+    "python3",
+    "py",
+    "pytest",
+    "gradle",
+    "gradlew",
+    "./gradlew",
+    "make",
+    "cmake",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,7 +199,8 @@ pub async fn build_run_task(
     // 3. Spawn validated process with direct argument array
     #[cfg(windows)]
     let mut cmd = {
-        let is_batch = program == "npm" || program == "npx" || program == "yarn" || program == "pnpm";
+        let is_batch =
+            program == "npm" || program == "npx" || program == "yarn" || program == "pnpm";
         if is_batch {
             let mut c = Command::new("cmd.exe");
             c.arg("/C").arg(program).args(args);
@@ -231,7 +246,10 @@ pub async fn build_run_task(
         while let Ok(Some(line)) = reader.next_line().await {
             full.push_str(&line);
             full.push('\n');
-            let _ = app_stdout.emit("build-task-output", json!({ "line": line, "stream": "stdout" }));
+            let _ = app_stdout.emit(
+                "build-task-output",
+                json!({ "line": line, "stream": "stdout" }),
+            );
         }
         full
     });
@@ -243,7 +261,10 @@ pub async fn build_run_task(
         while let Ok(Some(line)) = reader.next_line().await {
             full.push_str(&line);
             full.push('\n');
-            let _ = app_stderr.emit("build-task-output", json!({ "line": line, "stream": "stderr" }));
+            let _ = app_stderr.emit(
+                "build-task-output",
+                json!({ "line": line, "stream": "stderr" }),
+            );
         }
         full
     });
@@ -306,19 +327,36 @@ mod tests {
 
     #[test]
     fn test_approved_build_tools_whitelist() {
-        let allowed = ["cargo", "npm", "npx", "yarn", "pnpm", "bun", "python", "gradle", "make", "cmake"];
+        let allowed = [
+            "cargo", "npm", "npx", "yarn", "pnpm", "bun", "python", "gradle", "make", "cmake",
+        ];
         for tool in allowed {
             assert!(
-                APPROVED_BUILD_TOOLS.iter().any(|&t| t == tool || tool.ends_with(t)),
+                APPROVED_BUILD_TOOLS
+                    .iter()
+                    .any(|&t| t == tool || tool.ends_with(t)),
                 "Tool '{}' should be in approved build tools",
                 tool
             );
         }
 
-        let dangerous = ["cmd", "cmd.exe", "powershell", "pwsh", "bash", "sh", "curl", "wget", "rm", "del"];
+        let dangerous = [
+            "cmd",
+            "cmd.exe",
+            "powershell",
+            "pwsh",
+            "bash",
+            "sh",
+            "curl",
+            "wget",
+            "rm",
+            "del",
+        ];
         for tool in dangerous {
             assert!(
-                !APPROVED_BUILD_TOOLS.iter().any(|&t| t.eq_ignore_ascii_case(tool)),
+                !APPROVED_BUILD_TOOLS
+                    .iter()
+                    .any(|&t| t.eq_ignore_ascii_case(tool)),
                 "Dangerous tool '{}' must NOT be in approved build tools",
                 tool
             );

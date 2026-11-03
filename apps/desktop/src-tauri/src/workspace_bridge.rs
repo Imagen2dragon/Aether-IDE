@@ -158,12 +158,16 @@ impl WorkspaceSession {
     /// Removes a folder from active workspace roots.
     pub fn remove_root(&self, path_or_id: &Path) -> Result<serde_json::Value, String> {
         let id_str = path_or_id.to_string_lossy();
-        let canonical = path_or_id.canonicalize().unwrap_or_else(|_| path_or_id.to_path_buf());
+        let canonical = path_or_id
+            .canonicalize()
+            .unwrap_or_else(|_| path_or_id.to_path_buf());
 
         {
             let mut roots = self.roots.lock().unwrap();
             roots.retain(|r| {
-                r.root_id != id_str && r.canonical_path != canonical && r.canonical_path != path_or_id
+                r.root_id != id_str
+                    && r.canonical_path != canonical
+                    && r.canonical_path != path_or_id
             });
 
             // Re-index root IDs
@@ -206,7 +210,10 @@ impl WorkspaceSession {
 
         let roots = self.roots.lock().unwrap();
         for r in roots.iter() {
-            if filesystem_engine::FilesystemEngine::is_within_boundary(&canonical, &r.canonical_path) {
+            if filesystem_engine::FilesystemEngine::is_within_boundary(
+                &canonical,
+                &r.canonical_path,
+            ) {
                 if !r.is_trusted {
                     return Err(format!(
                         "Security Denial: Directory {:?} is inside untrusted workspace root '{}'. Process execution denied.",
@@ -240,10 +247,17 @@ impl WorkspaceSession {
         if p.is_absolute() {
             let canon = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
             for root in roots.iter() {
-                if filesystem_engine::FilesystemEngine::is_within_boundary(&canon, &root.canonical_path) {
+                if filesystem_engine::FilesystemEngine::is_within_boundary(
+                    &canon,
+                    &root.canonical_path,
+                ) {
                     if let Ok(rel) = canon.strip_prefix(&root.canonical_path) {
                         let rel_str = rel.to_string_lossy().replace('\\', "/");
-                        return Ok((root.capability.clone(), root.canonical_path.clone(), rel_str));
+                        return Ok((
+                            root.capability.clone(),
+                            root.canonical_path.clone(),
+                            rel_str,
+                        ));
                     }
                 }
             }
@@ -296,7 +310,9 @@ impl WorkspaceSession {
             });
         }
 
-        let primary = roots.first().map(|r| r.canonical_path.to_string_lossy().to_string());
+        let primary = roots
+            .first()
+            .map(|r| r.canonical_path.to_string_lossy().to_string());
         let count = root_infos.len();
         drop(roots);
 
@@ -677,7 +693,10 @@ mod tests {
         // Revoke workspace
         session.revoke_workspace().unwrap();
         let summary_after = session.get_workspace_summary().unwrap();
-        assert_eq!(summary_after.get("root_count").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(
+            summary_after.get("root_count").and_then(|v| v.as_u64()),
+            Some(0)
+        );
 
         let _ = std::fs::remove_dir_all(&temp_base);
     }

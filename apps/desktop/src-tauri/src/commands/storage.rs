@@ -232,7 +232,10 @@ pub async fn storage_cleanup(
         // 1. Resolve candidate by ID or matching relative path
         let candidate = if let Some(c) = candidate_map.get(&target).cloned() {
             c
-        } else if let Some((_, c)) = candidate_map.iter().find(|(_, c)| c.relative_path == target || c.candidate_id == target) {
+        } else if let Some((_, c)) = candidate_map
+            .iter()
+            .find(|(_, c)| c.relative_path == target || c.candidate_id == target)
+        {
             c.clone()
         } else {
             errors.push(format!(
