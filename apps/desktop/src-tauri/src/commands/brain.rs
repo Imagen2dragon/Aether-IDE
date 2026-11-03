@@ -29,8 +29,10 @@ pub async fn brain_scan_workspace(
     let brain_arc = app.state::<SharedBrain>();
     let mut brain = brain_arc.lock();
 
-    let mut combined_report = BrainReconcileReport::default();
-    combined_report.is_complete = true;
+    let mut combined_report = BrainReconcileReport {
+        is_complete: true,
+        ..Default::default()
+    };
 
     for root_path in roots_to_scan {
         match brain.reconcile_workspace(&root_path) {

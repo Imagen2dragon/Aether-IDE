@@ -84,29 +84,15 @@ pub trait ModelProvider: Send + Sync {
 
     async fn stream_completion(
         &self,
-        req: &CompletionRequest,
-        request_id: &str,
-        sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
-        cancel: Arc<std::sync::atomic::AtomicBool>,
+        _req: &CompletionRequest,
+        _request_id: &str,
+        _sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+        _cancel: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<CompletionResponse> {
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(AetherError::ModelProvider(
-                "Request cancelled by user".into(),
-            ));
-        }
-        let resp = self.complete(req).await?;
-        if !cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            let _ = sender.send(StreamDelta::Chunk {
-                request_id: request_id.to_string(),
-                delta: resp.content.clone(),
-            });
-            let _ = sender.send(StreamDelta::Completed {
-                request_id: request_id.to_string(),
-                full_text: resp.content.clone(),
-                completion_tokens: resp.completion_tokens,
-            });
-        }
-        Ok(resp)
+        Err(AetherError::ModelProvider(format!(
+            "Streaming is not supported for provider '{}'",
+            self.provider_name()
+        )))
     }
 }
 
@@ -734,118 +720,420 @@ impl ModelProvider for OpenAiCompatibleProvider {
             None => None,
         };
 
-        let target_model = req.model.clone().unwrap_or_else(|| {
-            if self.name == "lmstudio" {
-                "local-model".into()
-            } else {
-                "gpt-4o".into()
-            }
-        });
+        let default_model = if self.name == "lmstudio" {
+            "local-model"
+        } else {
+            "gpt-4o"
+        };
 
-        let mut messages = Vec::new();
-        if let Some(sys) = &req.system {
-            messages.push(serde_json::json!({
-                "role": "system",
-                "content": sys
-            }));
-        }
+        stream_openai_compatible(
+            &self.name,
+            &self.endpoint,
+            api_key.as_deref(),
+            req,
+            default_model,
+            request_id,
+            sender,
+            cancel,
+        )
+        .await
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Streaming Helper Functions (OpenAI SSE, Anthropic SSE, Google Gemini SSE)
+// -----------------------------------------------------------------------------
+#[allow(clippy::too_many_arguments)]
+async fn stream_openai_compatible(
+    provider_name: &str,
+    endpoint: &str,
+    api_key: Option<&str>,
+    req: &CompletionRequest,
+    default_model: &str,
+    request_id: &str,
+    sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<CompletionResponse> {
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(AetherError::ModelProvider(
+            "Request cancelled by user".into(),
+        ));
+    }
+
+    let target_model = req
+        .model
+        .clone()
+        .unwrap_or_else(|| default_model.to_string());
+
+    let mut messages = Vec::new();
+    if let Some(sys) = &req.system {
         messages.push(serde_json::json!({
-            "role": "user",
-            "content": &req.prompt
+            "role": "system",
+            "content": sys
         }));
+    }
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": &req.prompt
+    }));
 
-        let payload = serde_json::json!({
-            "model": target_model,
-            "messages": messages,
-            "temperature": req.temperature.unwrap_or(0.2),
-            "max_tokens": req.max_tokens.unwrap_or(2048),
-            "stream": true
-        });
+    let payload = serde_json::json!({
+        "model": target_model,
+        "messages": messages,
+        "temperature": req.temperature.unwrap_or(0.2),
+        "max_tokens": req.max_tokens.unwrap_or(2048),
+        "stream": true
+    });
 
-        let client = reqwest::Client::new();
-        let url = format!("{}/chat/completions", self.endpoint);
-        let mut request = client.post(&url).json(&payload);
+    let client = reqwest::Client::new();
+    let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
+    let mut request = client.post(&url).json(&payload);
 
-        if let Some(key) = api_key {
-            request = request.header("Authorization", format!("Bearer {}", key));
+    if let Some(key) = api_key {
+        request = request.header("Authorization", format!("Bearer {}", key));
+    }
+
+    let start = std::time::Instant::now();
+    let resp = request.send().await.map_err(|e| {
+        AetherError::ModelProvider(format!("Failed to connect to {}: {}", endpoint, e))
+    })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AetherError::ModelProvider(format!(
+            "{} streaming error (HTTP {}): {}",
+            provider_name, status, body
+        )));
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut full_text = String::new();
+    let mut completion_tokens = 0usize;
+    let mut buffer = String::new();
+
+    use futures::StreamExt;
+    while let Some(chunk_res) = stream.next().await {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(AetherError::ModelProvider(
+                "Request cancelled by user".into(),
+            ));
         }
 
-        let start = std::time::Instant::now();
-        let resp = request.send().await.map_err(|e| {
-            AetherError::ModelProvider(format!("Failed to connect to {}: {}", self.endpoint, e))
-        })?;
+        let bytes = chunk_res.map_err(|e| AetherError::ModelProvider(e.to_string()))?;
+        buffer.push_str(&String::from_utf8_lossy(&bytes));
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(AetherError::ModelProvider(format!(
-                "{} streaming error (HTTP {}): {}",
-                self.name, status, body
-            )));
-        }
+        while let Some(pos) = buffer.find('\n') {
+            let line = buffer[..pos].trim().to_string();
+            buffer.drain(..=pos);
 
-        let mut stream = resp.bytes_stream();
-        let mut full_text = String::new();
-        let mut completion_tokens = 0usize;
-        let mut buffer = String::new();
-
-        use futures::StreamExt;
-        while let Some(chunk_res) = stream.next().await {
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(AetherError::ModelProvider(
-                    "Request cancelled by user".into(),
-                ));
+            if line.is_empty() || line.starts_with(':') {
+                continue;
             }
 
-            let bytes = chunk_res.map_err(|e| AetherError::ModelProvider(e.to_string()))?;
-            buffer.push_str(&String::from_utf8_lossy(&bytes));
-
-            while let Some(pos) = buffer.find('\n') {
-                let line = buffer[..pos].trim().to_string();
-                buffer.drain(..=pos);
-
-                if line.is_empty() || line.starts_with(':') {
-                    continue;
+            if let Some(data_str) = line.strip_prefix("data: ") {
+                if data_str.trim() == "[DONE]" {
+                    break;
                 }
 
-                if let Some(data_str) = line.strip_prefix("data: ") {
-                    if data_str.trim() == "[DONE]" {
-                        break;
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
+                    if let Some(delta) = json
+                        .pointer("/choices/0/delta/content")
+                        .and_then(|v| v.as_str())
+                    {
+                        if !delta.is_empty() {
+                            full_text.push_str(delta);
+                            completion_tokens += 1;
+                            let _ = sender.send(StreamDelta::Chunk {
+                                request_id: request_id.to_string(),
+                                delta: delta.to_string(),
+                            });
+                        }
                     }
+                }
+            }
+        }
+    }
 
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
-                        if let Some(delta) = json
-                            .pointer("/choices/0/delta/content")
-                            .and_then(|v| v.as_str())
-                        {
-                            if !delta.is_empty() {
-                                full_text.push_str(delta);
+    let _ = sender.send(StreamDelta::Completed {
+        request_id: request_id.to_string(),
+        full_text: full_text.clone(),
+        completion_tokens,
+    });
+
+    Ok(CompletionResponse {
+        model: target_model,
+        content: full_text,
+        prompt_tokens: 0,
+        completion_tokens,
+        latency_ms: start.elapsed().as_millis() as u64,
+    })
+}
+
+async fn stream_anthropic(
+    endpoint: &str,
+    req: &CompletionRequest,
+    request_id: &str,
+    sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<CompletionResponse> {
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(AetherError::ModelProvider(
+            "Request cancelled by user".into(),
+        ));
+    }
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+    if api_key.trim().is_empty() {
+        return Err(AetherError::ModelProvider(
+            "ANTHROPIC_API_KEY environment variable is not set. Please set ANTHROPIC_API_KEY in your environment or Settings.".into(),
+        ));
+    }
+
+    let target_model = match req.model.as_deref() {
+        Some("claude-3-7-sonnet") => "claude-3-7-sonnet-20250219",
+        Some("claude-3-5-haiku") => "claude-3-5-haiku-20241022",
+        _ => "claude-3-5-sonnet-20241022",
+    };
+
+    let mut payload_map = serde_json::Map::new();
+    payload_map.insert("model".into(), serde_json::json!(target_model));
+    payload_map.insert(
+        "max_tokens".into(),
+        serde_json::json!(req.max_tokens.unwrap_or(2048)),
+    );
+    payload_map.insert("stream".into(), serde_json::json!(true));
+    if let Some(sys) = &req.system {
+        payload_map.insert("system".into(), serde_json::json!(sys));
+    }
+    payload_map.insert(
+        "messages".into(),
+        serde_json::json!([{ "role": "user", "content": &req.prompt }]),
+    );
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/messages", endpoint.trim_end_matches('/'));
+    let start = std::time::Instant::now();
+    let resp = client
+        .post(&url)
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&serde_json::Value::Object(payload_map))
+        .send()
+        .await
+        .map_err(|e| {
+            AetherError::ModelProvider(format!("Failed to connect to Anthropic API: {}", e))
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AetherError::ModelProvider(format!(
+            "Anthropic streaming error (HTTP {}): {}",
+            status, body
+        )));
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut full_text = String::new();
+    let mut completion_tokens = 0usize;
+    let mut buffer = String::new();
+
+    use futures::StreamExt;
+    while let Some(chunk_res) = stream.next().await {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(AetherError::ModelProvider(
+                "Request cancelled by user".into(),
+            ));
+        }
+
+        let bytes = chunk_res.map_err(|e| AetherError::ModelProvider(e.to_string()))?;
+        buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+        while let Some(pos) = buffer.find('\n') {
+            let line = buffer[..pos].trim().to_string();
+            buffer.drain(..=pos);
+
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
+
+            if let Some(data_str) = line.strip_prefix("data: ") {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
+                    let event_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if event_type == "content_block_delta" {
+                        if let Some(text) = json.pointer("/delta/text").and_then(|v| v.as_str()) {
+                            if !text.is_empty() {
+                                full_text.push_str(text);
                                 completion_tokens += 1;
                                 let _ = sender.send(StreamDelta::Chunk {
                                     request_id: request_id.to_string(),
-                                    delta: delta.to_string(),
+                                    delta: text.to_string(),
                                 });
+                            }
+                        }
+                    } else if event_type == "message_stop" {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = sender.send(StreamDelta::Completed {
+        request_id: request_id.to_string(),
+        full_text: full_text.clone(),
+        completion_tokens,
+    });
+
+    Ok(CompletionResponse {
+        model: target_model.to_string(),
+        content: full_text,
+        prompt_tokens: 0,
+        completion_tokens,
+        latency_ms: start.elapsed().as_millis() as u64,
+    })
+}
+
+async fn stream_gemini(
+    endpoint: &str,
+    req: &CompletionRequest,
+    request_id: &str,
+    sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<CompletionResponse> {
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(AetherError::ModelProvider(
+            "Request cancelled by user".into(),
+        ));
+    }
+
+    let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+    if api_key.trim().is_empty() {
+        return Err(AetherError::ModelProvider(
+            "GEMINI_API_KEY environment variable is not set. Please configure GEMINI_API_KEY in your environment or Settings.".into(),
+        ));
+    }
+
+    let model_id = req
+        .model
+        .clone()
+        .unwrap_or_else(|| "gemini-2.0-flash".into());
+
+    let url = format!(
+        "{}/models/{}:streamGenerateContent?key={}&alt=sse",
+        endpoint.trim_end_matches('/'),
+        model_id,
+        api_key
+    );
+
+    let mut payload_map = serde_json::Map::new();
+    payload_map.insert(
+        "contents".into(),
+        serde_json::json!([
+            {
+                "role": "user",
+                "parts": [{ "text": &req.prompt }]
+            }
+        ]),
+    );
+
+    if let Some(sys) = &req.system {
+        payload_map.insert(
+            "system_instruction".into(),
+            serde_json::json!({
+                "parts": [{ "text": sys }]
+            }),
+        );
+    }
+
+    let gen_config = serde_json::json!({
+        "temperature": req.temperature.unwrap_or(0.2),
+        "maxOutputTokens": req.max_tokens.unwrap_or(2048)
+    });
+    payload_map.insert("generationConfig".into(), gen_config);
+
+    let client = reqwest::Client::new();
+    let start = std::time::Instant::now();
+    let resp = client
+        .post(&url)
+        .json(&serde_json::Value::Object(payload_map))
+        .send()
+        .await
+        .map_err(|e| {
+            AetherError::ModelProvider(format!("Failed to connect to Google Gemini API: {}", e))
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AetherError::ModelProvider(format!(
+            "Gemini streaming error (HTTP {}): {}",
+            status, body
+        )));
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut full_text = String::new();
+    let mut completion_tokens = 0usize;
+    let mut buffer = String::new();
+
+    use futures::StreamExt;
+    while let Some(chunk_res) = stream.next().await {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(AetherError::ModelProvider(
+                "Request cancelled by user".into(),
+            ));
+        }
+
+        let bytes = chunk_res.map_err(|e| AetherError::ModelProvider(e.to_string()))?;
+        buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+        while let Some(pos) = buffer.find('\n') {
+            let line = buffer[..pos].trim().to_string();
+            buffer.drain(..=pos);
+
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
+
+            if let Some(data_str) = line.strip_prefix("data: ") {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
+                    if let Some(parts) = json
+                        .pointer("/candidates/0/content/parts")
+                        .and_then(|v| v.as_array())
+                    {
+                        for part in parts {
+                            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                                if !text.is_empty() {
+                                    full_text.push_str(text);
+                                    completion_tokens += 1;
+                                    let _ = sender.send(StreamDelta::Chunk {
+                                        request_id: request_id.to_string(),
+                                        delta: text.to_string(),
+                                    });
+                                }
                             }
                         }
                     }
                 }
             }
         }
-
-        let _ = sender.send(StreamDelta::Completed {
-            request_id: request_id.to_string(),
-            full_text: full_text.clone(),
-            completion_tokens,
-        });
-
-        Ok(CompletionResponse {
-            model: target_model,
-            content: full_text,
-            prompt_tokens: 0,
-            completion_tokens,
-            latency_ms: start.elapsed().as_millis() as u64,
-        })
     }
+
+    let _ = sender.send(StreamDelta::Completed {
+        request_id: request_id.to_string(),
+        full_text: full_text.clone(),
+        completion_tokens,
+    });
+
+    Ok(CompletionResponse {
+        model: model_id,
+        content: full_text,
+        prompt_tokens: 0,
+        completion_tokens,
+        latency_ms: start.elapsed().as_millis() as u64,
+    })
 }
 
 // -----------------------------------------------------------------------------
@@ -992,6 +1280,16 @@ impl ModelProvider for AnthropicProvider {
             completion_tokens,
             latency_ms: start.elapsed().as_millis() as u64,
         })
+    }
+
+    async fn stream_completion(
+        &self,
+        req: &CompletionRequest,
+        request_id: &str,
+        sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<CompletionResponse> {
+        stream_anthropic(&self.endpoint, req, request_id, sender, cancel).await
     }
 }
 
@@ -1158,6 +1456,16 @@ impl ModelProvider for GoogleGeminiProvider {
             latency_ms: start.elapsed().as_millis() as u64,
         })
     }
+
+    async fn stream_completion(
+        &self,
+        req: &CompletionRequest,
+        request_id: &str,
+        sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<CompletionResponse> {
+        stream_gemini(&self.endpoint, req, request_id, sender, cancel).await
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1293,6 +1601,32 @@ impl ModelProvider for DeepSeekProvider {
             completion_tokens,
             latency_ms: start.elapsed().as_millis() as u64,
         })
+    }
+
+    async fn stream_completion(
+        &self,
+        req: &CompletionRequest,
+        request_id: &str,
+        sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<CompletionResponse> {
+        let api_key = std::env::var("DEEPSEEK_API_KEY").unwrap_or_default();
+        if api_key.trim().is_empty() {
+            return Err(AetherError::ModelProvider(
+                "DEEPSEEK_API_KEY environment variable is not set. Please configure DEEPSEEK_API_KEY in your environment or Settings.".into(),
+            ));
+        }
+        stream_openai_compatible(
+            "deepseek",
+            &self.endpoint,
+            Some(&api_key),
+            req,
+            "deepseek-chat",
+            request_id,
+            sender,
+            cancel,
+        )
+        .await
     }
 }
 
@@ -1430,6 +1764,32 @@ impl ModelProvider for XAIGrokProvider {
             latency_ms: start.elapsed().as_millis() as u64,
         })
     }
+
+    async fn stream_completion(
+        &self,
+        req: &CompletionRequest,
+        request_id: &str,
+        sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<CompletionResponse> {
+        let api_key = std::env::var("XAI_API_KEY").unwrap_or_default();
+        if api_key.trim().is_empty() {
+            return Err(AetherError::ModelProvider(
+                "XAI_API_KEY environment variable is not set. Please configure XAI_API_KEY in your environment or Settings.".into(),
+            ));
+        }
+        stream_openai_compatible(
+            "xai",
+            &self.endpoint,
+            Some(&api_key),
+            req,
+            "grok-2-1212",
+            request_id,
+            sender,
+            cancel,
+        )
+        .await
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1541,5 +1901,80 @@ mod tests {
         let all_statuses = gateway.diagnose_all_providers();
         assert!(all_statuses.contains_key("ollama"));
         assert!(all_statuses.contains_key("openai"));
+    }
+
+    struct NonStreamingProvider;
+
+    #[async_trait]
+    impl ModelProvider for NonStreamingProvider {
+        fn provider_name(&self) -> &str {
+            "non-streaming-dummy"
+        }
+        fn list_models(&self) -> Vec<ModelMetadata> {
+            vec![]
+        }
+        async fn complete(&self, _req: &CompletionRequest) -> Result<CompletionResponse> {
+            Ok(CompletionResponse {
+                model: "dummy".into(),
+                content: "ok".into(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                latency_ms: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fake_streaming_eliminated_unsupported_provider_fails_closed() {
+        let provider = NonStreamingProvider;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let req = CompletionRequest {
+            prompt: "test".into(),
+            system: None,
+            model: None,
+            temperature: None,
+            max_tokens: None,
+        };
+
+        let res = provider.stream_completion(&req, "req-1", tx, cancel).await;
+        assert!(res.is_err(), "Non-streaming provider must fail closed");
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("Streaming is not supported for provider 'non-streaming-dummy'"),
+            "Error must explicitly explain streaming is unsupported: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_aborts_stream_immediately() {
+        let provider = OpenAiCompatibleProvider::new(
+            "test-openai",
+            "http://127.0.0.1:9", // Unreachable port
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true)); // Pre-cancelled!
+
+        let req = CompletionRequest {
+            prompt: "test".into(),
+            system: None,
+            model: None,
+            temperature: None,
+            max_tokens: None,
+        };
+
+        let res = provider
+            .stream_completion(&req, "req-cancel", tx, cancel)
+            .await;
+        assert!(res.is_err());
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("Request cancelled by user"),
+            "Cancelled request must fail immediately: {}",
+            err
+        );
     }
 }
