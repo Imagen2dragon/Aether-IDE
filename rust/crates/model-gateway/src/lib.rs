@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelMetadata {
@@ -87,7 +88,7 @@ pub trait ModelProvider: Send + Sync {
         _req: &CompletionRequest,
         _request_id: &str,
         _sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
-        _cancel: Arc<std::sync::atomic::AtomicBool>,
+        _cancel: CancellationToken,
     ) -> Result<CompletionResponse> {
         Err(AetherError::ModelProvider(format!(
             "Streaming is not supported for provider '{}'",
@@ -277,7 +278,7 @@ impl ModelGateway {
         req: &CompletionRequest,
         request_id: &str,
         sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
-        cancel: Arc<std::sync::atomic::AtomicBool>,
+        cancel: CancellationToken,
     ) -> Result<CompletionResponse> {
         let target_model = req
             .model
@@ -424,8 +425,14 @@ impl ModelProvider for LocalOllamaProvider {
         req: &CompletionRequest,
         request_id: &str,
         sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
-        cancel: Arc<std::sync::atomic::AtomicBool>,
+        cancel: CancellationToken,
     ) -> Result<CompletionResponse> {
+        if cancel.is_cancelled() {
+            return Err(AetherError::ModelProvider(
+                "Request cancelled by user".into(),
+            ));
+        }
+
         let client = reqwest::Client::new();
         let model_name = req
             .model
@@ -442,12 +449,19 @@ impl ModelProvider for LocalOllamaProvider {
 
         let start = std::time::Instant::now();
         let url = format!("{}/api/generate", self.endpoint);
-        let resp = client.post(&url).json(&payload).send().await.map_err(|e| {
-            AetherError::ModelProvider(format!(
-                "Failed to connect to local Ollama daemon at {}. Is Ollama running? Error: {}",
-                self.endpoint, e
-            ))
-        })?;
+        let resp = tokio::select! {
+            _ = cancel.cancelled() => {
+                return Err(AetherError::ModelProvider("Request cancelled by user".into()));
+            }
+            res = client.post(&url).json(&payload).send() => {
+                res.map_err(|e| {
+                    AetherError::ModelProvider(format!(
+                        "Failed to connect to local Ollama daemon at {}. Is Ollama running? Error: {}",
+                        self.endpoint, e
+                    ))
+                })?
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -464,12 +478,16 @@ impl ModelProvider for LocalOllamaProvider {
         let mut buffer = String::new();
 
         use futures::StreamExt;
-        while let Some(chunk_res) = stream.next().await {
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(AetherError::ModelProvider(
-                    "Request cancelled by user".into(),
-                ));
-            }
+        loop {
+            let chunk_res = tokio::select! {
+                _ = cancel.cancelled() => {
+                    return Err(AetherError::ModelProvider("Request cancelled by user".into()));
+                }
+                item = stream.next() => match item {
+                    Some(res) => res,
+                    None => break,
+                }
+            };
 
             let bytes = chunk_res.map_err(|e| AetherError::ModelProvider(e.to_string()))?;
             buffer.push_str(&String::from_utf8_lossy(&bytes));
@@ -704,7 +722,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
         req: &CompletionRequest,
         request_id: &str,
         sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
-        cancel: Arc<std::sync::atomic::AtomicBool>,
+        cancel: CancellationToken,
     ) -> Result<CompletionResponse> {
         let api_key = match self.api_key_env_var {
             Some(env_var) => {
@@ -752,9 +770,9 @@ async fn stream_openai_compatible(
     default_model: &str,
     request_id: &str,
     sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
-    cancel: Arc<std::sync::atomic::AtomicBool>,
+    cancel: CancellationToken,
 ) -> Result<CompletionResponse> {
-    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+    if cancel.is_cancelled() {
         return Err(AetherError::ModelProvider(
             "Request cancelled by user".into(),
         ));
@@ -794,9 +812,16 @@ async fn stream_openai_compatible(
     }
 
     let start = std::time::Instant::now();
-    let resp = request.send().await.map_err(|e| {
-        AetherError::ModelProvider(format!("Failed to connect to {}: {}", endpoint, e))
-    })?;
+    let resp = tokio::select! {
+        _ = cancel.cancelled() => {
+            return Err(AetherError::ModelProvider("Request cancelled by user".into()));
+        }
+        res = request.send() => {
+            res.map_err(|e| {
+                AetherError::ModelProvider(format!("Failed to connect to {}: {}", endpoint, e))
+            })?
+        }
+    };
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -813,12 +838,16 @@ async fn stream_openai_compatible(
     let mut buffer = String::new();
 
     use futures::StreamExt;
-    while let Some(chunk_res) = stream.next().await {
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(AetherError::ModelProvider(
-                "Request cancelled by user".into(),
-            ));
-        }
+    loop {
+        let chunk_res = tokio::select! {
+            _ = cancel.cancelled() => {
+                return Err(AetherError::ModelProvider("Request cancelled by user".into()));
+            }
+            item = stream.next() => match item {
+                Some(res) => res,
+                None => break,
+            }
+        };
 
         let bytes = chunk_res.map_err(|e| AetherError::ModelProvider(e.to_string()))?;
         buffer.push_str(&String::from_utf8_lossy(&bytes));
@@ -875,9 +904,9 @@ async fn stream_anthropic(
     req: &CompletionRequest,
     request_id: &str,
     sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
-    cancel: Arc<std::sync::atomic::AtomicBool>,
+    cancel: CancellationToken,
 ) -> Result<CompletionResponse> {
-    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+    if cancel.is_cancelled() {
         return Err(AetherError::ModelProvider(
             "Request cancelled by user".into(),
         ));
@@ -914,16 +943,21 @@ async fn stream_anthropic(
     let client = reqwest::Client::new();
     let url = format!("{}/messages", endpoint.trim_end_matches('/'));
     let start = std::time::Instant::now();
-    let resp = client
-        .post(&url)
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", "2023-06-01")
-        .json(&serde_json::Value::Object(payload_map))
-        .send()
-        .await
-        .map_err(|e| {
-            AetherError::ModelProvider(format!("Failed to connect to Anthropic API: {}", e))
-        })?;
+    let resp = tokio::select! {
+        _ = cancel.cancelled() => {
+            return Err(AetherError::ModelProvider("Request cancelled by user".into()));
+        }
+        res = client
+            .post(&url)
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&serde_json::Value::Object(payload_map))
+            .send() => {
+                res.map_err(|e| {
+                    AetherError::ModelProvider(format!("Failed to connect to Anthropic API: {}", e))
+                })?
+        }
+    };
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -940,12 +974,16 @@ async fn stream_anthropic(
     let mut buffer = String::new();
 
     use futures::StreamExt;
-    while let Some(chunk_res) = stream.next().await {
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(AetherError::ModelProvider(
-                "Request cancelled by user".into(),
-            ));
-        }
+    loop {
+        let chunk_res = tokio::select! {
+            _ = cancel.cancelled() => {
+                return Err(AetherError::ModelProvider("Request cancelled by user".into()));
+            }
+            item = stream.next() => match item {
+                Some(res) => res,
+                None => break,
+            }
+        };
 
         let bytes = chunk_res.map_err(|e| AetherError::ModelProvider(e.to_string()))?;
         buffer.push_str(&String::from_utf8_lossy(&bytes));
@@ -1000,9 +1038,9 @@ async fn stream_gemini(
     req: &CompletionRequest,
     request_id: &str,
     sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
-    cancel: Arc<std::sync::atomic::AtomicBool>,
+    cancel: CancellationToken,
 ) -> Result<CompletionResponse> {
-    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+    if cancel.is_cancelled() {
         return Err(AetherError::ModelProvider(
             "Request cancelled by user".into(),
         ));
@@ -1055,14 +1093,19 @@ async fn stream_gemini(
 
     let client = reqwest::Client::new();
     let start = std::time::Instant::now();
-    let resp = client
-        .post(&url)
-        .json(&serde_json::Value::Object(payload_map))
-        .send()
-        .await
-        .map_err(|e| {
-            AetherError::ModelProvider(format!("Failed to connect to Google Gemini API: {}", e))
-        })?;
+    let resp = tokio::select! {
+        _ = cancel.cancelled() => {
+            return Err(AetherError::ModelProvider("Request cancelled by user".into()));
+        }
+        res = client
+            .post(&url)
+            .json(&serde_json::Value::Object(payload_map))
+            .send() => {
+                res.map_err(|e| {
+                    AetherError::ModelProvider(format!("Failed to connect to Google Gemini API: {}", e))
+                })?
+        }
+    };
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -1079,12 +1122,16 @@ async fn stream_gemini(
     let mut buffer = String::new();
 
     use futures::StreamExt;
-    while let Some(chunk_res) = stream.next().await {
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(AetherError::ModelProvider(
-                "Request cancelled by user".into(),
-            ));
-        }
+    loop {
+        let chunk_res = tokio::select! {
+            _ = cancel.cancelled() => {
+                return Err(AetherError::ModelProvider("Request cancelled by user".into()));
+            }
+            item = stream.next() => match item {
+                Some(res) => res,
+                None => break,
+            }
+        };
 
         let bytes = chunk_res.map_err(|e| AetherError::ModelProvider(e.to_string()))?;
         buffer.push_str(&String::from_utf8_lossy(&bytes));
@@ -1287,7 +1334,7 @@ impl ModelProvider for AnthropicProvider {
         req: &CompletionRequest,
         request_id: &str,
         sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
-        cancel: Arc<std::sync::atomic::AtomicBool>,
+        cancel: CancellationToken,
     ) -> Result<CompletionResponse> {
         stream_anthropic(&self.endpoint, req, request_id, sender, cancel).await
     }
@@ -1462,7 +1509,7 @@ impl ModelProvider for GoogleGeminiProvider {
         req: &CompletionRequest,
         request_id: &str,
         sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
-        cancel: Arc<std::sync::atomic::AtomicBool>,
+        cancel: CancellationToken,
     ) -> Result<CompletionResponse> {
         stream_gemini(&self.endpoint, req, request_id, sender, cancel).await
     }
@@ -1608,7 +1655,7 @@ impl ModelProvider for DeepSeekProvider {
         req: &CompletionRequest,
         request_id: &str,
         sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
-        cancel: Arc<std::sync::atomic::AtomicBool>,
+        cancel: CancellationToken,
     ) -> Result<CompletionResponse> {
         let api_key = std::env::var("DEEPSEEK_API_KEY").unwrap_or_default();
         if api_key.trim().is_empty() {
@@ -1770,7 +1817,7 @@ impl ModelProvider for XAIGrokProvider {
         req: &CompletionRequest,
         request_id: &str,
         sender: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
-        cancel: Arc<std::sync::atomic::AtomicBool>,
+        cancel: CancellationToken,
     ) -> Result<CompletionResponse> {
         let api_key = std::env::var("XAI_API_KEY").unwrap_or_default();
         if api_key.trim().is_empty() {
@@ -1928,7 +1975,7 @@ mod tests {
     async fn test_fake_streaming_eliminated_unsupported_provider_fails_closed() {
         let provider = NonStreamingProvider;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = CancellationToken::new();
 
         let req = CompletionRequest {
             prompt: "test".into(),
@@ -1956,7 +2003,8 @@ mod tests {
             None,
         );
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true)); // Pre-cancelled!
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // Pre-cancelled!
 
         let req = CompletionRequest {
             prompt: "test".into(),
@@ -1975,6 +2023,116 @@ mod tests {
             err.contains("Request cancelled by user"),
             "Cancelled request must fail immediately: {}",
             err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ai_006_cancellation_while_http_response_is_stalled() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Spawn mock server that sends HTTP 200 chunked headers but stalls indefinitely without streaming body chunks
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                let _ = socket.write_all(header.as_bytes()).await;
+                // Stall indefinitely
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        });
+
+        let provider =
+            OpenAiCompatibleProvider::new("test-openai", &format!("http://{}", addr), None);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        // Cancel after 50ms while response reading is stalled
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel_clone.cancel();
+        });
+
+        let req = CompletionRequest {
+            prompt: "test".into(),
+            system: None,
+            model: None,
+            temperature: None,
+            max_tokens: None,
+        };
+
+        let start = std::time::Instant::now();
+        let res = provider
+            .stream_completion(&req, "req-stall", tx, cancel)
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(res.is_err(), "Stalled stream must be cancelled");
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("Request cancelled by user"),
+            "Expected cancellation error, got: {}",
+            err
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "Cancellation must abort stalled read immediately, took {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ai_007_cancellation_during_connection_establishment() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Mock server accepts TCP socket but stalls before sending any HTTP response headers
+        tokio::spawn(async move {
+            if let Ok((mut _socket, _)) = listener.accept().await {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        });
+
+        let provider =
+            OpenAiCompatibleProvider::new("test-openai", &format!("http://{}", addr), None);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        // Trigger cancellation during connect
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel_clone.cancel();
+        });
+
+        let req = CompletionRequest {
+            prompt: "test".into(),
+            system: None,
+            model: None,
+            temperature: None,
+            max_tokens: None,
+        };
+
+        let start = std::time::Instant::now();
+        let res = provider
+            .stream_completion(&req, "req-connect-stall", tx, cancel)
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(res.is_err(), "Connecting request must be cancelled");
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("Request cancelled by user"),
+            "Expected cancellation error, got: {}",
+            err
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "Cancellation must abort connection immediately, took {:?}",
+            elapsed
         );
     }
 }

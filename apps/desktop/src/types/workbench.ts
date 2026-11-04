@@ -252,6 +252,7 @@ export interface WorkspaceCheckpoint {
 }
 
 export interface CheckpointRestorePreview {
+  preview_token: string;
   checkpoint_id: string;
   files_to_create: string[];
   files_to_overwrite: string[];

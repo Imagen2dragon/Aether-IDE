@@ -65,13 +65,14 @@ pub async fn checkpoint_restore_preview(
     let root = ws
         .primary_root()
         .ok_or_else(|| "No active workspace root open to preview restore".to_string())?;
+    let ws_id = ws.workspace_id();
     drop(ws);
 
     let engine_arc = app.state::<SharedCheckpointEngine>();
     let engine = engine_arc.lock();
 
     engine
-        .restore_preview(&checkpoint_id, &root)
+        .restore_preview_bound(&checkpoint_id, &ws_id, &root)
         .map_err(|e| format!("Failed to preview restore: {}", e))
 }
 
@@ -79,6 +80,7 @@ pub async fn checkpoint_restore_preview(
 pub async fn checkpoint_restore(
     app: AppHandle,
     checkpoint_id: String,
+    preview_token: String,
     force: Option<bool>,
     approved_conflicts: Option<Vec<String>>,
 ) -> Result<CheckpointRestoreReport, String> {
@@ -93,26 +95,37 @@ pub async fn checkpoint_restore(
     let engine_arc = app.state::<SharedCheckpointEngine>();
     let engine = engine_arc.lock();
 
-    // 1. Create pre-restore safety snapshot before destructive restore
-    let _ = engine.create_checkpoint_with_root(
-        &format!("Pre-restore safety backup for {}", checkpoint_id),
-        &ws_id,
-        &root,
-        None,
+    // 1. Atomically validate and consume the preview token generated during preview review
+    let session = engine
+        .consume_preview_token(&preview_token, &checkpoint_id, &ws_id, &root)
+        .map_err(|e| format!("Preview token validation failed: {}", e))?;
+
+    // 2. Mandatory safety snapshot: MUST SUCCEED or abort restore completely (CHK-013)
+    let backup_ckpt = engine
+        .create_checkpoint_with_root(
+            &format!("Pre-restore safety backup for {}", checkpoint_id),
+            &ws_id,
+            &root,
+            None,
+        )
+        .map_err(|e| {
+            format!(
+                "Mandatory pre-restore safety backup failed: {}. Restoration aborted to protect existing workspace.",
+                e
+            )
+        })?;
+    tracing::info!(
+        "Mandatory safety snapshot created prior to restore: {}",
+        backup_ckpt.checkpoint_id
     );
 
-    // 2. Perform preview to evaluate conflicts
-    let preview = engine
-        .restore_preview(&checkpoint_id, &root)
-        .map_err(|e| format!("Failed to preview restore: {}", e))?;
-
     let allow_overwrite = if force.unwrap_or(false) {
-        preview.conflicts.clone()
+        session.preview.conflicts.clone()
     } else {
         approved_conflicts.unwrap_or_default()
     };
 
     engine
-        .restore_checkpoint_with_token(&checkpoint_id, &root, &preview, &allow_overwrite)
+        .restore_checkpoint_with_token(&checkpoint_id, &root, &session.preview, &allow_overwrite)
         .map_err(|e| format!("Failed to restore checkpoint: {}", e))
 }

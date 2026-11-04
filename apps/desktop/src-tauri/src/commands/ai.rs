@@ -8,13 +8,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 pub type SharedGateway = Arc<ModelGateway>;
-pub type ActiveAiStreams = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
+pub type ActiveAiStreams = Arc<Mutex<HashMap<String, CancellationToken>>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StructuredProposal {
@@ -111,7 +111,7 @@ pub async fn ai_stream_prompt(
 
     let gw = app.state::<SharedGateway>().inner().clone();
     let streams_arc = app.state::<ActiveAiStreams>();
-    let cancel_token = Arc::new(AtomicBool::new(false));
+    let cancel_token = CancellationToken::new();
 
     {
         let mut streams = streams_arc.lock();
@@ -222,7 +222,7 @@ pub async fn ai_cancel_stream(app: AppHandle, request_id: String) -> Result<bool
     let streams_arc = app.state::<ActiveAiStreams>();
     let mut streams = streams_arc.lock();
     if let Some(token) = streams.remove(&request_id) {
-        token.store(true, Ordering::Relaxed);
+        token.cancel();
         let _ = app.emit("ai-stream-cancelled", json!({ "request_id": &request_id }));
         info!("Cancelled active AI streaming request: {}", request_id);
         Ok(true)

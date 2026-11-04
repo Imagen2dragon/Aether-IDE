@@ -479,6 +479,7 @@ dependencies = [
  "chrono",
  "database-engine",
  "filesystem-engine",
+ "parking_lot",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1533,6 +1534,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

@@ -305,8 +305,18 @@ export class TauriService {
     return invoke("checkpoint_restore_preview", { checkpointId });
   }
 
-  static async restoreCheckpoint(checkpointId: string): Promise<CheckpointRestoreReport> {
-    return invoke("checkpoint_restore", { checkpointId });
+  static async restoreCheckpoint(
+    checkpointId: string,
+    previewToken: string,
+    force = false,
+    approvedConflicts?: string[]
+  ): Promise<CheckpointRestoreReport> {
+    return invoke("checkpoint_restore", {
+      checkpointId,
+      previewToken,
+      force,
+      approvedConflicts,
+    });
   }
 
   // --- Git Engine ---

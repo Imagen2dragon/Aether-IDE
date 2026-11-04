@@ -1,9 +1,12 @@
 use application_core::{AetherError, Result};
 use filesystem_engine::{sanitize_relative_path, FilesystemEngine, WorkspaceCapability};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +29,14 @@ pub struct WorkspaceCheckpoint {
     pub file_hashes: HashMap<String, String>, // relative_path -> sha256
 }
 
+/// Explicit representation of disk file state captured during preview inspection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileDiskState {
+    Present { sha256: String, size_bytes: u64 },
+    Missing,
+    Inaccessible { reason: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointRestorePreview {
     pub checkpoint_id: String,
@@ -36,7 +47,20 @@ pub struct CheckpointRestorePreview {
     pub missing_blobs: Vec<String>,
     pub integrity_valid: bool,
     #[serde(default)]
+    pub file_states: HashMap<String, FileDiskState>,
+    #[serde(default)]
     pub disk_hashes: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActivePreviewSession {
+    pub preview_token: String,
+    pub checkpoint_id: String,
+    pub workspace_id: String,
+    pub canonical_root: PathBuf,
+    pub preview: CheckpointRestorePreview,
+    pub created_at: Instant,
+    pub expires_at: Instant,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,13 +74,17 @@ pub struct CheckpointRestoreReport {
 
 pub struct CheckpointEngine {
     storage_dir: PathBuf,
+    active_previews: Arc<Mutex<HashMap<String, ActivePreviewSession>>>,
 }
 
 impl CheckpointEngine {
     pub fn new<P: AsRef<Path>>(storage_dir: P) -> Self {
         let p = storage_dir.as_ref().to_path_buf();
         let _ = std::fs::create_dir_all(&p);
-        Self { storage_dir: p }
+        Self {
+            storage_dir: p,
+            active_previews: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Recursively collects source files from a workspace directory, ignoring generated caches.
@@ -241,12 +269,14 @@ impl CheckpointEngine {
         Ok(list)
     }
 
-    /// Generates a restore preview without modifying disk state.
-    pub fn restore_preview(
+    /// Generates a bound restore preview, recording exact file states and storing an active preview session.
+    pub fn restore_preview_bound(
         &self,
         checkpoint_id: &str,
+        workspace_id: &str,
         root_dir: &Path,
     ) -> Result<CheckpointRestorePreview> {
+        let canonical_root = root_dir.canonicalize().map_err(AetherError::Io)?;
         let snapshot_dir = self.storage_dir.join(checkpoint_id);
         let meta_path = snapshot_dir.join("metadata.json");
         if !meta_path.is_file() {
@@ -265,6 +295,7 @@ impl CheckpointEngine {
         let mut conflicts = Vec::new();
         let mut missing_blobs = Vec::new();
         let mut disk_hashes = HashMap::new();
+        let mut file_states = HashMap::new();
 
         for record in &ckpt.files {
             // Verify relative path security
@@ -282,36 +313,154 @@ impl CheckpointEngine {
                 continue;
             }
 
-            let dest_path = root_dir.join(&record.relative_path);
-            if dest_path.exists() {
-                if let Ok(current_bytes) = std::fs::read(&dest_path) {
-                    let current_hash = Self::sha256_digest(&current_bytes);
-                    disk_hashes.insert(record.relative_path.clone(), current_hash.clone());
-                    if current_hash != record.sha256 {
-                        files_to_overwrite.push(record.relative_path.clone());
-                        conflicts.push(record.relative_path.clone());
+            let dest_path = canonical_root.join(&record.relative_path);
+
+            let state = match std::fs::symlink_metadata(&dest_path) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        FileDiskState::Inaccessible {
+                            reason: "Destination is a symbolic link".into(),
+                        }
+                    } else if !meta.is_file() {
+                        FileDiskState::Inaccessible {
+                            reason: "Destination is a directory or non-file object".into(),
+                        }
+                    } else {
+                        match std::fs::read(&dest_path) {
+                            Ok(bytes) => {
+                                let hash = Self::sha256_digest(&bytes);
+                                disk_hashes.insert(record.relative_path.clone(), hash.clone());
+                                if hash != record.sha256 {
+                                    files_to_overwrite.push(record.relative_path.clone());
+                                    conflicts.push(record.relative_path.clone());
+                                }
+                                FileDiskState::Present {
+                                    sha256: hash,
+                                    size_bytes: bytes.len() as u64,
+                                }
+                            }
+                            Err(e) => FileDiskState::Inaccessible {
+                                reason: format!("Failed to read file: {}", e),
+                            },
+                        }
                     }
-                } else {
-                    files_to_overwrite.push(record.relative_path.clone());
                 }
-            } else {
-                files_to_create.push(record.relative_path.clone());
-            }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    files_to_create.push(record.relative_path.clone());
+                    FileDiskState::Missing
+                }
+                Err(e) => FileDiskState::Inaccessible {
+                    reason: format!("File inspection error: {}", e),
+                },
+            };
+
+            file_states.insert(record.relative_path.clone(), state);
         }
 
         let integrity_valid = missing_blobs.is_empty();
-        let preview_token = format!("prev-{}", uuid::Uuid::new_v4().simple());
 
-        Ok(CheckpointRestorePreview {
+        let token_uuid = uuid::Uuid::new_v4();
+        let rand_bytes = token_uuid.as_bytes();
+        let preview_token = format!(
+            "prev-{}-{}",
+            token_uuid.simple(),
+            &Self::sha256_digest(rand_bytes)[..16]
+        );
+
+        let preview = CheckpointRestorePreview {
             checkpoint_id: checkpoint_id.to_string(),
-            preview_token,
+            preview_token: preview_token.clone(),
             files_to_create,
             files_to_overwrite,
             conflicts,
             missing_blobs,
             integrity_valid,
+            file_states,
             disk_hashes,
-        })
+        };
+
+        let now = Instant::now();
+        let expires_at = now + Duration::from_secs(600); // 10 minutes
+
+        let session = ActivePreviewSession {
+            preview_token: preview_token.clone(),
+            checkpoint_id: checkpoint_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            canonical_root,
+            preview: preview.clone(),
+            created_at: now,
+            expires_at,
+        };
+
+        {
+            let mut previews = self.active_previews.lock();
+            previews.retain(|_, s| s.expires_at > now);
+            previews.insert(preview_token, session);
+        }
+
+        Ok(preview)
+    }
+
+    /// Legacy restore preview method without explicit workspace binding.
+    pub fn restore_preview(
+        &self,
+        checkpoint_id: &str,
+        root_dir: &Path,
+    ) -> Result<CheckpointRestorePreview> {
+        let canon = root_dir
+            .canonicalize()
+            .unwrap_or_else(|_| root_dir.to_path_buf());
+        self.restore_preview_bound(checkpoint_id, "ws-default", &canon)
+    }
+
+    /// Validates and consumes an active preview token atomically.
+    pub fn consume_preview_token(
+        &self,
+        token: &str,
+        checkpoint_id: &str,
+        workspace_id: &str,
+        root_dir: &Path,
+    ) -> Result<ActivePreviewSession> {
+        let canonical_root = root_dir.canonicalize().map_err(AetherError::Io)?;
+        let now = Instant::now();
+
+        let mut previews = self.active_previews.lock();
+        let session = previews.remove(token).ok_or_else(|| {
+            AetherError::PermissionDenied(format!(
+                "Invalid or already consumed preview token '{}'",
+                token
+            ))
+        })?;
+
+        if session.expires_at <= now {
+            return Err(AetherError::PermissionDenied(format!(
+                "Preview token '{}' has expired",
+                token
+            )));
+        }
+
+        if session.checkpoint_id != checkpoint_id {
+            return Err(AetherError::PermissionDenied(format!(
+                "Preview token checkpoint mismatch: expected '{}', got '{}'",
+                session.checkpoint_id, checkpoint_id
+            )));
+        }
+
+        if session.workspace_id != workspace_id {
+            return Err(AetherError::PermissionDenied(format!(
+                "Preview token workspace mismatch: expected '{}', got '{}'",
+                session.workspace_id, workspace_id
+            )));
+        }
+
+        if session.canonical_root != canonical_root {
+            return Err(AetherError::PermissionDenied(format!(
+                "Preview token root directory mismatch: expected {:?}, got {:?}",
+                session.canonical_root, canonical_root
+            )));
+        }
+
+        Ok(session)
     }
 
     /// Legacy compatibility restore method.
@@ -381,17 +530,57 @@ impl CheckpointEngine {
         }
 
         // 2. Protect against restore races: revalidate current file states against preview snapshot
-        for (rel_path, expected_hash) in &preview.disk_hashes {
+        for (rel_path, recorded_state) in &preview.file_states {
             let dest_path = root_dir.join(rel_path);
-            if dest_path.exists() {
-                if let Ok(current_bytes) = std::fs::read(&dest_path) {
-                    let current_hash = Self::sha256_digest(&current_bytes);
-                    if &current_hash != expected_hash {
+            let current_meta = std::fs::symlink_metadata(&dest_path);
+
+            match recorded_state {
+                FileDiskState::Present {
+                    sha256: expected_hash,
+                    ..
+                } => match current_meta {
+                    Ok(meta) => {
+                        if meta.file_type().is_symlink() || !meta.is_file() {
+                            return Err(AetherError::PermissionDenied(format!(
+                                    "Restore race detected: file '{}' is no longer a regular file or was replaced with another object. Restore aborted to protect modifications.",
+                                    rel_path
+                                )));
+                        }
+                        let current_bytes = std::fs::read(&dest_path).map_err(AetherError::Io)?;
+                        let current_hash = Self::sha256_digest(&current_bytes);
+                        if &current_hash != expected_hash {
+                            return Err(AetherError::PermissionDenied(format!(
+                                    "Restore race detected: file '{}' was modified on disk after preview was generated (Expected: {}, Current: {}). Restore aborted to protect modifications.",
+                                    rel_path, expected_hash, current_hash
+                                )));
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         return Err(AetherError::PermissionDenied(format!(
-                            "Restore race detected: file '{}' was modified on disk after preview was generated (Expected: {}, Current: {}). Restore aborted to protect modifications.",
-                            rel_path, expected_hash, current_hash
+                                "Restore race detected: file '{}' was deleted after preview was generated. Restore aborted to protect modifications.",
+                                rel_path
+                            )));
+                    }
+                    Err(e) => {
+                        return Err(AetherError::PermissionDenied(format!(
+                                "Restore race detected: file '{}' became inaccessible: {}. Restore aborted.",
+                                rel_path, e
+                            )));
+                    }
+                },
+                FileDiskState::Missing => {
+                    if dest_path.exists() || current_meta.is_ok() {
+                        return Err(AetherError::PermissionDenied(format!(
+                            "Restore race detected: target file '{}' was newly created on disk after preview was generated. Restore aborted to protect modifications.",
+                            rel_path
                         )));
                     }
+                }
+                FileDiskState::Inaccessible { reason } => {
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Restore race detected: file '{}' was inaccessible during preview generation ({}). Restore aborted.",
+                        rel_path, reason
+                    )));
                 }
             }
         }
@@ -718,6 +907,205 @@ mod tests {
         let err_str = format!("{:?}", res.err().unwrap());
         assert!(
             err_str.contains("Malicious relative path") || err_str.contains("PermissionDenied")
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_008_and_009_preview_token_validation_and_replay_rejection() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_chk_tokens_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let file = workspace_dir.join("token_test.txt");
+        std::fs::write(&file, "initial").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("Token test", "ws-token-1", &workspace_dir, None)
+            .unwrap();
+
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-token-1", &workspace_dir)
+            .unwrap();
+        assert!(!preview.preview_token.is_empty());
+
+        // CHK-008: Invalid token rejected
+        let invalid_res = engine.consume_preview_token(
+            "prev-invalid-fake-token",
+            &ckpt.checkpoint_id,
+            "ws-token-1",
+            &workspace_dir,
+        );
+        assert!(invalid_res.is_err(), "Invalid token must be rejected");
+        assert!(invalid_res
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Invalid or already consumed preview token"));
+
+        // Valid token consumption succeeds
+        let consumed = engine.consume_preview_token(
+            &preview.preview_token,
+            &ckpt.checkpoint_id,
+            "ws-token-1",
+            &workspace_dir,
+        );
+        assert!(consumed.is_ok(), "First consumption of token must succeed");
+
+        // CHK-009: Token replay rejected (cannot use token twice)
+        let replay_res = engine.consume_preview_token(
+            &preview.preview_token,
+            &ckpt.checkpoint_id,
+            "ws-token-1",
+            &workspace_dir,
+        );
+        assert!(replay_res.is_err(), "Replayed token must be rejected");
+        assert!(replay_res
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Invalid or already consumed preview token"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_010_expired_preview_token_rejected() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_chk_expire_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let file = workspace_dir.join("expire.txt");
+        std::fs::write(&file, "test").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("Expire test", "ws-exp", &workspace_dir, None)
+            .unwrap();
+
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-exp", &workspace_dir)
+            .unwrap();
+
+        // Artificially expire the token in the session store
+        {
+            let mut previews = engine.active_previews.lock();
+            if let Some(session) = previews.get_mut(&preview.preview_token) {
+                session.expires_at = Instant::now() - Duration::from_secs(1);
+            }
+        }
+
+        // CHK-010: Expired token rejected
+        let exp_res = engine.consume_preview_token(
+            &preview.preview_token,
+            &ckpt.checkpoint_id,
+            "ws-exp",
+            &workspace_dir,
+        );
+        assert!(exp_res.is_err(), "Expired preview token must be rejected");
+        assert!(exp_res.err().unwrap().to_string().contains("has expired"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_011_deleted_file_race_detection() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_del_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let file = workspace_dir.join("to_be_deleted.txt");
+        std::fs::write(&file, "present at checkpoint").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("Del test", "ws-del", &workspace_dir, None)
+            .unwrap();
+
+        // Preview generated while file is Present
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-del", &workspace_dir)
+            .unwrap();
+
+        // CHK-011: File is deleted on disk after preview was generated!
+        std::fs::remove_file(&file).unwrap();
+
+        let res = engine.restore_checkpoint_with_token(
+            &ckpt.checkpoint_id,
+            &workspace_dir,
+            &preview,
+            &[],
+        );
+
+        assert!(
+            res.is_err(),
+            "Deleted file race must be detected and aborted"
+        );
+        let err_msg = res.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("deleted after preview was generated"),
+            "Error must identify deleted-file race: {}",
+            err_msg
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_012_newly_created_target_file_race_detection() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_new_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let target_file = workspace_dir.join("new_file.txt");
+        std::fs::write(&target_file, "content in checkpoint").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("New file test", "ws-new", &workspace_dir, None)
+            .unwrap();
+
+        // Delete target file so that at preview time it is Missing on disk
+        std::fs::remove_file(&target_file).unwrap();
+
+        // Preview generated: file state is Missing
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-new", &workspace_dir)
+            .unwrap();
+
+        // CHK-012: Concurrent developer creates file on disk after preview!
+        std::fs::write(&target_file, "concurrent new content").unwrap();
+
+        let res = engine.restore_checkpoint_with_token(
+            &ckpt.checkpoint_id,
+            &workspace_dir,
+            &preview,
+            &[],
+        );
+
+        assert!(
+            res.is_err(),
+            "Newly created file race must be detected and aborted"
+        );
+        let err_msg = res.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("newly created on disk after preview was generated"),
+            "Error must identify newly created file race: {}",
+            err_msg
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
