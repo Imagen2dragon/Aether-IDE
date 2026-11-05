@@ -267,6 +267,7 @@ export interface CheckpointRestoreReport {
   restored_files: string[];
   errors: string[];
   success: boolean;
+  backup_checkpoint_id?: string;
 }
 
 // Git Engine

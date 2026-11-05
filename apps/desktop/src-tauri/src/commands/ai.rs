@@ -115,6 +115,12 @@ pub async fn ai_stream_prompt(
 
     {
         let mut streams = streams_arc.lock();
+        if streams.contains_key(&req_id) {
+            return Err(format!(
+                "An active AI streaming request with ID '{}' is already in progress. Duplicate request IDs are prohibited to prevent stream hijacking.",
+                req_id
+            ));
+        }
         streams.insert(req_id.clone(), cancel_token.clone());
     }
 

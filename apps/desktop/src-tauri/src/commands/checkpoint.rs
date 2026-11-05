@@ -95,37 +95,17 @@ pub async fn checkpoint_restore(
     let engine_arc = app.state::<SharedCheckpointEngine>();
     let engine = engine_arc.lock();
 
-    // 1. Atomically validate and consume the preview token generated during preview review
-    let session = engine
-        .consume_preview_token(&preview_token, &checkpoint_id, &ws_id, &root)
-        .map_err(|e| format!("Preview token validation failed: {}", e))?;
-
-    // 2. Mandatory safety snapshot: MUST SUCCEED or abort restore completely (CHK-013)
-    let backup_ckpt = engine
-        .create_checkpoint_with_root(
-            &format!("Pre-restore safety backup for {}", checkpoint_id),
-            &ws_id,
-            &root,
-            None,
-        )
-        .map_err(|e| {
-            format!(
-                "Mandatory pre-restore safety backup failed: {}. Restoration aborted to protect existing workspace.",
-                e
-            )
-        })?;
-    tracing::info!(
-        "Mandatory safety snapshot created prior to restore: {}",
-        backup_ckpt.checkpoint_id
-    );
-
-    let allow_overwrite = if force.unwrap_or(false) {
-        session.preview.conflicts.clone()
-    } else {
-        approved_conflicts.unwrap_or_default()
-    };
+    let allow_overwrite = approved_conflicts.unwrap_or_default();
+    let force_flag = force.unwrap_or(false);
 
     engine
-        .restore_checkpoint_with_token(&checkpoint_id, &root, &session.preview, &allow_overwrite)
+        .restore_checkpoint_with_token(
+            &checkpoint_id,
+            &ws_id,
+            &root,
+            &preview_token,
+            force_flag,
+            &allow_overwrite,
+        )
         .map_err(|e| format!("Failed to restore checkpoint: {}", e))
 }

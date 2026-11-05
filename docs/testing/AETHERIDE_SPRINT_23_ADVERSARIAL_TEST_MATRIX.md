@@ -25,6 +25,7 @@ This matrix establishes the comprehensive test results and security validations 
 | **BLD-007** | Build Security | Default working directory (`working_dir = None`) enforces trust & boundary | `apps/desktop/src-tauri/src/commands/build.rs` | `test_bld_007_untrusted_default_workspace_execution_denied` | **PASS** |
 | **BLD-008** | Build Security | Executable suffix spoofing (`evilcargo`, `maliciousnpm`) rejected | `apps/desktop/src-tauri/src/commands/build.rs` | `test_bld_008_executable_suffix_spoofing_rejected` | **PASS** |
 | **BLD-009** | Build Security | Gradle wrapper trust policy and shell metacharacter injection safety | `apps/desktop/src-tauri/src/commands/build.rs` | `test_bld_009_windows_command_wrapper_safety` | **PASS** |
+| **BLD-010** | Build Security | Windows process argument escaping integration proves `&`, `|`, `>`, `<`, `%TEMP%` delivered literally without shell interpretation | `apps/desktop/src-tauri/src/commands/build.rs` | `test_bld_010_windows_process_argument_escaping_integration` | **PASS** |
 | **CHK-001** | Checkpoints | Byte-perfect raw binary and invalid UTF-8 file storage and restoration | `checkpoint-engine/src/lib.rs` | `test_checkpoint_binary_and_invalid_utf8_byte_preservation` | **PASS** |
 | **CHK-002** | Checkpoints | One-use preview token validation prevents unauthorized restores | `checkpoint-engine/src/lib.rs` | `test_checkpoint_create_and_restore` | **PASS** |
 | **CHK-003** | Checkpoints | Default fail-closed abort on unresolved conflicts (`PermissionDenied`) | `checkpoint-engine/src/lib.rs` | `test_checkpoint_create_and_restore` | **PASS** |
@@ -38,6 +39,14 @@ This matrix establishes the comprehensive test results and security validations 
 | **CHK-011** | Checkpoints | Deleted file race condition detected and restore safely aborted | `checkpoint-engine/src/lib.rs` | `test_chk_011_deleted_file_race_detection` | **PASS** |
 | **CHK-012** | Checkpoints | Newly created destination file race condition detected and restore safely aborted | `checkpoint-engine/src/lib.rs` | `test_chk_012_newly_created_target_file_race_detection` | **PASS** |
 | **CHK-013** | Checkpoints | Mandatory pre-restore safety snapshot failure aborts restore leaving workspace untouched | `apps/desktop/src-tauri/src/commands/checkpoint.rs` | Verified fail-closed invariant in `checkpoint_restore` | **PASS** |
+| **CHK-014** | Checkpoints | TOCTOU modification during restore window immediately aborted | `checkpoint-engine/src/lib.rs` | `test_chk_014_toctou_modification_during_restore_aborted` | **PASS** |
+| **CHK-015** | Checkpoints | TOCTOU deletion during restore window immediately aborted | `checkpoint-engine/src/lib.rs` | `test_chk_015_toctou_deletion_during_restore_aborted` | **PASS** |
+| **CHK-016** | Checkpoints | TOCTOU new file creation during restore window immediately aborted | `checkpoint-engine/src/lib.rs` | `test_chk_016_toctou_new_file_creation_aborted` | **PASS** |
+| **CHK-017** | Checkpoints | TOCTOU symlink or directory replacement during restore window immediately aborted | `checkpoint-engine/src/lib.rs` | `test_chk_017_toctou_symlink_or_directory_replacement_aborted` | **PASS** |
+| **CHK-018** | Checkpoints | Inaccessible recorded file state at preview rejects restore fail-closed | `checkpoint-engine/src/lib.rs` | `test_chk_019_missing_state_rejects_inaccessible_and_non_notfound` | **PASS** |
+| **CHK-019** | Checkpoints | Missing-state handling strictly checks NotFound and rejects Inaccessible/existing objects | `checkpoint-engine/src/lib.rs` | `test_chk_019_missing_state_rejects_inaccessible_and_non_notfound` | **PASS** |
+| **CHK-020** | Checkpoints | Preview token binding mismatches rejected; concurrent race allows exactly 1 consumer | `checkpoint-engine/src/lib.rs` | `test_chk_020_token_binding_mismatches_and_concurrency` | **PASS** |
+| **CHK-021** | Checkpoints | Simulated backup failure halts restore with zero mutations, retries cleanly with fresh preview | `checkpoint-engine/src/lib.rs` | `test_chk_021_mandatory_safety_snapshot_failure_aborts_without_mutations` | **PASS** |
 | **AI-001** | AI Streaming | Fake streaming fallback eliminated; unsupported providers fail closed | `model-gateway/src/lib.rs` | `test_fake_streaming_eliminated_unsupported_provider_fails_closed` | **PASS** |
 | **AI-002** | AI Streaming | Cancellation token halts stream immediately and drops HTTP connection | `model-gateway/src/lib.rs` | `test_cancellation_aborts_stream_immediately` | **PASS** |
 | **AI-003** | AI Streaming | Genuine SSE streaming implemented for OpenAI-compatible providers | `model-gateway/src/lib.rs` | `stream_openai_compatible` | **PASS** |
@@ -45,6 +54,11 @@ This matrix establishes the comprehensive test results and security validations 
 | **AI-005** | AI Streaming | Genuine SSE streaming implemented for Google Gemini (`candidates/.../text`) | `model-gateway/src/lib.rs` | `stream_gemini` | **PASS** |
 | **AI-006** | AI Streaming | Cancellation token aborts stalled HTTP response read via `tokio::select!` | `model-gateway/src/lib.rs` | `test_ai_006_cancellation_while_http_response_is_stalled` | **PASS** |
 | **AI-007** | AI Streaming | Cancellation token aborts stalled connection establishment via `tokio::select!` | `model-gateway/src/lib.rs` | `test_ai_007_cancellation_during_connection_establishment` | **PASS** |
+| **AI-008** | AI Streaming | Duplicate request IDs rejected in desktop stream map, preventing stream hijacking | `apps/desktop/src-tauri/src/commands/ai.rs` | `commands::ai::ai_stream_prompt` | **PASS** |
+| **AI-009** | AI Streaming | Cancellation during error response body read interrupts stalled HTTP connection | `model-gateway/src/lib.rs` | `test_ai_009_cancellation_during_error_response_body_read` | **PASS** |
+| **AI-010** | AI Streaming | Anthropic provider error body read cancellation interruption | `model-gateway/src/lib.rs` | `test_ai_010_provider_cancellation_anthropic` | **PASS** |
+| **AI-011** | AI Streaming | Gemini provider error body read cancellation interruption | `model-gateway/src/lib.rs` | `test_ai_011_provider_cancellation_gemini` | **PASS** |
+| **AI-012** | AI Streaming | Ollama provider error body read cancellation interruption | `model-gateway/src/lib.rs` | `test_ai_012_provider_cancellation_ollama` | **PASS** |
 | **E2E-001** | Product E2E | End-to-end product lifecycle in disposable git repository | `aether-daemon/tests/e2e_full_product_test.rs` | `test_e2e_full_product_lifecycle_disposable_project` | **PASS** |
 | **E2E-002** | Multi-Agent | Swarm DAG scheduling, cycle rejection, and three-way merge resolution | `agent-orchestrator/tests/swarm_execution_test.rs` | `test_multi_agent_dag_scheduling_and_lifecycle` | **PASS** |
 | **E2E-003** | Release Packaging | Tauri 2 desktop app compiles and builds production release installer | `apps/desktop` | `npm run tauri build` | **PASS** |

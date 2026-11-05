@@ -94,16 +94,22 @@ To prevent a malicious repository from dropping a trojaned `npm.cmd` or `cargo.e
 ### 5.1 Raw Byte Preservation
 Checkpoints record raw binary bytes. Lossy conversions (`String::from_utf8_lossy`) are strictly eliminated. Binary files, compiled assets, images, and non-UTF-8 text files are preserved with exact byte integrity and verified via SHA-256 content hashes.
 
-### 5.2 Conflict Detection & One-Use Preview Tokens
-- Prior to restoring a checkpoint, `checkpoint_restore_preview` scans the workspace, calculates current disk hashes, and generates a cryptographically random, one-use `preview_token`.
+### 5.2 Conflict Detection & Cryptographic Single-Use Preview Tokens
+- Prior to restoring a checkpoint, `restore_preview_bound` scans the workspace, calculates current disk hashes, and generates a cryptographically random, single-use `preview_token` formatted as `prev-<uuid4>-<sha256>`. The token is generated via system CSPRNG (`uuid::Uuid::new_v4()`) and is strictly bound to `(token, checkpoint_id, workspace_id, canonical_root)`.
 - If any file was modified on disk since the checkpoint snapshot, a conflict is flagged.
-- By default, restoration aborts on unresolved conflicts (`PermissionDenied`) unless the user explicitly authorizes them via `force: true` or `approved_conflicts`.
+- By default, restoration aborts on unresolved conflicts (`PermissionDenied`) unless the user explicitly authorizes them via `force: true` or `explicit_overwrite_conflicts`.
+- Legacy un-tokenized restoration methods (`restore_checkpoint` and `restore_checkpoint_into`) are deprecated and strictly reject all invocations with `PermissionDenied`, eliminating any bypass of preview token validation.
 
-### 5.3 Post-Preview Race Detection
-During restoration, the engine re-hashes disk files and compares them against `preview.disk_hashes`. If a file was modified concurrently between preview generation and restore execution, the restore aborts immediately, preventing accidental loss of concurrent developer edits.
+### 5.3 Immediate Per-File TOCTOU Race Condition Defense
+To completely close the Time-of-Check to Time-of-Use (TOCTOU) race condition window between preview generation and restoration:
+1. **In-Memory Blob Preflight:** All checkpoint blobs are pre-verified and loaded into memory before touching disk, preventing partial restoration due to mid-flight blob corruption or missing files.
+2. **Immediate Per-File Revalidation:** Immediately before overwriting or creating each file, `CheckpointEngine::verify_file_disk_state` inspects the destination path with `symlink_metadata`:
+   - Distinguishes `ErrorKind::NotFound` from `ErrorKind::PermissionDenied` and other I/O errors fail-closed.
+   - Rejects the restoration if the file was modified, deleted, newly created, or replaced with a symlink or directory after preview generation.
+3. **Atomic Writes & Post-Write Verification:** Writes use `cap.write_file_bytes_atomic` and immediately verify that the on-disk SHA-256 digest matches the checkpoint manifest.
 
-### 5.4 Pre-Restore Safety Snapshots
-Before applying any file modifications during restore, Tauri command `checkpoint_restore` automatically creates an internal safety checkpoint snapshot of the current workspace state.
+### 5.4 Mandatory Pre-Restore Safety Snapshots
+Before applying any file modifications during restore, `CheckpointEngine::restore_checkpoint_with_token` automatically creates a mandatory safety checkpoint snapshot of the current workspace state. If snapshot generation fails, restoration immediately aborts fail-closed, leaving all workspace files completely untouched.
 
 ---
 
@@ -115,6 +121,10 @@ The default trait method on `ModelProvider` fails closed (`Streaming is not supp
 
 ### 6.2 Connection Abort on Cancellation
 When a user clicks "Stop" or cancels an active stream (`ai_cancel_stream`):
-- The atomic cancellation token (`AtomicBool`) is flagged.
+- The atomic cancellation token (`CancellationToken`) is flagged.
 - The active streaming loop terminates immediately.
+- Stalled HTTP error body reads (`resp.text()`) and connection establishments are bound to cancellation via `tokio::select!`, preventing un-cancellable blocking on unresponsive upstreams.
 - The underlying `reqwest` HTTP response byte stream is dropped, terminating the TCP/TLS connection to the provider and saving user API tokens.
+
+### 6.3 Stream Identifier Uniqueness
+In desktop `ai_stream_prompt`, incoming `request_id` values are checked against active streams. Duplicate request IDs are rejected fail-closed, preventing stream hijacking or premature cancellation token deletion.

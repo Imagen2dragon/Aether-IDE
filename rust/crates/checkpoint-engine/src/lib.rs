@@ -70,11 +70,14 @@ pub struct CheckpointRestoreReport {
     pub restored_files: Vec<String>,
     pub errors: Vec<String>,
     pub success: bool,
+    #[serde(default)]
+    pub backup_checkpoint_id: Option<String>,
 }
 
 pub struct CheckpointEngine {
     storage_dir: PathBuf,
     active_previews: Arc<Mutex<HashMap<String, ActivePreviewSession>>>,
+    simulate_backup_failure: std::sync::atomic::AtomicBool,
 }
 
 impl CheckpointEngine {
@@ -84,7 +87,14 @@ impl CheckpointEngine {
         Self {
             storage_dir: p,
             active_previews: Arc::new(Mutex::new(HashMap::new())),
+            simulate_backup_failure: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn set_simulate_backup_failure(&self, simulate: bool) {
+        self.simulate_backup_failure
+            .store(simulate, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Recursively collects source files from a workspace directory, ignoring generated caches.
@@ -425,7 +435,7 @@ impl CheckpointEngine {
         let now = Instant::now();
 
         let mut previews = self.active_previews.lock();
-        let session = previews.remove(token).ok_or_else(|| {
+        let session = previews.get(token).ok_or_else(|| {
             AetherError::PermissionDenied(format!(
                 "Invalid or already consumed preview token '{}'",
                 token
@@ -433,6 +443,7 @@ impl CheckpointEngine {
         })?;
 
         if session.expires_at <= now {
+            previews.remove(token);
             return Err(AetherError::PermissionDenied(format!(
                 "Preview token '{}' has expired",
                 token
@@ -460,66 +471,184 @@ impl CheckpointEngine {
             )));
         }
 
+        let session = previews.remove(token).expect("Token must exist");
         Ok(session)
     }
 
-    /// Legacy compatibility restore method.
-    pub fn restore_checkpoint(&self, checkpoint: &WorkspaceCheckpoint) -> Result<()> {
-        let root = checkpoint
-            .roots
-            .first()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let report = self.restore_checkpoint_into(&checkpoint.checkpoint_id, &root, true)?;
-        if !report.success {
-            return Err(AetherError::Internal(format!(
-                "Restore failed: {:?}",
-                report.errors
-            )));
-        }
-        Ok(())
+    /// Deprecated: Direct restoration without preview token and safety backup is disabled for security.
+    #[deprecated(
+        since = "0.1.0-beta.2",
+        note = "Direct restoration without preview token is disabled. Use restore_preview_bound and restore_checkpoint_with_token."
+    )]
+    pub fn restore_checkpoint(&self, _checkpoint: &WorkspaceCheckpoint) -> Result<()> {
+        Err(AetherError::PermissionDenied(
+            "Security Denial: Direct restore_checkpoint without preview token and mandatory safety backup is disabled. Every restoration must use restore_preview_bound and restore_checkpoint_with_token."
+                .to_string(),
+        ))
     }
 
-    /// Restores a snapshot into target root directory with atomic file writes and hash validation.
+    /// Deprecated: Direct restoration without preview token and safety backup is disabled for security.
+    #[deprecated(
+        since = "0.1.0-beta.2",
+        note = "Direct restoration without preview token is disabled. Use restore_preview_bound and restore_checkpoint_with_token."
+    )]
     pub fn restore_checkpoint_into(
         &self,
-        checkpoint_id: &str,
-        root_dir: &Path,
-        force: bool,
+        _checkpoint_id: &str,
+        _root_dir: &Path,
+        _force: bool,
     ) -> Result<CheckpointRestoreReport> {
-        let preview = self.restore_preview(checkpoint_id, root_dir)?;
-        let overwrite_list: Vec<String> = if force {
-            preview.conflicts.clone()
-        } else {
-            Vec::new()
-        };
-        self.restore_checkpoint_with_token(checkpoint_id, root_dir, &preview, &overwrite_list)
+        Err(AetherError::PermissionDenied(
+            "Security Denial: Direct restore_checkpoint_into without preview token and mandatory safety backup is disabled. Every restoration must use restore_preview_bound and restore_checkpoint_with_token."
+                .to_string(),
+        ))
     }
 
-    /// Restores a snapshot into target root directory with explicit conflict decisions,
-    /// race condition protection against post-preview modifications, byte-level atomic writes,
+    /// Verifies the recorded disk state against the current filesystem object immediately before write.
+    /// Distinguishes NotFound from PermissionDenied and other I/O errors fail-closed.
+    pub fn verify_file_disk_state(
+        dest_path: &Path,
+        rel_path: &str,
+        recorded_state: &FileDiskState,
+    ) -> Result<()> {
+        let current_meta = std::fs::symlink_metadata(dest_path);
+
+        match recorded_state {
+            FileDiskState::Present {
+                sha256: expected_hash,
+                ..
+            } => match current_meta {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return Err(AetherError::PermissionDenied(format!(
+                            "Restore race detected: file '{}' was replaced with a symbolic link. Restore aborted.",
+                            rel_path
+                        )));
+                    }
+                    if !meta.is_file() {
+                        return Err(AetherError::PermissionDenied(format!(
+                            "Restore race detected: file '{}' is no longer a regular file. Restore aborted.",
+                            rel_path
+                        )));
+                    }
+                    let current_bytes = std::fs::read(dest_path).map_err(|e| {
+                        AetherError::PermissionDenied(format!(
+                            "Restore race detected: file '{}' could not be read ({}). Restore aborted.",
+                            rel_path, e
+                        ))
+                    })?;
+                    let current_hash = Self::sha256_digest(&current_bytes);
+                    if &current_hash != expected_hash {
+                        return Err(AetherError::PermissionDenied(format!(
+                            "Restore race detected: file '{}' was modified on disk after preview was generated (Expected: {}, Current: {}). Restore aborted.",
+                            rel_path, expected_hash, current_hash
+                        )));
+                    }
+                    Ok(())
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(AetherError::PermissionDenied(format!(
+                        "Restore race detected: file '{}' was deleted after preview was generated. Restore aborted.",
+                        rel_path
+                    )))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    Err(AetherError::PermissionDenied(format!(
+                        "Restore race detected: file '{}' became inaccessible due to permission denied. Restore aborted.",
+                        rel_path
+                    )))
+                }
+                Err(e) => {
+                    Err(AetherError::PermissionDenied(format!(
+                        "Restore race detected: filesystem error inspecting '{}': {}. Restore aborted.",
+                        rel_path, e
+                    )))
+                }
+            },
+            FileDiskState::Missing => match current_meta {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        Err(AetherError::PermissionDenied(format!(
+                            "Restore race detected: target file '{}' was newly created as a symbolic link after preview. Restore aborted.",
+                            rel_path
+                        )))
+                    } else if !meta.is_file() {
+                        Err(AetherError::PermissionDenied(format!(
+                            "Restore race detected: target file '{}' was newly created as a directory or non-file object after preview. Restore aborted.",
+                            rel_path
+                        )))
+                    } else {
+                        Err(AetherError::PermissionDenied(format!(
+                            "Restore race detected: target file '{}' was newly created on disk after preview was generated. Restore aborted to protect modifications.",
+                            rel_path
+                        )))
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    Err(AetherError::PermissionDenied(format!(
+                        "Restore race detected: target file '{}' is inaccessible due to permission denied. Restore aborted.",
+                        rel_path
+                    )))
+                }
+                Err(e) => {
+                    Err(AetherError::PermissionDenied(format!(
+                        "Restore race detected: filesystem error inspecting target file '{}': {}. Restore aborted.",
+                        rel_path, e
+                    )))
+                }
+            },
+            FileDiskState::Inaccessible { reason } => {
+                Err(AetherError::PermissionDenied(format!(
+                    "Restore race detected: file '{}' was inaccessible during preview generation ({}). Restore aborted.",
+                    rel_path, reason
+                )))
+            }
+        }
+    }
+
+    /// Restores a snapshot into target root directory with centralized preview token consumption,
+    /// mandatory pre-restore safety snapshot creation, explicit conflict decisions,
+    /// immediate per-file TOCTOU race condition protection, byte-level atomic writes,
     /// and post-restore cryptographic integrity verification.
     pub fn restore_checkpoint_with_token(
         &self,
         checkpoint_id: &str,
+        workspace_id: &str,
         root_dir: &Path,
-        preview: &CheckpointRestorePreview,
+        preview_token: &str,
+        force: bool,
         explicit_overwrite_conflicts: &[String],
     ) -> Result<CheckpointRestoreReport> {
-        if !preview.integrity_valid {
+        let canonical_root = root_dir.canonicalize().map_err(AetherError::Io)?;
+
+        // 1. Atomically validate and consume the preview token (single-use, binds id/workspace/root)
+        let session = self.consume_preview_token(
+            preview_token,
+            checkpoint_id,
+            workspace_id,
+            &canonical_root,
+        )?;
+
+        if !session.preview.integrity_valid {
             return Err(AetherError::Internal(format!(
                 "Checkpoint integrity check failed: missing blobs {:?}",
-                preview.missing_blobs
+                session.preview.missing_blobs
             )));
         }
 
-        // 1. Enforce default fail-closed policy: Abort on unresolved conflicts
-        let unapproved_conflicts: Vec<_> = preview
-            .conflicts
-            .iter()
-            .filter(|c| !explicit_overwrite_conflicts.contains(c))
-            .cloned()
-            .collect();
+        // 2. Enforce conflict authorization: reject unapproved conflicts fail-closed
+        let unapproved_conflicts: Vec<_> = if force {
+            Vec::new()
+        } else {
+            session
+                .preview
+                .conflicts
+                .iter()
+                .filter(|c| !explicit_overwrite_conflicts.contains(c))
+                .cloned()
+                .collect()
+        };
 
         if !unapproved_conflicts.is_empty() {
             return Err(AetherError::PermissionDenied(format!(
@@ -529,149 +658,110 @@ impl CheckpointEngine {
             )));
         }
 
-        // 2. Protect against restore races: revalidate current file states against preview snapshot
-        for (rel_path, recorded_state) in &preview.file_states {
-            let dest_path = root_dir.join(rel_path);
-            let current_meta = std::fs::symlink_metadata(&dest_path);
-
-            match recorded_state {
-                FileDiskState::Present {
-                    sha256: expected_hash,
-                    ..
-                } => match current_meta {
-                    Ok(meta) => {
-                        if meta.file_type().is_symlink() || !meta.is_file() {
-                            return Err(AetherError::PermissionDenied(format!(
-                                    "Restore race detected: file '{}' is no longer a regular file or was replaced with another object. Restore aborted to protect modifications.",
-                                    rel_path
-                                )));
-                        }
-                        let current_bytes = std::fs::read(&dest_path).map_err(AetherError::Io)?;
-                        let current_hash = Self::sha256_digest(&current_bytes);
-                        if &current_hash != expected_hash {
-                            return Err(AetherError::PermissionDenied(format!(
-                                    "Restore race detected: file '{}' was modified on disk after preview was generated (Expected: {}, Current: {}). Restore aborted to protect modifications.",
-                                    rel_path, expected_hash, current_hash
-                                )));
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(AetherError::PermissionDenied(format!(
-                                "Restore race detected: file '{}' was deleted after preview was generated. Restore aborted to protect modifications.",
-                                rel_path
-                            )));
-                    }
-                    Err(e) => {
-                        return Err(AetherError::PermissionDenied(format!(
-                                "Restore race detected: file '{}' became inaccessible: {}. Restore aborted.",
-                                rel_path, e
-                            )));
-                    }
-                },
-                FileDiskState::Missing => {
-                    if dest_path.exists() || current_meta.is_ok() {
-                        return Err(AetherError::PermissionDenied(format!(
-                            "Restore race detected: target file '{}' was newly created on disk after preview was generated. Restore aborted to protect modifications.",
-                            rel_path
-                        )));
-                    }
-                }
-                FileDiskState::Inaccessible { reason } => {
-                    return Err(AetherError::PermissionDenied(format!(
-                        "Restore race detected: file '{}' was inaccessible during preview generation ({}). Restore aborted.",
-                        rel_path, reason
-                    )));
-                }
-            }
+        // 3. Mandatory pre-restore safety snapshot (CHK-013)
+        // Must succeed or abort restoration immediately, leaving existing workspace untouched.
+        if self
+            .simulate_backup_failure
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(AetherError::Internal(format!(
+                "Mandatory pre-restore safety backup failed: Simulated I/O failure for {}. Restoration aborted to protect existing workspace.",
+                checkpoint_id
+            )));
         }
 
+        let backup_ckpt = self
+            .create_checkpoint_with_root(
+                &format!("Pre-restore safety backup for {}", checkpoint_id),
+                workspace_id,
+                &canonical_root,
+                None,
+            )
+            .map_err(|e| {
+                AetherError::Internal(format!(
+                    "Mandatory pre-restore safety backup failed: {}. Restoration aborted to protect existing workspace.",
+                    e
+                ))
+            })?;
+
+        info!(
+            "Mandatory safety snapshot created prior to restore: {}",
+            backup_ckpt.checkpoint_id
+        );
+
+        // 4. Preflight and read ALL checkpoint blobs into memory before touching disk
         let snapshot_dir = self.storage_dir.join(checkpoint_id);
         let meta_path = snapshot_dir.join("metadata.json");
         let meta_content = FilesystemEngine::read_file_string(&meta_path)?;
         let ckpt: WorkspaceCheckpoint = serde_json::from_str(&meta_content)?;
         let blobs_dir = snapshot_dir.join("blobs");
 
-        let cap = WorkspaceCapability::open(root_dir)?;
-        let mut restored_files = Vec::new();
-        let mut errors = Vec::new();
-
+        let mut prepared_records: Vec<(&CheckpointFileRecord, Vec<u8>)> = Vec::new();
         for record in &ckpt.files {
-            // Verify path strictly
-            if let Err(e) = sanitize_relative_path(&record.relative_path) {
-                errors.push(format!(
-                    "Skipping unsafe path '{}': {}",
-                    record.relative_path, e
-                ));
-                continue;
-            }
-
+            sanitize_relative_path(&record.relative_path)?;
             let blob_path = blobs_dir.join(&record.sha256);
-            let blob_bytes = match std::fs::read(&blob_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    errors.push(format!(
-                        "Failed reading blob for '{}': {}",
-                        record.relative_path, e
-                    ));
-                    continue;
-                }
-            };
+            let blob_bytes = std::fs::read(&blob_path).map_err(|e| {
+                AetherError::Internal(format!(
+                    "Failed reading blob for '{}': {}",
+                    record.relative_path, e
+                ))
+            })?;
 
-            // Verify blob hash matches manifest
             let computed_hash = Self::sha256_digest(&blob_bytes);
             if computed_hash != record.sha256 {
-                errors.push(format!(
+                return Err(AetherError::Internal(format!(
                     "Blob corruption detected for '{}'. Expected sha256 {}, got {}",
                     record.relative_path, record.sha256, computed_hash
-                ));
-                continue;
+                )));
             }
-
-            // Byte-perfect restoration: write raw bytes atomically via capability
-            match cap.write_file_bytes_atomic(&record.relative_path, &blob_bytes) {
-                Ok(_) => {
-                    // Cryptographic post-restore verification of file on disk
-                    let dest = root_dir.join(&record.relative_path);
-                    if let Ok(written_bytes) = std::fs::read(&dest) {
-                        let written_hash = Self::sha256_digest(&written_bytes);
-                        if written_hash == record.sha256 {
-                            restored_files.push(record.relative_path.clone());
-                        } else {
-                            errors.push(format!(
-                                "Post-restore hash mismatch for '{}'. Expected {}, found on disk {}",
-                                record.relative_path, record.sha256, written_hash
-                            ));
-                        }
-                    } else {
-                        errors.push(format!(
-                            "Failed to verify restored file '{}' on disk",
-                            record.relative_path
-                        ));
-                    }
-                }
-                Err(e) => {
-                    errors.push(format!(
-                        "Failed restoring '{}': {}",
-                        record.relative_path, e
-                    ));
-                }
-            }
+            prepared_records.push((record, blob_bytes));
         }
 
-        let success = errors.is_empty();
-        info!(
-            "Restored checkpoint '{}': {} succeeded, {} errors",
-            checkpoint_id,
-            restored_files.len(),
-            errors.len()
-        );
+        // 5. Execute file writes with immediate per-file state revalidation to close TOCTOU window
+        let cap = WorkspaceCapability::open(&canonical_root)?;
+        let mut restored_files = Vec::new();
+
+        for (record, blob_bytes) in prepared_records {
+            let dest_path = canonical_root.join(&record.relative_path);
+
+            // Re-validate disk state immediately before writing this specific file
+            let recorded_state = session
+                .preview
+                .file_states
+                .get(&record.relative_path)
+                .ok_or_else(|| {
+                    AetherError::PermissionDenied(format!(
+                        "Restore aborted: unrecorded file state for '{}'",
+                        record.relative_path
+                    ))
+                })?;
+
+            Self::verify_file_disk_state(&dest_path, &record.relative_path, recorded_state)?;
+
+            // Atomic byte-perfect write
+            cap.write_file_bytes_atomic(&record.relative_path, &blob_bytes)?;
+
+            // Immediate post-write verification
+            let dest = canonical_root.join(&record.relative_path);
+            let written_bytes = std::fs::read(&dest).map_err(AetherError::Io)?;
+            let written_hash = Self::sha256_digest(&written_bytes);
+            if written_hash != record.sha256 {
+                return Err(AetherError::Internal(format!(
+                    "Post-restore hash mismatch for '{}'. Expected {}, found on disk {}",
+                    record.relative_path, record.sha256, written_hash
+                )));
+            }
+
+            restored_files.push(record.relative_path.clone());
+        }
 
         Ok(CheckpointRestoreReport {
             checkpoint_id: checkpoint_id.to_string(),
             restored_count: restored_files.len(),
             restored_files,
-            errors,
-            success,
+            errors: Vec::new(),
+            success: true,
+            backup_checkpoint_id: Some(backup_ckpt.checkpoint_id),
         })
     }
 }
@@ -679,6 +769,54 @@ impl CheckpointEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_legacy_restore_checkpoint_strictly_prohibited() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_legacy_prohibit_1_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let engine = CheckpointEngine::new(&storage_dir);
+        let dummy_ckpt = WorkspaceCheckpoint {
+            checkpoint_id: "ckpt-legacy-1".to_string(),
+            workspace_id: "ws-legacy".to_string(),
+            description: "legacy".to_string(),
+            created_at: "2026-11-05T00:00:00Z".to_string(),
+            manifest_version: 1,
+            roots: Vec::new(),
+            files: Vec::new(),
+            file_hashes: HashMap::new(),
+        };
+        #[allow(deprecated)]
+        let res = engine.restore_checkpoint(&dummy_ckpt);
+        assert!(res.is_err());
+        assert!(matches!(
+            res.err().unwrap(),
+            AetherError::PermissionDenied(_)
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_legacy_restore_checkpoint_into_strictly_prohibited() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_legacy_prohibit_2_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let engine = CheckpointEngine::new(&storage_dir);
+        #[allow(deprecated)]
+        let res = engine.restore_checkpoint_into("ckpt-legacy-2", &workspace_dir, true);
+        assert!(res.is_err());
+        assert!(matches!(
+            res.err().unwrap(),
+            AetherError::PermissionDenied(_)
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 
     #[test]
     fn test_checkpoint_create_and_restore() {
@@ -712,7 +850,7 @@ mod tests {
 
         // Preview restore
         let preview = engine
-            .restore_preview(&ckpt.checkpoint_id, &workspace_dir)
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-test", &workspace_dir)
             .expect("Preview failed");
         assert!(preview.integrity_valid);
         assert!(preview.conflicts.is_empty());
@@ -721,26 +859,48 @@ mod tests {
         std::fs::write(&file1, "Modified content").unwrap();
 
         let preview_after = engine
-            .restore_preview(&ckpt.checkpoint_id, &workspace_dir)
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-test", &workspace_dir)
             .expect("Preview failed");
         assert_eq!(preview_after.conflicts.len(), 1);
         assert_eq!(preview_after.conflicts[0], "hello.txt");
 
-        // Restore snapshot with force=false must abort due to conflict
-        let unapproved_res =
-            engine.restore_checkpoint_into(&ckpt.checkpoint_id, &workspace_dir, false);
+        // Restore snapshot with force=false and no explicit overwrite authorization must abort
+        let unapproved_res = engine.restore_checkpoint_with_token(
+            &ckpt.checkpoint_id,
+            "ws-test",
+            &workspace_dir,
+            &preview_after.preview_token,
+            false,
+            &[],
+        );
         assert!(
             unapproved_res.is_err(),
             "Default restore must abort on unresolved conflicts"
         );
 
+        // Re-generate fresh preview token for explicit authorization (since prior token was consumed)
+        let fresh_preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-test", &workspace_dir)
+            .expect("Fresh preview failed");
+
         // Restore snapshot with explicit authorization (force=true)
         let report = engine
-            .restore_checkpoint_into(&ckpt.checkpoint_id, &workspace_dir, true)
+            .restore_checkpoint_with_token(
+                &ckpt.checkpoint_id,
+                "ws-test",
+                &workspace_dir,
+                &fresh_preview.preview_token,
+                true,
+                &[],
+            )
             .expect("Restore with explicit authorization failed");
 
         assert!(report.success);
         assert_eq!(report.restored_count, 2);
+        assert!(
+            report.backup_checkpoint_id.is_some(),
+            "Mandatory safety backup must be created and reported"
+        );
 
         // Verify content restored
         let restored_content = std::fs::read_to_string(&file1).unwrap();
@@ -792,9 +952,20 @@ mod tests {
         std::fs::write(&png_file, b"corrupted png bytes").unwrap();
         std::fs::write(&bin_file, b"corrupted bin bytes").unwrap();
 
-        // Restore with explicit authorization
+        // Restore with preview and token
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-bin", &workspace_dir)
+            .expect("Preview failed");
+
         let report = engine
-            .restore_checkpoint_into(&ckpt.checkpoint_id, &workspace_dir, true)
+            .restore_checkpoint_with_token(
+                &ckpt.checkpoint_id,
+                "ws-bin",
+                &workspace_dir,
+                &preview.preview_token,
+                true,
+                &[],
+            )
             .expect("Restore failed");
 
         assert!(report.success);
@@ -847,7 +1018,7 @@ mod tests {
 
         // Preview is requested
         let preview = engine
-            .restore_preview(&ckpt.checkpoint_id, &workspace_dir)
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-race", &workspace_dir)
             .expect("Preview failed");
         assert_eq!(preview.conflicts.len(), 1);
 
@@ -857,8 +1028,10 @@ mod tests {
         // User attempts to restore with preview token
         let res = engine.restore_checkpoint_with_token(
             &ckpt.checkpoint_id,
+            "ws-race",
             &workspace_dir,
-            &preview,
+            &preview.preview_token,
+            true,
             &["race_target.txt".to_string()],
         );
 
@@ -901,7 +1074,7 @@ mod tests {
         });
         std::fs::write(&meta_path, serde_json::to_string(&tampered_ckpt).unwrap()).unwrap();
 
-        let res = engine.restore_checkpoint_into(&ckpt.checkpoint_id, &workspace_dir, false);
+        let res = engine.restore_preview_bound(&ckpt.checkpoint_id, "ws-sec", &workspace_dir);
         // Must fail with PermissionDenied because of malicious path traversal
         assert!(res.is_err());
         let err_str = format!("{:?}", res.err().unwrap());
@@ -1044,8 +1217,10 @@ mod tests {
 
         let res = engine.restore_checkpoint_with_token(
             &ckpt.checkpoint_id,
+            "ws-del",
             &workspace_dir,
-            &preview,
+            &preview.preview_token,
+            true,
             &[],
         );
 
@@ -1092,8 +1267,10 @@ mod tests {
 
         let res = engine.restore_checkpoint_with_token(
             &ckpt.checkpoint_id,
+            "ws-new",
             &workspace_dir,
-            &preview,
+            &preview.preview_token,
+            true,
             &[],
         );
 
@@ -1107,6 +1284,448 @@ mod tests {
             "Error must identify newly created file race: {}",
             err_msg
         );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_014_toctou_modification_during_restore_aborted() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_014_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let target = workspace_dir.join("toctou_mod.txt");
+        std::fs::write(&target, "initial content").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("TOCTOU mod test", "ws-toctou", &workspace_dir, None)
+            .unwrap();
+
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-toctou", &workspace_dir)
+            .unwrap();
+
+        // Modify file after preview token was generated
+        std::fs::write(&target, "unrecorded modifications").unwrap();
+
+        let res = engine.restore_checkpoint_with_token(
+            &ckpt.checkpoint_id,
+            "ws-toctou",
+            &workspace_dir,
+            &preview.preview_token,
+            true,
+            &[],
+        );
+
+        assert!(
+            res.is_err(),
+            "Modified file must be rejected by TOCTOU check"
+        );
+        let err = res.err().unwrap().to_string();
+        assert!(
+            err.contains("was modified on disk after preview was generated"),
+            "Unexpected error: {}",
+            err
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_015_toctou_deletion_during_restore_aborted() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_015_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let target = workspace_dir.join("toctou_del.txt");
+        std::fs::write(&target, "content to delete").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("TOCTOU del test", "ws-del-toctou", &workspace_dir, None)
+            .unwrap();
+
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-del-toctou", &workspace_dir)
+            .unwrap();
+
+        // Delete file after preview was generated
+        std::fs::remove_file(&target).unwrap();
+
+        let res = engine.restore_checkpoint_with_token(
+            &ckpt.checkpoint_id,
+            "ws-del-toctou",
+            &workspace_dir,
+            &preview.preview_token,
+            true,
+            &[],
+        );
+
+        assert!(
+            res.is_err(),
+            "Deleted file must be rejected by TOCTOU check"
+        );
+        let err = res.err().unwrap().to_string();
+        assert!(
+            err.contains("was deleted after preview was generated"),
+            "Unexpected error: {}",
+            err
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_016_toctou_new_file_creation_aborted() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_016_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let target = workspace_dir.join("toctou_new.txt");
+        std::fs::write(&target, "in snapshot").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("TOCTOU new test", "ws-new-toctou", &workspace_dir, None)
+            .unwrap();
+
+        // Remove it so preview sees FileDiskState::Missing
+        std::fs::remove_file(&target).unwrap();
+
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-new-toctou", &workspace_dir)
+            .unwrap();
+
+        // Recreate it right before restore
+        std::fs::write(&target, "created right before restore").unwrap();
+
+        let res = engine.restore_checkpoint_with_token(
+            &ckpt.checkpoint_id,
+            "ws-new-toctou",
+            &workspace_dir,
+            &preview.preview_token,
+            true,
+            &[],
+        );
+
+        assert!(res.is_err(), "Newly created file must be rejected");
+        let err = res.err().unwrap().to_string();
+        assert!(
+            err.contains("newly created on disk after preview was generated"),
+            "Unexpected error: {}",
+            err
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_017_toctou_symlink_or_directory_replacement_aborted() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_017_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let target = workspace_dir.join("toctou_obj.txt");
+        std::fs::write(&target, "regular file").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("TOCTOU dir test", "ws-dir-toctou", &workspace_dir, None)
+            .unwrap();
+
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-dir-toctou", &workspace_dir)
+            .unwrap();
+
+        // Remove regular file and replace with directory
+        std::fs::remove_file(&target).unwrap();
+        std::fs::create_dir(&target).unwrap();
+
+        let res = engine.restore_checkpoint_with_token(
+            &ckpt.checkpoint_id,
+            "ws-dir-toctou",
+            &workspace_dir,
+            &preview.preview_token,
+            true,
+            &[],
+        );
+
+        assert!(res.is_err(), "Directory replacement must be rejected");
+        let err = res.err().unwrap().to_string();
+        assert!(
+            err.contains("is no longer a regular file")
+                || err.contains("was replaced with a directory"),
+            "Unexpected error: {}",
+            err
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_019_missing_state_rejects_inaccessible_and_non_notfound() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_019_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let existing_file = temp_dir.join("exists.txt");
+        std::fs::write(&existing_file, "i exist").unwrap();
+
+        let existing_dir = temp_dir.join("sub_dir");
+        std::fs::create_dir(&existing_dir).unwrap();
+
+        // 1. Missing state expected, but an actual regular file exists -> must reject
+        let res_file = CheckpointEngine::verify_file_disk_state(
+            &existing_file,
+            "exists.txt",
+            &FileDiskState::Missing,
+        );
+        assert!(res_file.is_err());
+        assert!(res_file
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("newly created on disk"));
+
+        // 2. Missing state expected, but a directory exists -> must reject
+        let res_dir = CheckpointEngine::verify_file_disk_state(
+            &existing_dir,
+            "sub_dir",
+            &FileDiskState::Missing,
+        );
+        assert!(res_dir.is_err());
+        assert!(res_dir
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("directory or non-file object"));
+
+        // 3. Inaccessible state recorded during preview -> must reject immediately fail-closed
+        let res_inaccessible = CheckpointEngine::verify_file_disk_state(
+            &existing_file,
+            "exists.txt",
+            &FileDiskState::Inaccessible {
+                reason: "Destination was a symlink".into(),
+            },
+        );
+        assert!(res_inaccessible.is_err());
+        assert!(res_inaccessible
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("was inaccessible during preview generation"));
+
+        // 4. Truly absent file -> must succeed
+        let non_existent = temp_dir.join("non_existent.txt");
+        let res_ok = CheckpointEngine::verify_file_disk_state(
+            &non_existent,
+            "non_existent.txt",
+            &FileDiskState::Missing,
+        );
+        assert!(res_ok.is_ok());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_020_token_binding_mismatches_and_concurrency() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_020_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        let other_workspace_dir = temp_dir.join("other_workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        std::fs::create_dir_all(&other_workspace_dir).unwrap();
+
+        let file = workspace_dir.join("bound.txt");
+        std::fs::write(&file, "bound content").unwrap();
+
+        let engine = std::sync::Arc::new(CheckpointEngine::new(&storage_dir));
+        let ckpt = engine
+            .create_checkpoint_with_root("Binding test", "ws-correct", &workspace_dir, None)
+            .unwrap();
+
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-correct", &workspace_dir)
+            .unwrap();
+        let token = preview.preview_token.clone();
+
+        // 1. Wrong checkpoint ID rejected
+        let res_wrong_ckpt = engine.consume_preview_token(
+            &token,
+            "wrong-checkpoint-id",
+            "ws-correct",
+            &workspace_dir,
+        );
+        assert!(res_wrong_ckpt.is_err());
+        assert!(res_wrong_ckpt
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("checkpoint mismatch"));
+
+        // 2. Wrong workspace ID rejected
+        let res_wrong_ws = engine.consume_preview_token(
+            &token,
+            &ckpt.checkpoint_id,
+            "wrong-workspace-id",
+            &workspace_dir,
+        );
+        assert!(res_wrong_ws.is_err());
+        assert!(res_wrong_ws
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("workspace mismatch"));
+
+        // 3. Wrong root directory rejected
+        let res_wrong_root = engine.consume_preview_token(
+            &token,
+            &ckpt.checkpoint_id,
+            "ws-correct",
+            &other_workspace_dir,
+        );
+        assert!(res_wrong_root.is_err());
+        assert!(res_wrong_root
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("root directory mismatch"));
+
+        // 4. Concurrent consumption: spawn 10 threads racing to consume the same preview token
+        let mut handles = Vec::new();
+        let success_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let error_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        for _ in 0..10 {
+            let engine_clone = std::sync::Arc::clone(&engine);
+            let token_clone = token.clone();
+            let ckpt_id = ckpt.checkpoint_id.clone();
+            let ws_path = workspace_dir.clone();
+            let succ_clone = std::sync::Arc::clone(&success_count);
+            let err_clone = std::sync::Arc::clone(&error_count);
+
+            handles.push(std::thread::spawn(move || {
+                let res = engine_clone.consume_preview_token(
+                    &token_clone,
+                    &ckpt_id,
+                    "ws-correct",
+                    &ws_path,
+                );
+                if res.is_ok() {
+                    succ_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                } else {
+                    err_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Exactly 1 thread must succeed; all other 9 must be rejected fail-closed
+        assert_eq!(
+            success_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Exactly one concurrent consumer must succeed"
+        );
+        assert_eq!(
+            error_count.load(std::sync::atomic::Ordering::SeqCst),
+            9,
+            "All other concurrent consumers must be rejected"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_021_mandatory_safety_snapshot_failure_aborts_without_mutations() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_021_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let file = workspace_dir.join("app.js");
+        std::fs::write(&file, "console.log('original');").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("Safety abort test", "ws-abort", &workspace_dir, None)
+            .unwrap();
+
+        // Mutate file on disk so restoration would normally overwrite it
+        std::fs::write(&file, "console.log('uncommitted user work');").unwrap();
+
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-abort", &workspace_dir)
+            .unwrap();
+
+        // Enable simulated backup failure hook
+        engine.set_simulate_backup_failure(true);
+
+        // Attempt restore
+        let res = engine.restore_checkpoint_with_token(
+            &ckpt.checkpoint_id,
+            "ws-abort",
+            &workspace_dir,
+            &preview.preview_token,
+            true,
+            &[],
+        );
+
+        // Restoration MUST fail because pre-restore safety backup failed
+        assert!(res.is_err());
+        let err_msg = res.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("Mandatory pre-restore safety backup failed"),
+            "Error must report mandatory backup failure: {}",
+            err_msg
+        );
+
+        // User's uncommitted work MUST be completely untouched!
+        let disk_content = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(
+            disk_content, "console.log('uncommitted user work');",
+            "Target file must not be modified if mandatory safety backup fails"
+        );
+
+        // Disable simulation hook
+        engine.set_simulate_backup_failure(false);
+
+        // Obtain fresh preview (since previous token was consumed)
+        let fresh_preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-abort", &workspace_dir)
+            .unwrap();
+
+        // Now restore succeeds
+        let report = engine
+            .restore_checkpoint_with_token(
+                &ckpt.checkpoint_id,
+                "ws-abort",
+                &workspace_dir,
+                &fresh_preview.preview_token,
+                true,
+                &[],
+            )
+            .expect("Restore must succeed when safety backup succeeds");
+
+        assert!(report.success);
+        assert!(report.backup_checkpoint_id.is_some());
+
+        // File is now restored to original
+        let restored_content = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(restored_content, "console.log('original');");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

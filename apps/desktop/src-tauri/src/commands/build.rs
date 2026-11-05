@@ -740,4 +740,43 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn test_bld_010_windows_process_argument_escaping_integration() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_bld_010_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let cargo_exe = resolve_approved_tool_executable("cargo", &temp_dir, true)
+            .expect("Cargo must resolve in trusted workspace");
+
+        // Construct command with dangerous shell metacharacters (&, |, >, <, %TEMP%)
+        let injection_cmd = r#"cargo --version "test & echo PWNED > injected.txt | type injected.txt < NUL %TEMP%""#;
+        let tokens = parse_command_tokens(injection_cmd);
+        assert_eq!(tokens[0], "cargo");
+        assert_eq!(tokens[1], "--version");
+        assert_eq!(
+            tokens[2],
+            "test & echo PWNED > injected.txt | type injected.txt < NUL %TEMP%"
+        );
+
+        // Execute directly via std::process::Command (mirroring build_run_task direct execution)
+        let output = std::process::Command::new(&cargo_exe)
+            .args(&tokens[1..])
+            .current_dir(&temp_dir)
+            .output();
+
+        // Execution completes (cargo prints version or handles extra arg)
+        assert!(output.is_ok(), "Process execution must not crash");
+
+        // The injected file MUST NOT exist because shell interpretation never occurred!
+        let injected_file = temp_dir.join("injected.txt");
+        assert!(
+            !injected_file.exists(),
+            "Security Failure: Injected file '{:?}' was created! Shell metacharacters escaped into execution.",
+            injected_file
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
