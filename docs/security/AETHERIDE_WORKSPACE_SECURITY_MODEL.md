@@ -73,48 +73,60 @@ Autonomous agents execute with an explicit `AgentExecutionContext` rather than a
 
 ## 4. Build Tool Security & Direct Execution
 
-### 4.1 Elimination of Shell Wrappers
-Build commands are executed directly via `std::process::Command` without wrapping in `cmd.exe /c` or `sh -c`. This neutralizes shell injection attacks (`&`, `|`, `;`, `&&`, `` ` ``, `$()`).
-On Windows, `.cmd` and `.bat` tools (such as `npm.cmd` or `cargo.cmd`) are resolved to their system executable and spawned directly.
+### 4.1 Universal Trust Enforcement (BLD-007)
+Both execution paths (explicit `working_dir` or default `working_dir = None` defaulting to the primary workspace root) execute `validate_build_working_directory`. The directory must be strictly within an authorized workspace root AND that workspace root must be trusted (`r.is_trusted == true`). Process execution in untrusted workspaces is denied unconditionally.
 
-### 4.2 Approved Tool Whitelist
+### 4.2 Elimination of Shell Wrappers & Metacharacter Injection
+Build commands are executed directly via `tokio::process::Command` without wrapping in `cmd.exe /c` or `sh -c`. This neutralizes shell injection attacks (`&`, `|`, `;`, `&&`, `` ` ``, `$()`). Command arguments are tokenized preserving quoted strings and spaces, and passed as typed argv arrays.
+
+### 4.3 Approved Tool Whitelist & Exact Name Resolution (BLD-008)
 AetherIDE restricts execution to explicitly approved build utilities:
-`cargo`, `npm`, `npx`, `yarn`, `pnpm`, `node`, `python`, `pip`, `pytest`, `dotnet`, `go`, `flutter`, `gradle`, `mvn`, `git`.
+`cargo`, `rustc`, `npm`, `npx`, `yarn`, `pnpm`, `bun`, `python`, `python3`, `py`, `pytest`, `gradle`, `gradlew`, `./gradlew`, `make`, `cmake`.
+Tool resolution enforces exact stem matching. Suffix spoofing (`tool_name.ends_with(tool)` attacks such as `evilcargo`, `fakepnpm`, or `maliciousnpm`) is strictly rejected.
 
-### 4.3 Shadow Binary Defense
+### 4.4 Script Extension Safety & Gradle Wrapper Policy (BLD-009)
+- On Windows, `.cmd` and `.bat` extensions are strictly permitted only for script-based tools (`npm`, `npx`, `yarn`, `pnpm`, `gradlew`). Compiled binary tools (`cargo`, `python`, `rustc`) cannot execute batch script files (`cargo.bat` is rejected).
+- Gradle wrapper scripts (`./gradlew`, `gradlew.bat`) are project-local and are permitted to execute only if the workspace root has been verified as trusted (`is_trusted = true`).
+
+### 4.5 Shadow Binary Defense (BLD-002)
 To prevent a malicious repository from dropping a trojaned `npm.cmd` or `cargo.exe` into its project directory to hijack build triggers:
 - The runner inspects the target directory for local binaries shadowing approved tools.
-- Project-local executables matching tool names are rejected with `Security Denial: Project-local executable shadows approved tool`.
+- Project-local executables matching tool names are rejected with `Security Denial: Project-local binary shadows approved build tool`.
 - Approved tools are resolved exclusively against the system `PATH`.
 
 ---
 
 ## 5. Checkpoint Engine & Byte-Perfect Integrity
 
-### 5.1 Raw Byte Preservation
+### 5.1 Raw Byte Preservation (CHK-001)
 Checkpoints record raw binary bytes. Lossy conversions (`String::from_utf8_lossy`) are strictly eliminated. Binary files, compiled assets, images, and non-UTF-8 text files are preserved with exact byte integrity and verified via SHA-256 content hashes.
 
-### 5.2 Conflict Detection & One-Use Preview Tokens
-- Prior to restoring a checkpoint, `checkpoint_restore_preview` scans the workspace, calculates current disk hashes, and generates a cryptographically random, one-use `preview_token`.
-- If any file was modified on disk since the checkpoint snapshot, a conflict is flagged.
-- By default, restoration aborts on unresolved conflicts (`PermissionDenied`) unless the user explicitly authorizes them via `force: true` or `approved_conflicts`.
+### 5.2 Conflict Detection & Cryptographic Preview Sessions (CHK-008, CHK-009, CHK-010)
+- Prior to restoring a checkpoint, `checkpoint_restore_preview` scans the workspace, calculates current disk states, and generates a cryptographically random `preview_token` (using OS CSPRNG).
+- The preview session is cryptographically bound to the `checkpoint_id`, `workspace_id`, and canonical root, with a strict 10-minute expiration window.
+- The token is atomically consumed on restore; replay attempts are rejected immediately (`CHK-009`).
+- By default, restoration aborts on unresolved conflicts (`PermissionDenied`) unless the user explicitly authorizes them via approved conflicts (`CHK-003`, `CHK-004`).
 
-### 5.3 Post-Preview Race Detection
-During restoration, the engine re-hashes disk files and compares them against `preview.disk_hashes`. If a file was modified concurrently between preview generation and restore execution, the restore aborts immediately, preventing accidental loss of concurrent developer edits.
+### 5.3 Explicit Disk State & Full Race Detection (CHK-005, CHK-011, CHK-012)
+The preview records each affected file's disk state as `Present { sha256 }`, `Missing`, or `Inaccessible`. Immediately before applying restore bytes:
+- If an existing file was modified after preview: rejected (`CHK-005`).
+- If an existing file was deleted after preview: rejected (`CHK-011`).
+- If a missing target file was created after preview: rejected (`CHK-012`).
+- If a file became inaccessible: rejected.
 
-### 5.4 Pre-Restore Safety Snapshots
-Before applying any file modifications during restore, Tauri command `checkpoint_restore` automatically creates an internal safety checkpoint snapshot of the current workspace state.
+### 5.4 Mandatory Pre-Restore Safety Snapshots (CHK-013)
+Before applying any file modifications during restore, Tauri command `checkpoint_restore` creates an internal safety checkpoint backup snapshot of the current workspace state. If creating this backup fails, restoration immediately aborts fail-closed, leaving the workspace files untouched.
 
 ---
 
 ## 6. AI Gateway Streaming & Cancellation
 
-### 6.1 Genuine SSE Streaming
+### 6.1 Genuine SSE Streaming (AI-001, AI-003, AI-004, AI-005)
 All official model providers (OpenAI, Anthropic, Google Gemini, DeepSeek, xAI, Local Ollama) implement genuine chunk-by-chunk streaming over Server-Sent Events (SSE) or chunked HTTP.
 The default trait method on `ModelProvider` fails closed (`Streaming is not supported for provider '...'`), eliminating fake single-chunk completion disguises.
 
-### 6.2 Connection Abort on Cancellation
-When a user clicks "Stop" or cancels an active stream (`ai_cancel_stream`):
-- The atomic cancellation token (`AtomicBool`) is flagged.
-- The active streaming loop terminates immediately.
-- The underlying `reqwest` HTTP response byte stream is dropped, terminating the TCP/TLS connection to the provider and saving user API tokens.
+### 6.2 Asynchronous Cancellation via CancellationToken (AI-002, AI-006, AI-007)
+Cancellation utilizes `tokio_util::sync::CancellationToken`:
+- Both HTTP connection requests (`request.send()`) and response chunk reads (`stream.next()`) are wrapped in `tokio::select!` with `cancel.cancelled()`.
+- If user triggers `ai_cancel_stream`, cancellation immediately aborts pending connection handshakes (`AI-007`) and stalled chunk reads (`AI-006`).
+- The underlying `reqwest` HTTP response byte stream is dropped, terminating the TCP/TLS connection to the provider and saving API tokens.

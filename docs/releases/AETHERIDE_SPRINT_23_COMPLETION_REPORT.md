@@ -1,6 +1,8 @@
 # AetherIDE Sprint 23 Engineering Completion Report
 ## Release Candidate Hardening, Agent Security, Checkpoint Integrity & Genuine AI Streaming
 
+> **Post-Merge Remediation Note:** Following the merge of Sprint 23 (PR #16), a dedicated post-merge remediation sprint (**Sprint 23.1**) addressed residual findings in checkpoint tokens, build trust validation, and async AI cancellation. See [Sprint 23.1 Remediation Report](AETHERIDE_SPRINT_23_1_SECURITY_REMEDIATION_REPORT.md) and PR #17.
+
 **Release Version:** v0.1.0-beta.2  
 **Baseline Commit:** `757d965` (merged PR #15)  
 **Branch:** `feat/sprint-23-release-candidate-hardening`  
