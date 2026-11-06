@@ -65,6 +65,9 @@ This matrix establishes the comprehensive test results and security validations 
 | **CHK-037** | Checkpoints | Metadata inspection failure during rollback is not counted as successful deletion | `checkpoint-engine/src/lib.rs` | `test_chk_037_metadata_failure_not_counted_as_successful_deletion` | **PASS** |
 | **CHK-038** | Checkpoints | Preserved backup path is surfaced in restore report and verified to exist on disk | `checkpoint-engine/src/lib.rs` | `test_chk_038_preserved_backup_path_surfaced_in_restore_report` | **PASS** |
 | **CHK-039** | Checkpoints | Recovery report accurately distinguishes complete from partial compensation | `checkpoint-engine/src/lib.rs` | `test_chk_039_recovery_report_accurately_distinguishes_complete_from_partial_compensation` | **PASS** |
+| **CHK-040** | Checkpoints | Open-handle modification after initial hash verification preserves staged recovery artifact | `checkpoint-engine/src/lib.rs` | `test_chk_040_open_handle_mutation_after_hash_preserves_staged_artifact` | **PASS** |
+| **CHK-041** | Checkpoints | Rollback rename never overwrites concurrently recreated destination; preserves both destination and staged conflict | `checkpoint-engine/src/lib.rs` | `test_chk_041_rollback_rename_does_not_overwrite_recreated_destination` | **PASS** |
+| **CHK-042** | Checkpoints | Missing-file compensation exclusive creation prevents overwrite of concurrently recreated destination | `checkpoint-engine/src/lib.rs` | `test_chk_042_missing_file_compensation_exclusive_prevents_overwrite_of_recreated_destination` | **PASS** |
 | **BLD-011** | Build Security | Shared executable launch pipeline (`ApprovedBuildProcess`) executes complex arguments (&, \|, >, <, %TEMP%, spaces, quotes, backslashes) keeping test helper out of production whitelist | `apps/desktop/src-tauri/tests/windows_argument_escaping_integration_test.rs` | `test_windows_process_argument_escaping_integration_test_binary` | **PASS** |
 | **AI-001** | AI Streaming | Fake streaming fallback eliminated; unsupported providers fail closed | `model-gateway/src/lib.rs` | `test_fake_streaming_eliminated_unsupported_provider_fails_closed` | **PASS** |
 | **AI-002** | AI Streaming | Cancellation token halts stream immediately and drops HTTP connection | `model-gateway/src/lib.rs` | `test_cancellation_aborts_stream_immediately` | **PASS** |
@@ -119,6 +122,10 @@ Binary files (e.g. PNG files containing `0x89 0x50 0x4E 0x47` and arbitrary byte
   - Inaccessible files during metadata inspection are never counted as cleanly rolled back or assumed absent.
   - Preserved backup paths are surfaced directly in the restore report (`preserved_backups`) and verified to exist on disk.
   - Recovery reports accurately distinguish complete from partial compensation, explicitly enumerating compensated files, recovery conflicts, and preserved backup artifacts.
+- Open-handle race elimination, no-overwrite rollback rename, and exclusive compensation (`test_chk_040` through `test_chk_042`) proves that:
+  - Staged files modified through open writable handles after initial hash verification are caught by pre-unlink re-verification and preserved as conflict artifacts rather than deleted (`test_chk_040`).
+  - Rollback rename of staged files uses atomic no-overwrite publication; if the original destination was recreated, the staged file is preserved under a unique conflict path without overwriting the recreated destination (`test_chk_041`).
+  - Compensation of missing files uses exclusive creation (`replace_file_bytes_conditional_with_hooks(expected_hash: None)` via `hard_link`), preventing overwrite of destinations created concurrently between inspection and compensation (`test_chk_042`).
 
 ### 3.4 Model Gateway Streaming
 The previous default trait implementation of `ModelProvider::stream_completion` which silently called `complete()` and returned a single fake chunk was eliminated. Tests confirm:
