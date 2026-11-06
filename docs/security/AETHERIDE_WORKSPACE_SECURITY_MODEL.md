@@ -183,7 +183,7 @@ To eliminate irreversible destruction of recoverable user data when external pro
         - Primary mechanism is an atomic filesystem rename.
         - **Fail-Closed Cross-Device Copy Fallback:** A copy fallback is ONLY triggered when the rename fails with an error positively identified as an OS cross-device link error (`EXDEV` on Unix, `ERROR_NOT_SAME_DEVICE` on Windows). All other rename failures (permissions, path issues, sharing violations) fail closed immediately, restore the staged source file back to the workspace, and abort without unlinking.
         - True cross-device copies verify destination bytes and SHA-256 against the staged hash.
-        - **Pre-Unlink Source Re-Verification:** Immediately prior to unlinking the source file after a successful cross-device copy, the engine re-reads the staged source file and re-verifies its SHA-256. If a concurrent process mutated the source via a retained open handle, **THE SOURCE FILE IS NEVER UNLINKED**. Both copies are preserved, the staged file is restored to the workspace, the conflict is committed to the manifest as `QuarantineStatus::PreservedConflict`, and the operation fails closed.
+        - **Pre-Unlink Source Re-Verification & Exclusive Stability Proof:** Immediately prior to unlinking the source file after a successful cross-device copy, the engine re-reads the staged source file, re-verifies its SHA-256 against the expected hash, and verifies exclusive handle stability (using `share_mode(0)` on Windows). If a concurrent process mutated the source via a retained open handle or exclusive stability cannot be verified, **THE SOURCE FILE IS NEVER UNLINKED**. Both copies are preserved: the source file is restored to the workspace, the verified quarantine copy remains in quarantine, both paths are surfaced in error reporting, and the conflict is committed to the manifest as `QuarantineStatus::PreservedConflict`.
      g. Atomically committing `PendingCleanup` state to the recovery manifest.
 3. **Startup Reconciliation & Untracked Artifact Adoption (`initialize_and_reconcile`):**
    - Wired directly into application initialization (Tauri setup hook).
@@ -194,13 +194,21 @@ To eliminate irreversible destruction of recoverable user data when external pro
      * Untracked physical regular files found in `quarantine_dir` are adopted into the manifest as `PendingCleanup` (with reason `DiscoveredUntrackedArtifactOnStartup`) without deletion.
      * Untracked symlinks found in `quarantine_dir` are adopted as `PreservedConflict` (never eligible for cleanup).
      * Directory enumeration errors (`read_dir`) are not swallowed; errors propagate fail-closed.
-4. **Physical Quarantine Directory Boundary & Symlink Defense:**
+   - **Fail-Closed Engine Gating (`RecoveryBlocked`):** If startup reconciliation encounters an error (I/O, boundary violation, or corrupt manifest), the engine enters an explicit `RecoveryBlocked` state (`is_recovery_blocked() == true`). While blocked:
+     * Normal checkpoint creation (`create_checkpoint_with_root`) is strictly rejected.
+     * Checkpoint restore operations (`restore_preview_bound`, `restore_checkpoint_with_token`) are rejected.
+     * Quarantine cleanup operations (`cleanup_quarantine`, `cleanup_all_quarantined`) are rejected.
+     * Quarantine artifact listing (`list_quarantined_artifacts`) fails closed, refusing to report an authoritative or empty manifest until reconciliation succeeds.
+     * Recovery status is exposed to frontend via `checkpoint_get_recovery_status`.
+     * On-demand retry via `checkpoint_reconcile_quarantine` clears the blocked state upon successful completion.
+4. **Physical Quarantine Directory Boundary, Pinned Directory Handles & Symlink Defense:**
    - All quarantine paths are strictly derived from the trusted application storage `quarantine_dir()`.
    - `verify_quarantine_boundary()` validates `storage_dir` and `quarantine_dir` with `symlink_metadata`:
      * Rejects symlinks on all platforms.
      * Rejects `FILE_ATTRIBUTE_REPARSE_POINT` (junctions, mount points) on Windows.
      * Canonicalizes both paths and enforces `canonical_quarantine.parent() == Some(canonical_storage)`.
-   - The boundary check is re-verified immediately before every unlink operation to eliminate TOCTOU directory replacement attacks.
+   - **Pinned Directory Handle Operations (`cap_std::fs::Dir`):** During cleanup (`cleanup_quarantine` and `cleanup_all_quarantined`), operations are performed relative to a pinned directory handle (`Dir::open_ambient_dir(&q_dir, ambient_authority())`) with no-follow semantics. Ambient directory replacement or ancestor symlink swaps cannot redirect deletion outside the opened quarantine directory.
+   - **Pre-Unlink Target Object & Content Revalidation:** Immediately before calling `remove_file` through the pinned directory handle, the target's metadata and SHA-256 digest are re-inspected. If the target has been replaced with a symlink, non-regular file, or modified regular file, deletion is immediately aborted and the record is transitioned to `PreservedConflict`.
    - Path traversal attempts (`..`, absolute paths, drive letters, `/`, `\`, `:`) in quarantine records are rejected fail-closed.
 5. **Backend Authorization on Cleanup Operations:**
    - Physical deletion (`cleanup_quarantine`, `cleanup_all_quarantined`) strictly enforces backend status authorization:
@@ -210,11 +218,19 @@ To eliminate irreversible destruction of recoverable user data when external pro
      * `CleanedUp`: Idempotent `Ok(true)` without touching disk, preventing deletion of recreated artifacts at the same path.
    - Prior to unlinking, the file's content hash is verified against `actual_sha256` / `expected_sha256`. If the file was tampered with or modified while in quarantine, cleanup is blocked, the record transitions to `PreservedConflict`, and the file is preserved.
    - **Immediate Batch Cleanup Halt on Persistence Failure:** In `cleanup_all_quarantined`, progress is saved after each individual file removal. If `save_with_fault` fails, **the batch halts immediately**. No further files are deleted. The returned error reports the exact number of files cleaned and the ID of the record that failed persistence.
-6. **Production Compensating Rollback Integration:**
+6. **Transactional Corrupt-Manifest Handling:**
+   - When `load_recovery_manifest` encounters JSON deserialization failure (indicating file corruption or truncation):
+     * A collision-safe unique backup filename is constructed: `recovery_manifest.json.corrupt.<timestamp>.<uuid>`.
+     * The backup file is opened exclusively using `create_new(true)`, guaranteeing existing recovery backups are never overwritten.
+     * The entire raw corrupt byte stream is written, synced to disk, and verified via read-back SHA-256 digest against the original source bytes.
+     * Any backup creation, write, verification, or persistence failure aborts the operation and **PRESERVES THE ORIGINAL CORRUPT MANIFEST UNMODIFIED**.
+     * A fresh manifest is initialized, tracking the verified corrupt backup as `QuarantineStatus::PreservedConflict`.
+     * Only after the fresh manifest is successfully persisted is the recovery sequence considered complete.
+7. **Production Compensating Rollback Integration:**
    - `handle_compensating_rollback()` automatically applies the durable quarantine mechanism for newly created files during failed restore operations (`defer_to_quarantine: true`).
    - Unmutated newly created files are moved into quarantine, recorded in `recovery_manifest.json`, and surfaced in `CheckpointRestoreReport` under `quarantined_artifacts` with `cleanup_pending: true`.
    - Manifest persistence failures propagate as explicit rollback errors and preserve artifacts in quarantine storage.
-7. **Structured UI Surfacing:**
+8. **Structured UI Surfacing:**
    - Quarantined artifacts, preserved backups, and recovery conflicts are surfaced in the desktop workbench UI with explicit status badges (`PendingCleanup`, `CleanedUp`, `PreservedConflict`), requiring explicit user confirmation before executing any cleanup.
    - Reconcile action in the UI allows triggering on-demand storage reconciliation and displays reconciliation status banners. No automated destructive cleanup is executed in any normal UI workflow.
 

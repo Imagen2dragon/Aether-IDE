@@ -1282,6 +1282,41 @@ impl WorkspaceCapability {
                                 user_path
                             )));
                         }
+
+                        // Pre-unlink hook injection point (simulating writes through retained handles)
+                        if let Some(ref hook) = hooks.pre_unlink_hook {
+                            hook(&stage_abs);
+                        }
+
+                        // Re-verify source stability immediately before unlinking
+                        let pre_unlink_bytes =
+                            self.dir.read(&stage_rel).map_err(AetherError::Io)?;
+                        let mut pre_unlink_hasher = Sha256::new();
+                        pre_unlink_hasher.update(&pre_unlink_bytes);
+                        let pre_unlink_hash = format!("{:x}", pre_unlink_hasher.finalize());
+                        if pre_unlink_hash != expected_hash {
+                            return Err(AetherError::PermissionDenied(format!(
+                                "Concurrent source modification detected via retained handle during cross-device quarantine copy for '{}'. Staged source preserved without deletion.",
+                                user_path
+                            )));
+                        }
+
+                        #[cfg(windows)]
+                        {
+                            use std::os::windows::fs::OpenOptionsExt;
+                            if let Err(err) = std::fs::OpenOptions::new()
+                                .read(true)
+                                .write(true)
+                                .share_mode(0)
+                                .open(&stage_abs)
+                            {
+                                return Err(AetherError::PermissionDenied(format!(
+                                    "Exclusive source stability could not be verified for '{}' (retained handle detected: {}). Staged source preserved without deletion.",
+                                    user_path, err
+                                )));
+                            }
+                        }
+
                         self.dir.remove_file(&stage_rel).map_err(AetherError::Io)?;
                         target
                     }

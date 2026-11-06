@@ -7,6 +7,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RecoveryStatus {
+    pub is_blocked: bool,
+    pub blocked_reason: Option<String>,
+}
+
 pub type SharedCheckpointEngine = Arc<Mutex<CheckpointEngine>>;
 
 #[tauri::command]
@@ -116,6 +122,12 @@ pub async fn checkpoint_list_quarantine(
 ) -> Result<Vec<checkpoint_engine::QuarantineRecord>, String> {
     let engine_arc = app.state::<SharedCheckpointEngine>();
     let engine = engine_arc.lock();
+    if let Some(reason) = engine.recovery_blocked_reason() {
+        return Err(format!(
+            "Quarantine operations blocked due to reconciliation failure: {}",
+            reason
+        ));
+    }
     let manifest = engine
         .load_recovery_manifest()
         .map_err(|e| format!("Failed to load recovery manifest: {}", e))?;
@@ -140,4 +152,14 @@ pub async fn checkpoint_reconcile_quarantine(
     engine
         .reconcile_quarantine()
         .map_err(|e| format!("Failed to reconcile quarantine: {}", e))
+}
+
+#[tauri::command]
+pub async fn checkpoint_get_recovery_status(app: AppHandle) -> Result<RecoveryStatus, String> {
+    let engine_arc = app.state::<SharedCheckpointEngine>();
+    let engine = engine_arc.lock();
+    Ok(RecoveryStatus {
+        is_blocked: engine.is_recovery_blocked(),
+        blocked_reason: engine.recovery_blocked_reason(),
+    })
 }
