@@ -1212,28 +1212,57 @@ impl WorkspaceCapability {
         // 5c. Defer to Quarantine (prefer recoverability over irreversible deletion)
         if hooks.defer_to_quarantine {
             let quarantine_path = if let Some(ref q_dir) = hooks.quarantine_dir {
-                let _ = std::fs::create_dir_all(q_dir);
+                std::fs::create_dir_all(q_dir).map_err(AetherError::Io)?;
+                let file_stem = rel.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+                let safe_stem: String = file_stem
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+                    .collect();
+                let clean_stem = if safe_stem.is_empty() {
+                    "file"
+                } else {
+                    &safe_stem
+                };
                 let q_file_name = format!(
                     "{}.aether-quarantine-{}",
-                    rel.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
+                    clean_stem,
                     uuid::Uuid::new_v4().simple()
                 );
                 let target = q_dir.join(&q_file_name);
                 let stage_abs = self.root_path.join(&stage_rel);
                 match std::fs::rename(&stage_abs, &target) {
                     Ok(()) => target,
-                    Err(_) => match std::fs::copy(&stage_abs, &target) {
-                        Ok(_) => {
-                            let _ = self.dir.remove_file(&stage_rel);
-                            target
+                    Err(_) => {
+                        std::fs::copy(&stage_abs, &target).map_err(AetherError::Io)?;
+                        let copied_bytes = std::fs::read(&target).map_err(AetherError::Io)?;
+                        use sha2::{Digest, Sha256};
+                        let mut hasher = Sha256::new();
+                        hasher.update(&copied_bytes);
+                        let copied_hash = format!("{:x}", hasher.finalize());
+                        if copied_hash != expected_hash {
+                            let _ = std::fs::remove_file(&target);
+                            return Err(AetherError::Internal(format!(
+                                "Quarantine copy hash verification failed for '{}'",
+                                user_path
+                            )));
                         }
-                        Err(_) => self.root_path.join(&stage_rel),
-                    },
+                        self.dir.remove_file(&stage_rel).map_err(AetherError::Io)?;
+                        target
+                    }
                 }
             } else {
+                let safe_user: String = user_path
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+                    .collect();
+                let clean_name = if safe_user.is_empty() {
+                    "file"
+                } else {
+                    &safe_user
+                };
                 let q_name = format!(
                     "{}.aether-quarantine-{}",
-                    user_path,
+                    clean_name,
                     uuid::Uuid::new_v4().simple()
                 );
                 let q_rel = PathBuf::from(q_name);

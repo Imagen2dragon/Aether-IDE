@@ -20,6 +20,7 @@ import type {
   ProjectMemoryNote,
   ProposalReviewPreview,
   ProviderStatus,
+  QuarantineRecord,
   StorageAnalysisReport,
   StorageCleanupReport,
   StructuredProposal,
@@ -317,6 +318,14 @@ export class TauriService {
       force,
       approvedConflicts,
     });
+  }
+
+  static async listQuarantineRecords(): Promise<QuarantineRecord[]> {
+    return invoke("checkpoint_list_quarantine");
+  }
+
+  static async cleanupQuarantineRecord(id: string): Promise<boolean> {
+    return invoke("checkpoint_cleanup_quarantine", { id });
   }
 
   // --- Git Engine ---

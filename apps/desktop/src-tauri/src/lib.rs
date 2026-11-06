@@ -148,6 +148,8 @@ pub fn run() {
             commands::checkpoint_list,
             commands::checkpoint_restore_preview,
             commands::checkpoint_restore,
+            commands::checkpoint_list_quarantine,
+            commands::checkpoint_cleanup_quarantine,
             // Git Engine
             commands::git_get_status,
             commands::git_stage_file,

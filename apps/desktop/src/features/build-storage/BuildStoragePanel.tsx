@@ -14,6 +14,7 @@ import { TauriService } from "../../services/tauri";
 import type {
   BuildExecutionResult,
   DetectedBuildSystem,
+  QuarantineRecord,
   StorageAnalysisReport,
   StorageCleanupReport,
   WorkspaceCheckpoint,
@@ -45,10 +46,16 @@ export const BuildStoragePanel: React.FC<BuildStoragePanelProps> = ({ onBuildLog
   const [isCreatingCkpt, setIsCreatingCkpt] = useState(false);
   const [ckptMsg, setCkptMsg] = useState<string | null>(null);
 
+  // Quarantine & Durable Recovery
+  const [quarantineRecords, setQuarantineRecords] = useState<QuarantineRecord[]>([]);
+  const [isCleaningQuarantine, setIsCleaningQuarantine] = useState<string | null>(null);
+  const [quarantineActionMsg, setQuarantineActionMsg] = useState<{ id: string; success: boolean; msg: string } | null>(null);
+
   useEffect(() => {
     loadBuildSystems();
     loadStorageAnalysis();
     loadCheckpoints();
+    loadQuarantineRecords();
 
     // Listen for build log streaming chunks
     const unlistenPromise = TauriService.onEvent<{ line: string; stream: string }>(
@@ -97,6 +104,57 @@ export const BuildStoragePanel: React.FC<BuildStoragePanelProps> = ({ onBuildLog
       setCheckpoints(list);
     } catch (e) {
       console.error(e);
+    }
+  };
+
+  const loadQuarantineRecords = async () => {
+    try {
+      const records = await TauriService.listQuarantineRecords();
+      setQuarantineRecords(records);
+    } catch (e) {
+      console.error("Failed to load quarantine records", e);
+    }
+  };
+
+  const handleCleanupQuarantine = async (record: QuarantineRecord) => {
+    if (record.status === "PreservedConflict") {
+      alert(
+        `Cannot clean up preserved conflict '${record.quarantined_filename}'. This artifact was modified or has an active conflict. Manual inspection is required to avoid data loss.`
+      );
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Permanently delete quarantined artifact "${record.quarantined_filename}" (${record.original_relative_path})?\n\nThis cannot be undone. Make sure you no longer require this file.`
+    );
+    if (!confirmed) return;
+
+    setIsCleaningQuarantine(record.id);
+    try {
+      const ok = await TauriService.cleanupQuarantineRecord(record.id);
+      if (ok) {
+        setQuarantineActionMsg({
+          id: record.id,
+          success: true,
+          msg: `Successfully cleaned up ${record.quarantined_filename}`,
+        });
+      } else {
+        setQuarantineActionMsg({
+          id: record.id,
+          success: false,
+          msg: `Cleanup failed: artifact was not found or could not be removed`,
+        });
+      }
+      await loadQuarantineRecords();
+    } catch (err: any) {
+      setQuarantineActionMsg({
+        id: record.id,
+        success: false,
+        msg: `Cleanup failed: ${err}`,
+      });
+      await loadQuarantineRecords();
+    } finally {
+      setIsCleaningQuarantine(null);
     }
   };
 
@@ -195,6 +253,7 @@ export const BuildStoragePanel: React.FC<BuildStoragePanelProps> = ({ onBuildLog
         }
         setCkptMsg(warnMsg);
       }
+      await loadQuarantineRecords();
     } catch (err: any) {
       setCkptMsg(`Restore failed: ${err}`);
     }
@@ -610,6 +669,189 @@ export const BuildStoragePanel: React.FC<BuildStoragePanelProps> = ({ onBuildLog
                     </div>
                   </div>
                 ))
+              )}
+            </div>
+
+            {/* Quarantine & Durable Recovery Storage */}
+            <div
+              style={{
+                marginTop: 14,
+                padding: 10,
+                borderRadius: 6,
+                background: "var(--bg-card)",
+                border: "1px solid var(--border-color)",
+                display: "flex",
+                flexDirection: "column",
+                gap: 8,
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div
+                  style={{
+                    fontWeight: 600,
+                    fontSize: 12,
+                    color: "var(--accent-cyan)",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                  }}
+                >
+                  <HardDrive size={13} />
+                  <span>Durable Quarantine & Recovery Storage</span>
+                </div>
+                <button
+                  onClick={loadQuarantineRecords}
+                  style={{
+                    background: "none",
+                    border: "none",
+                    color: "var(--text-muted)",
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 4,
+                    fontSize: 10,
+                  }}
+                  title="Refresh Quarantine Records"
+                >
+                  <RefreshCw size={10} />
+                  <span>Refresh</span>
+                </button>
+              </div>
+
+              {quarantineActionMsg && (
+                <div
+                  style={{
+                    fontSize: 11,
+                    padding: "4px 8px",
+                    borderRadius: 4,
+                    background: quarantineActionMsg.success
+                      ? "rgba(16, 185, 129, 0.15)"
+                      : "rgba(239, 68, 68, 0.15)",
+                    color: quarantineActionMsg.success ? "#10b981" : "#ef4444",
+                    border: `1px solid ${
+                      quarantineActionMsg.success
+                        ? "rgba(16, 185, 129, 0.3)"
+                        : "rgba(239, 68, 68, 0.3)"
+                    }`,
+                  }}
+                >
+                  {quarantineActionMsg.msg}
+                </div>
+              )}
+
+              {quarantineRecords.length === 0 ? (
+                <div style={{ fontSize: 11, color: "var(--text-dim)", textAlign: "center", padding: "6px 0" }}>
+                  No quarantined artifacts recorded in recovery manifest.
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {quarantineRecords.map((rec) => {
+                    const isPendingCleanup = rec.status === "PendingCleanup";
+                    const isCleanedUp = rec.status === "CleanedUp";
+                    const isConflict = rec.status === "PreservedConflict";
+                    const isPendingMove = rec.status === "PendingMove";
+
+                    let badgeColor = "var(--text-dim)";
+                    let badgeBg = "rgba(148, 163, 184, 0.1)";
+                    let badgeLabel: string = rec.status;
+
+                    if (isPendingCleanup) {
+                      badgeColor = "#f59e0b";
+                      badgeBg = "rgba(245, 158, 11, 0.15)";
+                      badgeLabel = "Quarantined & Awaiting Cleanup";
+                    } else if (isCleanedUp) {
+                      badgeColor = "#10b981";
+                      badgeBg = "rgba(16, 185, 129, 0.15)";
+                      badgeLabel = "Cleanup Succeeded";
+                    } else if (isConflict) {
+                      badgeColor = "#ef4444";
+                      badgeBg = "rgba(239, 68, 68, 0.15)";
+                      badgeLabel = "Preserved Conflict (Cleanup Blocked)";
+                    } else if (isPendingMove) {
+                      badgeColor = "#3b82f6";
+                      badgeBg = "rgba(59, 130, 246, 0.15)";
+                      badgeLabel = "Pending Staging";
+                    }
+
+                    return (
+                      <div
+                        key={rec.id}
+                        style={{
+                          padding: "8px 10px",
+                          borderRadius: 6,
+                          background: "var(--bg-root)",
+                          border: `1px solid ${
+                            isConflict ? "rgba(239, 68, 68, 0.3)" : "var(--border-color)"
+                          }`,
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: 4,
+                        }}
+                      >
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                          <div>
+                            <div style={{ fontWeight: 600, fontSize: 11, color: "var(--text-primary)" }}>
+                              {rec.original_relative_path}
+                            </div>
+                            <div style={{ fontSize: 9, color: "var(--text-dim)", wordBreak: "break-all" }}>
+                              Storage: {rec.quarantined_filename || rec.quarantined_path}
+                            </div>
+                          </div>
+                          <span
+                            style={{
+                              fontSize: 9,
+                              fontWeight: 600,
+                              padding: "2px 6px",
+                              borderRadius: 4,
+                              background: badgeBg,
+                              color: badgeColor,
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            {badgeLabel}
+                          </span>
+                        </div>
+
+                        <div
+                          style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            alignItems: "center",
+                            fontSize: 9,
+                            color: "var(--text-muted)",
+                          }}
+                        >
+                          <span>
+                            Reason: {rec.reason} • {new Date(rec.quarantined_at).toLocaleString()}
+                          </span>
+
+                          {isPendingCleanup && (
+                            <button
+                              onClick={() => handleCleanupQuarantine(rec)}
+                              disabled={isCleaningQuarantine === rec.id}
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 4,
+                                padding: "2px 6px",
+                                borderRadius: 4,
+                                background: "rgba(239, 68, 68, 0.15)",
+                                border: "1px solid rgba(239, 68, 68, 0.3)",
+                                color: "#ef4444",
+                                fontSize: 9,
+                                fontWeight: 600,
+                                cursor: isCleaningQuarantine === rec.id ? "default" : "pointer",
+                              }}
+                            >
+                              <Trash2 size={10} />
+                              <span>{isCleaningQuarantine === rec.id ? "Cleaning..." : "Clean Up"}</span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
               )}
             </div>
           </div>

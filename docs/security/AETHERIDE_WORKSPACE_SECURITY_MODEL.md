@@ -165,14 +165,41 @@ Multi-file restore across a workspace directory is **NOT** an ACID filesystem tr
 To eliminate irreversible destruction of recoverable user data when external processes hold open handles, AetherIDE implements a durable quarantine subsystem:
 1. **Durable Recovery Manifest (`recovery_manifest.json`):**
    - Quarantined artifacts are recorded in `.aether/checkpoints/recovery_manifest.json`.
-   - Each entry records a unique UUID, original workspace relative path, quarantine path on disk, expected digest, actual digest at quarantine time, reason, and status (`PendingCleanup`, `CleanedUp`, or `PreservedConflict`).
-   - Manifest updates use atomic temporary write and rename, preventing corruption across process interruptions.
-2. **Controlled Cleanup Operations:**
-   - Physical deletion of quarantined artifacts is deferred to separately controlled cleanup operations (`cleanup_quarantine`, `cleanup_all_quarantined`).
+   - Each entry records a unique UUID, original workspace relative path, quarantine filename, quarantine path on disk, ISO-8601 UTC timestamp (`chrono::Utc::now()`), expected digest, actual digest at quarantine time, reason, and status:
+     * `PendingMove`: Initial intent record before file movement or during staging.
+     * `PendingCleanup`: Quarantined and awaiting explicit user-controlled cleanup.
+     * `CleanedUp`: Successfully cleaned up or confirmed absent.
+     * `PreservedConflict`: Preserved due to conflict, tampering, or concurrent modification.
+   - Manifest updates use atomic temporary write and rename (`save_with_fault`), with fsync of the file and its parent directory on Unix, preventing corruption across process crashes.
+2. **Durable Quarantine Transaction Protocol:**
+   - Movement from workspace into quarantine follows a multi-stage transaction:
+     a. Capability-anchored validation of relative workspace path and rejection of symlinks/non-files.
+     b. Generation of unique artifact ID and safe sanitized filename (alphanumeric, dots, dashes, underscores).
+     c. Staging inside workspace for exclusive access and pre-delete hook invocation.
+     d. Recording of `PendingMove` state in `recovery_manifest.json`.
+     e. Movement into `quarantine_dir` with verified copy fallback: if rename fails across filesystem boundaries, verified copy checks destination SHA-256 against staging hash before unlinking the staging file.
+     f. Atomically committing `PendingCleanup` state to the recovery manifest.
+3. **Startup Reconciliation & Untracked Artifact Adoption (`reconcile_quarantine`):**
+   - On application startup or recovery check, `reconcile_quarantine()` audits disk state against the recovery manifest:
+     * Records with missing physical files transition to `CleanedUp`.
+     * `PendingMove` records where the target file exists with valid SHA-256 are committed to `PendingCleanup`.
+     * Records whose target file has been modified or corrupted transition to `PreservedConflict`.
+     * Untracked physical artifacts found in `quarantine_dir` are adopted into the manifest as `PendingCleanup` without deletion, preventing data loss from interrupted transactions.
+4. **Path Traversal & Symlink Defense:**
+   - All quarantine paths are strictly derived from the trusted application storage `quarantine_dir()`.
+   - Path traversal attempts (`..`, absolute paths, drive letters, `/`, `\`, `:`) in quarantine records are rejected fail-closed.
+   - Symlinks inside quarantine are rejected fail-closed; symlinks are never followed and target files outside quarantine remain untouched.
+5. **Controlled Cleanup Operations & Mutation Defense:**
+   - Physical deletion of quarantined artifacts is deferred to user-controlled cleanup operations (`cleanup_quarantine`, `cleanup_all_quarantined`).
+   - Prior to unlinking, the file's content hash is verified against `actual_sha256` / `expected_sha256`. If the file was tampered with or modified while in quarantine, cleanup is blocked, the record transitions to `PreservedConflict`, and the file is preserved.
    - The engine never reports successful permanent deletion when an operation merely moved a file into quarantine (`was_deleted` remains false, `quarantined` is true, and `cleanup_pending` is flagged).
-   - If a cleanup operation is interrupted or crashes, on next startup the application reads the recovery manifest, discovers the remaining quarantined artifacts, and keeps them recoverable without silent data loss.
-3. **Structured UI Surfacing:**
-   - Quarantined artifacts, preserved backups, and recovery conflicts are surfaced in the desktop workbench UI with explicit paths, providing users actionable locations for manual recovery.
+   - In batch cleanups, progress is saved incrementally after each artifact; failures never mark records as `CleanedUp`.
+6. **Production Compensating Rollback Integration:**
+   - `handle_compensating_rollback()` automatically applies the durable quarantine mechanism for newly created files during failed restore operations (`defer_to_quarantine: true`).
+   - Unmutated newly created files are moved into quarantine, recorded in `recovery_manifest.json`, and surfaced in `CheckpointRestoreReport` under `quarantined_artifacts` with `cleanup_pending: true`.
+   - Manifest persistence failures propagate as explicit rollback errors and preserve artifacts in quarantine storage.
+7. **Structured UI Surfacing:**
+   - Quarantined artifacts, preserved backups, and recovery conflicts are surfaced in the desktop workbench UI with explicit status badges (`PendingCleanup`, `CleanedUp`, `PreservedConflict`), requiring explicit user confirmation before executing any cleanup. No automated destructive cleanup is executed in any normal UI workflow.
 
 ---
 

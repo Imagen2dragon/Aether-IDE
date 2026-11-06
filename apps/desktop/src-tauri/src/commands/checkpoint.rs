@@ -109,3 +109,24 @@ pub async fn checkpoint_restore(
         )
         .map_err(|e| format!("Failed to restore checkpoint: {}", e))
 }
+
+#[tauri::command]
+pub async fn checkpoint_list_quarantine(
+    app: AppHandle,
+) -> Result<Vec<checkpoint_engine::QuarantineRecord>, String> {
+    let engine_arc = app.state::<SharedCheckpointEngine>();
+    let engine = engine_arc.lock();
+    let manifest = engine
+        .load_recovery_manifest()
+        .map_err(|e| format!("Failed to load recovery manifest: {}", e))?;
+    Ok(manifest.records)
+}
+
+#[tauri::command]
+pub async fn checkpoint_cleanup_quarantine(app: AppHandle, id: String) -> Result<bool, String> {
+    let engine_arc = app.state::<SharedCheckpointEngine>();
+    let engine = engine_arc.lock();
+    engine
+        .cleanup_quarantine(&id)
+        .map_err(|e| format!("Failed to cleanup quarantine record: {}", e))
+}
