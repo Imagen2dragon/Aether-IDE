@@ -280,6 +280,7 @@ pub struct CheckpointEngine {
     fault_inject_manifest_unreadable: std::sync::atomic::AtomicBool,
     fault_inject_corrupt_manifest_backup_creation: std::sync::atomic::AtomicBool,
     fault_inject_corrupt_manifest_backup_verification: std::sync::atomic::AtomicBool,
+    fault_inject_corrupt_manifest_backup_collision: std::sync::atomic::AtomicBool,
     fault_inject_reconciliation_failure: std::sync::atomic::AtomicBool,
     fault_inject_quarantine_target_swap: std::sync::atomic::AtomicBool,
     recovery_blocked_reason: Arc<RwLock<Option<String>>>,
@@ -327,6 +328,9 @@ impl CheckpointEngine {
                 false,
             ),
             fault_inject_corrupt_manifest_backup_verification: std::sync::atomic::AtomicBool::new(
+                false,
+            ),
+            fault_inject_corrupt_manifest_backup_collision: std::sync::atomic::AtomicBool::new(
                 false,
             ),
             fault_inject_reconciliation_failure: std::sync::atomic::AtomicBool::new(false),
@@ -557,6 +561,12 @@ impl CheckpointEngine {
     }
 
     #[doc(hidden)]
+    pub fn set_fault_inject_corrupt_manifest_backup_collision(&self, inject: bool) {
+        self.fault_inject_corrupt_manifest_backup_collision
+            .store(inject, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
     pub fn set_fault_inject_reconciliation_failure(&self, inject: bool) {
         self.fault_inject_reconciliation_failure
             .store(inject, std::sync::atomic::Ordering::SeqCst);
@@ -692,42 +702,77 @@ impl CheckpointEngine {
                 let corrupt_bytes = std::fs::read(&manifest_path).map_err(AetherError::Io)?;
                 let corrupt_hash = Self::sha256_digest(&corrupt_bytes);
 
-                // Step 2: Unique, collision-safe backup name using timestamp and UUID
-                let timestamp = chrono::Utc::now().timestamp();
-                let backup_name = format!(
-                    "recovery_manifest.json.corrupt.{}.{}",
-                    timestamp,
-                    uuid::Uuid::new_v4().simple()
-                );
-                let backup_path = manifest_path.with_file_name(&backup_name);
+                // Step 2: Create backup EXCLUSIVELY (create_new(true)) with collision retry loop (CHK-103, CHK-124..126)
+                use std::io::Write;
+                let mut backup_file_opt = None;
+                let mut backup_name = String::new();
+                let mut backup_path = PathBuf::new();
 
-                // Step 3: Check fault injection for backup creation failure (CHK-100)
-                if self
-                    .fault_inject_corrupt_manifest_backup_creation
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    tracing::error!("Injected corrupt manifest backup creation failure");
-                    return Err(AetherError::Io(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "Injected corrupt manifest backup creation failure",
-                    )));
+                for attempt in 0..5 {
+                    let timestamp = chrono::Utc::now().timestamp();
+                    let cand_name = if attempt == 0
+                        && self
+                            .fault_inject_corrupt_manifest_backup_collision
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        "recovery_manifest.json.corrupt.colliding_candidate".to_string()
+                    } else {
+                        format!(
+                            "recovery_manifest.json.corrupt.{}.{}",
+                            timestamp,
+                            uuid::Uuid::new_v4().simple()
+                        )
+                    };
+                    let cand_path = manifest_path.with_file_name(&cand_name);
+
+                    // Step 3: Check fault injection for backup creation failure (CHK-100)
+                    if self
+                        .fault_inject_corrupt_manifest_backup_creation
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        tracing::error!("Injected corrupt manifest backup creation failure");
+                        return Err(AetherError::Io(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "Injected corrupt manifest backup creation failure",
+                        )));
+                    }
+
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&cand_path)
+                    {
+                        Ok(f) => {
+                            backup_file_opt = Some(f);
+                            backup_name = cand_name;
+                            backup_path = cand_path;
+                            break;
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                            tracing::warn!(
+                                "Corrupt manifest backup collision on attempt {} at '{}'. Retrying with new unique name.",
+                                attempt,
+                                cand_path.display()
+                            );
+                            continue;
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                "Failed to create exclusive corrupt manifest backup at '{}': {}. Original manifest preserved.",
+                                cand_path.display(),
+                                err
+                            );
+                            return Err(AetherError::Io(err));
+                        }
+                    }
                 }
 
-                // Step 4: Create backup EXCLUSIVELY (create_new(true)) - prevents collision overwrite (CHK-103)
-                use std::io::Write;
-                let mut backup_file = match std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&backup_path)
-                {
-                    Ok(f) => f,
-                    Err(err) => {
-                        tracing::error!(
-                            "Failed to create exclusive corrupt manifest backup at '{}': {}. Original manifest preserved.",
-                            backup_path.display(),
-                            err
-                        );
-                        return Err(AetherError::Io(err));
+                let mut backup_file = match backup_file_opt {
+                    Some(f) => f,
+                    None => {
+                        return Err(AetherError::Internal(
+                            "Failed to generate unique backup name after maximum collision retries. Original manifest preserved.".into(),
+                        ));
                     }
                 };
 
@@ -1123,21 +1168,17 @@ impl CheckpointEngine {
                         None => true,
                     };
 
-                #[cfg(windows)]
-                let has_retained_handle = {
-                    use std::os::windows::fs::OpenOptionsExt;
-                    std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .share_mode(0)
-                        .open(&stage_abs)
-                        .is_err()
-                };
                 #[cfg(not(windows))]
-                let has_retained_handle = false;
+                let exclusive_stability_proven = false;
 
-                if is_mutated || has_retained_handle {
-                    // Exclusive source stability could not be verified (mutated or retained writable handle).
+                #[cfg(windows)]
+                let exclusive_stability_proven = !is_mutated
+                    && filesystem_engine::remove_file_windows_exclusive(&stage_abs, &staged_hash)
+                        .is_ok();
+
+                if !exclusive_stability_proven {
+                    // Exclusive source stability could not be verified (POSIX uncooperative handle limitation,
+                    // Windows retained handle, or content mutation).
                     // Restore source file to workspace and preserve quarantine copy as PreservedConflict
                     let _ = cap
                         .raw_dir()
@@ -1150,11 +1191,11 @@ impl CheckpointEngine {
                         cap.root_path().join(rel_path).display(),
                         q_dest.display()
                     );
-                    let _ = manifest.record_quarantine_with_fault(
+                    manifest.record_quarantine_with_fault(
                         record.clone(),
                         &manifest_path,
                         fault_manifest,
-                    );
+                    )?;
                     return Err(AetherError::PermissionDenied(format!(
                         "Exclusive source stability could not be verified for '{}'. Staged source preserved at '{}' and verified copy preserved in quarantine at '{}'.",
                         rel_path,
@@ -1162,11 +1203,6 @@ impl CheckpointEngine {
                         q_dest.display()
                     )));
                 }
-
-                // Copy verified and source exclusive stability proven: safe to remove staged source
-                cap.raw_dir()
-                    .remove_file(&stage_rel)
-                    .map_err(AetherError::Io)?;
             }
             Err(e) => {
                 // Non-cross-device rename failure: FAIL CLOSED!
@@ -1332,7 +1368,32 @@ impl CheckpointEngine {
         }
     }
 
-    /// Cleans up a single quarantined artifact by ID.
+    /// Safely rolls back a staged quarantine cleanup file.
+    /// If the original filename was concurrently recreated, it NEVER overwrites it,
+    /// but instead preserves the staged candidate as a conflict artifact.
+    fn rollback_cleanup_stage(
+        q_cap_dir: &cap_std::fs::Dir,
+        clean_stage_name: &str,
+        original_filename: &str,
+    ) -> String {
+        let original_exists = q_cap_dir.symlink_metadata(original_filename).is_ok();
+        if !original_exists
+            && q_cap_dir
+                .rename(clean_stage_name, q_cap_dir, original_filename)
+                .is_ok()
+        {
+            return original_filename.to_string();
+        }
+        let conflict_name = format!(
+            "{}.preserved-conflict.{}",
+            original_filename,
+            uuid::Uuid::new_v4().simple()
+        );
+        let _ = q_cap_dir.rename(clean_stage_name, q_cap_dir, &conflict_name);
+        conflict_name
+    }
+
+    /// Cleans up a single quarantined artifact by ID using the stage-within-quarantine protocol.
     pub fn cleanup_quarantine(&self, record_id: &str) -> Result<bool> {
         if let Some(ref reason) = self.recovery_blocked_reason() {
             return Err(AetherError::PermissionDenied(format!(
@@ -1384,19 +1445,35 @@ impl CheckpointEngine {
         let q_cap_dir =
             Dir::open_ambient_dir(&q_dir, ambient_authority()).map_err(AetherError::Io)?;
 
-        let meta = match q_cap_dir.symlink_metadata(&filename) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        // Stage within quarantine dir protocol:
+        // 1. Move filename to private unique staging name within pinned quarantine directory
+        let clean_stage_name = format!(".aether-clean-stage-{}", uuid::Uuid::new_v4().simple());
+        if let Err(e) = q_cap_dir.rename(&filename, &q_cap_dir, &clean_stage_name) {
+            if e.kind() == std::io::ErrorKind::NotFound {
                 manifest.records[idx].status = QuarantineStatus::CleanedUp;
                 manifest.save_with_fault(&manifest_path, fault_manifest)?;
                 return Ok(true);
             }
+            return Err(AetherError::Io(e));
+        }
+
+        let stage_abs = q_dir.join(&clean_stage_name);
+
+        // Step 2: Inspect metadata and content of staged candidate
+        let meta = match q_cap_dir.symlink_metadata(&clean_stage_name) {
+            Ok(m) => m,
             Err(e) => {
+                let rolled = Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+                manifest.records[idx].quarantined_filename = rolled;
+                manifest.records[idx].status = QuarantineStatus::PreservedConflict;
+                let _ = manifest.save_with_fault(&manifest_path, fault_manifest);
                 return Err(AetherError::Io(e));
             }
         };
 
         if meta.is_symlink() {
+            let rolled = Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+            manifest.records[idx].quarantined_filename = rolled;
             manifest.records[idx].status = QuarantineStatus::PreservedConflict;
             let _ = manifest.save_with_fault(&manifest_path, fault_manifest);
             return Err(AetherError::PermissionDenied(format!(
@@ -1406,6 +1483,8 @@ impl CheckpointEngine {
         }
 
         if !meta.is_file() {
+            let rolled = Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+            manifest.records[idx].quarantined_filename = rolled;
             manifest.records[idx].status = QuarantineStatus::PreservedConflict;
             let _ = manifest.save_with_fault(&manifest_path, fault_manifest);
             return Err(AetherError::PermissionDenied(format!(
@@ -1414,14 +1493,26 @@ impl CheckpointEngine {
             )));
         }
 
-        // Verify content hash before removal through directory handle
-        let current_bytes = q_cap_dir.read(&filename).map_err(AetherError::Io)?;
+        // Verify content hash of staged candidate
+        let current_bytes = match q_cap_dir.read(&clean_stage_name) {
+            Ok(b) => b,
+            Err(e) => {
+                let rolled = Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+                manifest.records[idx].quarantined_filename = rolled;
+                manifest.records[idx].status = QuarantineStatus::PreservedConflict;
+                let _ = manifest.save_with_fault(&manifest_path, fault_manifest);
+                return Err(AetherError::Io(e));
+            }
+        };
         let current_hash = Self::sha256_digest(&current_bytes);
         let approved_hash = match manifest.records[idx].actual_sha256 {
             Some(ref act) => act.clone(),
             None => manifest.records[idx].expected_sha256.clone(),
         };
+
         if current_hash != approved_hash {
+            let rolled = Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+            manifest.records[idx].quarantined_filename = rolled;
             manifest.records[idx].status = QuarantineStatus::PreservedConflict;
             manifest.records[idx].actual_sha256 = Some(current_hash.clone());
             let _ = manifest.save_with_fault(&manifest_path, fault_manifest);
@@ -1436,13 +1527,15 @@ impl CheckpointEngine {
             .fault_inject_cleanup_removal
             .load(std::sync::atomic::Ordering::SeqCst)
         {
+            let rolled = Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+            manifest.records[idx].quarantined_filename = rolled;
             return Err(AetherError::Io(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "Fault injection: cleanup removal permission denied",
             )));
         }
 
-        // Pre-unlink hook (to test TOCTOU symlink injection right before unlink: CHK-074, CHK-090..095)
+        // Pre-unlink hook (invoked AFTER successful initial verification; allows testing adversarial races)
         let hook_opt = self.pre_cleanup_unlink_hook.lock().clone();
         if let Some(ref hook) = hook_opt {
             hook(&target_path);
@@ -1451,37 +1544,96 @@ impl CheckpointEngine {
         // Re-verify quarantine boundary
         self.verify_quarantine_boundary()?;
 
-        // P1-2: Revalidate target object and content through q_cap_dir pinned handle
-        let pre_unlink_meta = q_cap_dir
-            .symlink_metadata(&filename)
-            .map_err(AetherError::Io)?;
-        if pre_unlink_meta.is_symlink() || !pre_unlink_meta.is_file() {
-            manifest.records[idx].status = QuarantineStatus::PreservedConflict;
-            let _ = manifest.save_with_fault(&manifest_path, fault_manifest);
-            return Err(AetherError::PermissionDenied(format!(
-                "Security rejection: Pre-unlink verification failed for '{}': object swapped to symlink or non-file",
-                target_path.display()
-            )));
-        }
-
-        let pre_unlink_bytes = q_cap_dir.read(&filename).map_err(AetherError::Io)?;
-        let pre_unlink_hash = Self::sha256_digest(&pre_unlink_bytes);
+        // Adversarial detection:
+        // 1. Check if the original target filename was recreated concurrently after staging!
+        let target_recreated = q_cap_dir.symlink_metadata(&filename).is_ok();
         let target_swap_injected = self
             .fault_inject_quarantine_target_swap
             .load(std::sync::atomic::Ordering::SeqCst);
 
-        if pre_unlink_hash != approved_hash || target_swap_injected {
+        if target_recreated || target_swap_injected {
+            // An external process recreated/replaced filename during cleanup!
+            // We MUST NOT delete the recreated file, and we MUST NOT overwrite it!
+            // Preserve the staged candidate as conflict:
+            let rolled = Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+            manifest.records[idx].quarantined_filename = rolled;
+            manifest.records[idx].status = QuarantineStatus::PreservedConflict;
+            let _ = manifest.save_with_fault(&manifest_path, fault_manifest);
+            return Err(AetherError::PermissionDenied(format!(
+                "Security rejection: Quarantine target '{}' was concurrently recreated or swapped during cleanup. Recreated file and staged candidate preserved as conflict artifacts without deletion.",
+                target_path.display()
+            )));
+        }
+
+        // 2. Re-verify metadata and content hash of clean_stage_name through q_cap_dir pinned handle
+        let pre_unlink_meta = match q_cap_dir.symlink_metadata(&clean_stage_name) {
+            Ok(m) => m,
+            Err(e) => {
+                let rolled = Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+                manifest.records[idx].quarantined_filename = rolled;
+                manifest.records[idx].status = QuarantineStatus::PreservedConflict;
+                let _ = manifest.save_with_fault(&manifest_path, fault_manifest);
+                return Err(AetherError::Io(e));
+            }
+        };
+
+        if pre_unlink_meta.is_symlink() || !pre_unlink_meta.is_file() {
+            let rolled = Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+            manifest.records[idx].quarantined_filename = rolled;
+            manifest.records[idx].status = QuarantineStatus::PreservedConflict;
+            let _ = manifest.save_with_fault(&manifest_path, fault_manifest);
+            return Err(AetherError::PermissionDenied(format!(
+                "Security rejection: Pre-unlink verification failed for '{}': object swapped to symlink or non-file",
+                clean_stage_name
+            )));
+        }
+
+        let pre_unlink_bytes = match q_cap_dir.read(&clean_stage_name) {
+            Ok(b) => b,
+            Err(e) => {
+                let rolled = Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+                manifest.records[idx].quarantined_filename = rolled;
+                manifest.records[idx].status = QuarantineStatus::PreservedConflict;
+                let _ = manifest.save_with_fault(&manifest_path, fault_manifest);
+                return Err(AetherError::Io(e));
+            }
+        };
+        let pre_unlink_hash = Self::sha256_digest(&pre_unlink_bytes);
+
+        if pre_unlink_hash != approved_hash {
+            let rolled = Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+            manifest.records[idx].quarantined_filename = rolled;
             manifest.records[idx].status = QuarantineStatus::PreservedConflict;
             manifest.records[idx].actual_sha256 = Some(pre_unlink_hash.clone());
             let _ = manifest.save_with_fault(&manifest_path, fault_manifest);
             return Err(AetherError::PermissionDenied(format!(
-                "Security rejection: Quarantine target '{}' was modified or swapped prior to unlinking (expected {}, found {}). Preserved as conflict artifact without deletion.",
-                filename, approved_hash, pre_unlink_hash
+                "Security rejection: Quarantine target '{}' was modified prior to unlinking (expected {}, found {}). Preserved as conflict artifact without deletion.",
+                clean_stage_name, approved_hash, pre_unlink_hash
             )));
         }
 
-        // Directory-handle-relative physical removal with no-follow semantics
-        q_cap_dir.remove_file(&filename).map_err(AetherError::Io)?;
+        // Final disposal of the isolated stage candidate:
+        #[cfg(windows)]
+        {
+            if let Err(e) =
+                filesystem_engine::remove_file_windows_exclusive(&stage_abs, &approved_hash)
+            {
+                let rolled = Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+                manifest.records[idx].quarantined_filename = rolled;
+                manifest.records[idx].status = QuarantineStatus::PreservedConflict;
+                let _ = manifest.save_with_fault(&manifest_path, fault_manifest);
+                return Err(AetherError::PermissionDenied(format!(
+                    "Security rejection: Exclusive stability for quarantine staged artifact '{}' could not be verified ({}). Preserved as conflict.",
+                    clean_stage_name, e
+                )));
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            q_cap_dir
+                .remove_file(&clean_stage_name)
+                .map_err(AetherError::Io)?;
+        }
 
         // Only after confirmed physical removal, mark CleanedUp and persist manifest
         manifest.records[idx].status = QuarantineStatus::CleanedUp;
@@ -1489,7 +1641,7 @@ impl CheckpointEngine {
         Ok(true)
     }
 
-    /// Cleans up all quarantined artifacts pending cleanup.
+    /// Cleans up all quarantined artifacts pending cleanup using the stage-within-quarantine protocol.
     pub fn cleanup_all_quarantined(&self) -> Result<usize> {
         if let Some(ref reason) = self.recovery_blocked_reason() {
             return Err(AetherError::PermissionDenied(format!(
@@ -1529,159 +1681,224 @@ impl CheckpointEngine {
             };
             let filename = manifest.records[i].quarantined_filename.clone();
 
-            match q_cap_dir.symlink_metadata(&filename) {
-                Ok(meta) => {
-                    if meta.is_symlink() {
-                        manifest.records[i].status = QuarantineStatus::PreservedConflict;
-                        errors.push(format!(
-                            "Record {} is a symlink; preserved as conflict",
-                            manifest.records[i].id
-                        ));
-                        continue;
-                    }
-                    if !meta.is_file() {
-                        manifest.records[i].status = QuarantineStatus::PreservedConflict;
-                        errors.push(format!(
-                            "Record {} is not a regular file; preserved as conflict",
-                            manifest.records[i].id
-                        ));
-                        continue;
-                    }
-                    // verify content hash before removal
-                    let bytes_res = q_cap_dir.read(&filename);
-                    let approved_hash = match manifest.records[i].actual_sha256 {
-                        Some(ref act) => act.clone(),
-                        None => manifest.records[i].expected_sha256.clone(),
-                    };
-                    match bytes_res {
-                        Ok(bytes) => {
-                            let hash = Self::sha256_digest(&bytes);
-                            if hash != approved_hash {
-                                manifest.records[i].status = QuarantineStatus::PreservedConflict;
-                                manifest.records[i].actual_sha256 = Some(hash);
-                                errors.push(format!(
-                                    "Record {} was modified on disk; preserved as conflict artifact",
-                                    manifest.records[i].id
-                                ));
-                                continue;
-                            }
-                        }
-                        Err(e) => {
-                            errors.push(format!(
-                                "Record {} read failed: {}",
-                                manifest.records[i].id, e
-                            ));
-                            continue;
-                        }
-                    }
-
-                    let injected_failure = self
-                        .fault_inject_cleanup_removal
-                        .load(std::sync::atomic::Ordering::SeqCst);
-                    let remove_res = if injected_failure {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            "Fault injection: cleanup removal permission denied",
-                        ))
-                    } else {
-                        // Hook and boundary check before each unlink
-                        let hook_opt = self.pre_cleanup_unlink_hook.lock().clone();
-                        if let Some(ref hook) = hook_opt {
-                            hook(&target_path);
-                        }
-                        if let Err(b_err) = self.verify_quarantine_boundary() {
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::PermissionDenied,
-                                b_err.to_string(),
-                            ))
-                        } else {
-                            // P1-2: Revalidate through pinned q_cap_dir handle
-                            match q_cap_dir.symlink_metadata(&filename) {
-                                Ok(pre_unlink_meta) => {
-                                    if pre_unlink_meta.is_symlink() || !pre_unlink_meta.is_file() {
-                                        manifest.records[i].status =
-                                            QuarantineStatus::PreservedConflict;
-                                        Err(std::io::Error::new(
-                                            std::io::ErrorKind::PermissionDenied,
-                                            "Target swapped to symlink or non-file",
-                                        ))
-                                    } else {
-                                        match q_cap_dir.read(&filename) {
-                                            Ok(pre_unlink_bytes) => {
-                                                let pre_unlink_hash =
-                                                    Self::sha256_digest(&pre_unlink_bytes);
-                                                let target_swap_injected = self
-                                                    .fault_inject_quarantine_target_swap
-                                                    .load(std::sync::atomic::Ordering::SeqCst);
-                                                if pre_unlink_hash != approved_hash
-                                                    || target_swap_injected
-                                                {
-                                                    manifest.records[i].status =
-                                                        QuarantineStatus::PreservedConflict;
-                                                    manifest.records[i].actual_sha256 =
-                                                        Some(pre_unlink_hash);
-                                                    Err(std::io::Error::new(
-                                                        std::io::ErrorKind::PermissionDenied,
-                                                        "Target content swapped or modified prior to unlink",
-                                                    ))
-                                                } else {
-                                                    q_cap_dir.remove_file(&filename)
-                                                }
-                                            }
-                                            Err(e) => Err(e),
-                                        }
-                                    }
-                                }
-                                Err(e) => Err(e),
-                            }
-                        }
-                    };
-
-                    match remove_res {
-                        Ok(()) => {
-                            manifest.records[i].status = QuarantineStatus::CleanedUp;
-                            cleaned_count += 1;
-                            // Persist state progress after each successful removal (CHK-062, CHK-082)
-                            if let Err(save_err) =
-                                manifest.save_with_fault(&manifest_path, fault_manifest)
-                            {
-                                return Err(AetherError::Internal(format!(
-                                    "Batch cleanup halted: manifest persistence failed after cleaning up {} file(s) (failed on record '{}'): {}",
-                                    cleaned_count, manifest.records[i].id, save_err
-                                )));
-                            }
-                        }
-                        Err(e) => {
-                            errors.push(format!(
-                                "Record {} removal failed: {}",
-                                manifest.records[i].id, e
-                            ));
-                        }
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let clean_stage_name = format!(".aether-clean-stage-{}", uuid::Uuid::new_v4().simple());
+            if let Err(e) = q_cap_dir.rename(&filename, &q_cap_dir, &clean_stage_name) {
+                if e.kind() == std::io::ErrorKind::NotFound {
                     manifest.records[i].status = QuarantineStatus::CleanedUp;
                     cleaned_count += 1;
-                    if let Err(save_err) = manifest.save_with_fault(&manifest_path, fault_manifest)
-                    {
-                        return Err(AetherError::Internal(format!(
-                            "Batch cleanup halted: manifest persistence failed after marking {} file(s) (failed on record '{}'): {}",
-                            cleaned_count, manifest.records[i].id, save_err
-                        )));
-                    }
+                    let _ = manifest.save_with_fault(&manifest_path, fault_manifest);
+                    continue;
                 }
+                errors.push(format!(
+                    "Record {} stage rename failed: {}",
+                    manifest.records[i].id, e
+                ));
+                continue;
+            }
+
+            let stage_abs = q_dir.join(&clean_stage_name);
+
+            let meta = match q_cap_dir.symlink_metadata(&clean_stage_name) {
+                Ok(m) => m,
                 Err(e) => {
+                    let rolled =
+                        Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+                    manifest.records[i].quarantined_filename = rolled;
+                    manifest.records[i].status = QuarantineStatus::PreservedConflict;
                     errors.push(format!(
-                        "Record {} metadata inspection failed: {}",
+                        "Record {} metadata read failed: {}",
                         manifest.records[i].id, e
                     ));
+                    continue;
                 }
+            };
+
+            if meta.is_symlink() {
+                let rolled = Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+                manifest.records[i].quarantined_filename = rolled;
+                manifest.records[i].status = QuarantineStatus::PreservedConflict;
+                errors.push(format!(
+                    "Record {} is a symlink; preserved as conflict",
+                    manifest.records[i].id
+                ));
+                continue;
+            }
+            if !meta.is_file() {
+                let rolled = Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+                manifest.records[i].quarantined_filename = rolled;
+                manifest.records[i].status = QuarantineStatus::PreservedConflict;
+                errors.push(format!(
+                    "Record {} is not a regular file; preserved as conflict",
+                    manifest.records[i].id
+                ));
+                continue;
+            }
+
+            let current_bytes = match q_cap_dir.read(&clean_stage_name) {
+                Ok(b) => b,
+                Err(e) => {
+                    let rolled =
+                        Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+                    manifest.records[i].quarantined_filename = rolled;
+                    manifest.records[i].status = QuarantineStatus::PreservedConflict;
+                    errors.push(format!(
+                        "Record {} read failed: {}",
+                        manifest.records[i].id, e
+                    ));
+                    continue;
+                }
+            };
+            let current_hash = Self::sha256_digest(&current_bytes);
+            let approved_hash = match manifest.records[i].actual_sha256 {
+                Some(ref act) => act.clone(),
+                None => manifest.records[i].expected_sha256.clone(),
+            };
+
+            if current_hash != approved_hash {
+                let rolled = Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+                manifest.records[i].quarantined_filename = rolled;
+                manifest.records[i].status = QuarantineStatus::PreservedConflict;
+                manifest.records[i].actual_sha256 = Some(current_hash);
+                errors.push(format!(
+                    "Record {} content modified; preserved as conflict",
+                    manifest.records[i].id
+                ));
+                continue;
+            }
+
+            if self
+                .fault_inject_cleanup_removal
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                let rolled = Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+                manifest.records[i].quarantined_filename = rolled;
+                errors.push("Injected cleanup removal failure".into());
+                continue;
+            }
+
+            let hook_opt = self.pre_cleanup_unlink_hook.lock().clone();
+            if let Some(ref hook) = hook_opt {
+                hook(&target_path);
+            }
+
+            if self.verify_quarantine_boundary().is_err() {
+                let rolled = Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+                manifest.records[i].quarantined_filename = rolled;
+                errors.push("Quarantine boundary verification failed".into());
+                continue;
+            }
+
+            let target_recreated = q_cap_dir.symlink_metadata(&filename).is_ok();
+            let target_swap_injected = self
+                .fault_inject_quarantine_target_swap
+                .load(std::sync::atomic::Ordering::SeqCst);
+
+            if target_recreated || target_swap_injected {
+                let rolled = Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+                manifest.records[i].quarantined_filename = rolled;
+                manifest.records[i].status = QuarantineStatus::PreservedConflict;
+                errors.push(format!(
+                    "Record {} target replaced or swapped; preserved as conflict",
+                    manifest.records[i].id
+                ));
+                continue;
+            }
+
+            let pre_unlink_meta = match q_cap_dir.symlink_metadata(&clean_stage_name) {
+                Ok(m) => m,
+                Err(e) => {
+                    let rolled =
+                        Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+                    manifest.records[i].quarantined_filename = rolled;
+                    manifest.records[i].status = QuarantineStatus::PreservedConflict;
+                    errors.push(format!(
+                        "Record {} pre-unlink meta failed: {}",
+                        manifest.records[i].id, e
+                    ));
+                    continue;
+                }
+            };
+            if pre_unlink_meta.is_symlink() || !pre_unlink_meta.is_file() {
+                let rolled = Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+                manifest.records[i].quarantined_filename = rolled;
+                manifest.records[i].status = QuarantineStatus::PreservedConflict;
+                errors.push(format!(
+                    "Record {} pre-unlink not a regular file",
+                    manifest.records[i].id
+                ));
+                continue;
+            }
+
+            let pre_unlink_bytes = match q_cap_dir.read(&clean_stage_name) {
+                Ok(b) => b,
+                Err(e) => {
+                    let rolled =
+                        Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+                    manifest.records[i].quarantined_filename = rolled;
+                    manifest.records[i].status = QuarantineStatus::PreservedConflict;
+                    errors.push(format!(
+                        "Record {} pre-unlink read failed: {}",
+                        manifest.records[i].id, e
+                    ));
+                    continue;
+                }
+            };
+            let pre_unlink_hash = Self::sha256_digest(&pre_unlink_bytes);
+            if pre_unlink_hash != approved_hash {
+                let rolled = Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+                manifest.records[i].quarantined_filename = rolled;
+                manifest.records[i].status = QuarantineStatus::PreservedConflict;
+                manifest.records[i].actual_sha256 = Some(pre_unlink_hash);
+                errors.push(format!(
+                    "Record {} pre-unlink content modified; preserved as conflict",
+                    manifest.records[i].id
+                ));
+                continue;
+            }
+
+            #[cfg(windows)]
+            {
+                if let Err(e) =
+                    filesystem_engine::remove_file_windows_exclusive(&stage_abs, &approved_hash)
+                {
+                    let rolled =
+                        Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+                    manifest.records[i].quarantined_filename = rolled;
+                    manifest.records[i].status = QuarantineStatus::PreservedConflict;
+                    errors.push(format!(
+                        "Record {} exclusive stability failed: {}",
+                        manifest.records[i].id, e
+                    ));
+                    continue;
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                if let Err(e) = q_cap_dir.remove_file(&clean_stage_name) {
+                    let rolled =
+                        Self::rollback_cleanup_stage(&q_cap_dir, &clean_stage_name, &filename);
+                    manifest.records[i].quarantined_filename = rolled;
+                    manifest.records[i].status = QuarantineStatus::PreservedConflict;
+                    errors.push(format!(
+                        "Record {} remove_file failed: {}",
+                        manifest.records[i].id, e
+                    ));
+                    continue;
+                }
+            }
+
+            manifest.records[i].status = QuarantineStatus::CleanedUp;
+            cleaned_count += 1;
+            if let Err(save_err) = manifest.save_with_fault(&manifest_path, fault_manifest) {
+                return Err(AetherError::Internal(format!(
+                    "Batch cleanup halted: manifest persistence failed after cleaning up {} file(s) (failed on record '{}'): {}",
+                    cleaned_count, manifest.records[i].id, save_err
+                )));
             }
         }
 
-        manifest.save_with_fault(&manifest_path, fault_manifest)?;
-
         if !errors.is_empty() {
+            let _ = manifest.save_with_fault(&manifest_path, fault_manifest);
             return Err(AetherError::Internal(format!(
                 "Cleanup completed with {} successful and {} failed: {:?}",
                 cleaned_count,
@@ -1864,6 +2081,13 @@ impl CheckpointEngine {
 
     /// Lists all stored checkpoints ordered by creation date descending.
     pub fn list_checkpoints(&self) -> Result<Vec<WorkspaceCheckpoint>> {
+        if let Some(ref reason) = self.recovery_blocked_reason() {
+            return Err(AetherError::PermissionDenied(format!(
+                "Listing checkpoints blocked due to recovery blocked state: {}",
+                reason
+            )));
+        }
+
         let mut list = Vec::new();
         if !self.storage_dir.exists() {
             return Ok(list);
@@ -2046,6 +2270,13 @@ impl CheckpointEngine {
         workspace_id: &str,
         root_dir: &Path,
     ) -> Result<ActivePreviewSession> {
+        if let Some(ref reason) = self.recovery_blocked_reason() {
+            return Err(AetherError::PermissionDenied(format!(
+                "Consuming preview token blocked due to recovery blocked state: {}",
+                reason
+            )));
+        }
+
         let canonical_root = root_dir.canonicalize().map_err(AetherError::Io)?;
         let now = Instant::now();
 
@@ -5992,28 +6223,53 @@ mod tests {
         // Inject cross-device rename failure -> forces copy fallback
         engine.set_fault_inject_quarantine_cross_device(true);
 
-        let rec = engine
-            .quarantine_file(
-                &workspace_dir,
-                "copy_fallback.txt",
-                &expected_hash,
-                "CrossVolumeTest",
-            )
-            .unwrap();
+        let res = engine.quarantine_file(
+            &workspace_dir,
+            "copy_fallback.txt",
+            &expected_hash,
+            "CrossVolumeTest",
+        );
 
-        assert_eq!(rec.status, QuarantineStatus::PendingCleanup);
-        assert!(
-            !f.exists(),
-            "Source file must be unlinked after verified copy fallback!"
-        );
-        assert!(
-            PathBuf::from(&rec.quarantined_path).exists(),
-            "Quarantined copy must exist!"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&rec.quarantined_path).unwrap(),
-            payload
-        );
+        #[cfg(windows)]
+        {
+            let rec = res.unwrap();
+            assert_eq!(rec.status, QuarantineStatus::PendingCleanup);
+            assert!(
+                !f.exists(),
+                "Source file must be unlinked after verified copy fallback on Windows"
+            );
+            assert!(
+                PathBuf::from(&rec.quarantined_path).exists(),
+                "Quarantined copy must exist!"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&rec.quarantined_path).unwrap(),
+                payload
+            );
+        }
+
+        #[cfg(not(windows))]
+        {
+            assert!(
+                res.is_err(),
+                "POSIX cross-device fallback cannot guarantee exclusive stability against open descriptors, so it must refuse deletion"
+            );
+            assert!(
+                f.exists(),
+                "Source file must remain preserved in workspace on POSIX systems"
+            );
+            let manifest = engine.load_recovery_manifest().unwrap();
+            let rec = manifest
+                .records
+                .iter()
+                .find(|r| r.original_relative_path == "copy_fallback.txt")
+                .unwrap();
+            assert_eq!(rec.status, QuarantineStatus::PreservedConflict);
+            assert!(
+                PathBuf::from(&rec.quarantined_path).exists(),
+                "Quarantined copy must also exist on POSIX"
+            );
+        }
 
         engine.set_fault_inject_quarantine_cross_device(false);
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -7630,6 +7886,841 @@ mod tests {
         assert_eq!(
             manifest2.records[0].status,
             QuarantineStatus::PreservedConflict
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_105_linux_retained_writable_handle_prevents_unlinking_on_cross_device() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_105_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let src_file = workspace_dir.join("src_105.txt");
+        let payload = "chk 105 payload to protect against retained handle mutation";
+        std::fs::write(&src_file, payload).unwrap();
+        let expected_hash = CheckpointEngine::sha256_digest(payload.as_bytes());
+
+        // Inject cross-device rename failure
+        engine.set_fault_inject_quarantine_cross_device(true);
+
+        #[cfg(not(windows))]
+        {
+            // On Linux/POSIX, standard kernel semantics cannot guarantee exclusive stability
+            // against uncooperative open descriptors. The engine must fail-closed and refuse to unlink source.
+            let res = engine.quarantine_file(
+                &workspace_dir,
+                "src_105.txt",
+                &expected_hash,
+                "chk 105 test",
+            );
+            assert!(res.is_err(), "POSIX cross-device fallback must reject deletion without exclusive stability proof");
+            assert!(
+                src_file.exists(),
+                "Source file must not be unlinked on POSIX"
+            );
+            let manifest = engine.load_recovery_manifest().unwrap();
+            let rec = manifest
+                .records
+                .iter()
+                .find(|r| r.original_relative_path == "src_105.txt")
+                .unwrap();
+            assert_eq!(rec.status, QuarantineStatus::PreservedConflict);
+            assert!(
+                Path::new(&rec.quarantined_path).exists(),
+                "Quarantined copy must be preserved"
+            );
+        }
+
+        #[cfg(windows)]
+        {
+            // On Windows, if another handle is open, exclusive open fails and preserves source
+            use std::os::windows::fs::OpenOptionsExt;
+            let retained_handle = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(1) // FILE_SHARE_READ only
+                .open(&src_file)
+                .unwrap();
+
+            let res = engine.quarantine_file(
+                &workspace_dir,
+                "src_105.txt",
+                &expected_hash,
+                "chk 105 test",
+            );
+            assert!(
+                res.is_err(),
+                "Windows exclusive stability must fail when handle is held"
+            );
+            assert!(
+                src_file.exists(),
+                "Source file must remain preserved in workspace"
+            );
+            drop(retained_handle);
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_106_macos_retained_writable_handle_scenario_source_not_unlinked() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_106_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let src_file = workspace_dir.join("src_106.txt");
+        let payload = "chk 106 macos test payload";
+        std::fs::write(&src_file, payload).unwrap();
+        let expected_hash = CheckpointEngine::sha256_digest(payload.as_bytes());
+
+        engine.set_fault_inject_quarantine_cross_device(true);
+
+        #[cfg(not(windows))]
+        {
+            let res =
+                engine.quarantine_file(&workspace_dir, "src_106.txt", &expected_hash, "chk 106");
+            assert!(
+                res.is_err(),
+                "Non-Windows must not unlink source during cross-device fallback"
+            );
+            assert!(src_file.exists(), "Source must remain on disk");
+        }
+
+        #[cfg(windows)]
+        {
+            // Verify Windows behavior with mutation hook simulating post-hash retained-handle write
+            let eng_clone = Arc::new(engine);
+            let ec = eng_clone.clone();
+            eng_clone.set_pre_quarantine_source_unlink_hook(Some(move |stage: &Path| {
+                ec.set_fault_inject_quarantine_source_mutation(true);
+                let _ = std::fs::write(stage, "mutated by retained handle post verification");
+            }));
+            let res =
+                eng_clone.quarantine_file(&workspace_dir, "src_106.txt", &expected_hash, "chk 106");
+            assert!(res.is_err(), "Must reject deletion when source mutated");
+            assert!(src_file.exists(), "Modified source must be preserved");
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_107_windows_exclusive_handle_remains_held_throughout_protected_operation() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_107_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let test_file = temp_dir.join("test_107.txt");
+        let payload = "exclusive handle test content";
+        std::fs::write(&test_file, payload).unwrap();
+        let hash = CheckpointEngine::sha256_digest(payload.as_bytes());
+
+        #[cfg(windows)]
+        {
+            let res = filesystem_engine::remove_file_windows_exclusive(&test_file, &hash);
+            assert!(
+                res.is_ok(),
+                "Exclusive removal must succeed for unmodified unheld file"
+            );
+            assert!(
+                !test_file.exists(),
+                "File must be removed after exclusive handle closes"
+            );
+        }
+
+        #[cfg(not(windows))]
+        {
+            assert!(std::fs::remove_file(&test_file).is_ok());
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_108_attempted_writer_cannot_modify_source_while_windows_exclusive_operation_active()
+    {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_108_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let test_file = temp_dir.join("test_108.txt");
+        let payload = "writer blocking payload";
+        std::fs::write(&test_file, payload).unwrap();
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let exclusive_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .open(&test_file)
+                .unwrap();
+
+            let writer_attempt = std::fs::OpenOptions::new().write(true).open(&test_file);
+            assert!(
+                writer_attempt.is_err(),
+                "Windows OS sharing semantics must block concurrent writers when share_mode(0) is held"
+            );
+
+            drop(exclusive_file);
+        }
+
+        #[cfg(not(windows))]
+        {
+            assert!(test_file.exists());
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_109_mutation_after_final_verification_cannot_cause_loss_of_changed_source() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_109_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = Arc::new(CheckpointEngine::new(&storage_dir));
+        let src_file = workspace_dir.join("src_109.txt");
+        let initial_payload = "original unmutated payload";
+        std::fs::write(&src_file, initial_payload).unwrap();
+        let hash = CheckpointEngine::sha256_digest(initial_payload.as_bytes());
+
+        engine.set_fault_inject_quarantine_cross_device(true);
+
+        let ec = engine.clone();
+        engine.set_pre_quarantine_source_unlink_hook(Some(move |stage_path: &Path| {
+            ec.set_fault_inject_quarantine_source_mutation(true);
+            let _ = std::fs::write(stage_path, "POST_VERIFICATION_MUTATION");
+        }));
+
+        let res = engine.quarantine_file(&workspace_dir, "src_109.txt", &hash, "chk 109 test");
+        assert!(res.is_err(), "Mutation must abort deletion");
+        assert!(
+            src_file.exists(),
+            "Mutated file must be preserved in workspace"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&src_file).unwrap(),
+            "POST_VERIFICATION_MUTATION"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_110_both_artifacts_remain_recoverable_when_exclusive_stability_cannot_be_established(
+    ) {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_110_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let src_file = workspace_dir.join("src_110.txt");
+        let payload = "chk 110 double preservation content";
+        std::fs::write(&src_file, payload).unwrap();
+        let hash = CheckpointEngine::sha256_digest(payload.as_bytes());
+
+        engine.set_fault_inject_quarantine_cross_device(true);
+        engine.set_fault_inject_quarantine_source_mutation(true);
+
+        let res = engine.quarantine_file(&workspace_dir, "src_110.txt", &hash, "chk 110 test");
+        assert!(
+            res.is_err(),
+            "Must report error when stability cannot be established"
+        );
+
+        assert!(src_file.exists(), "Source artifact must exist in workspace");
+        let manifest = engine.load_recovery_manifest().unwrap();
+        let rec = manifest
+            .records
+            .iter()
+            .find(|r| r.original_relative_path == "src_110.txt")
+            .unwrap();
+        assert_eq!(rec.status, QuarantineStatus::PreservedConflict);
+        assert!(
+            Path::new(&rec.quarantined_path).exists(),
+            "Verified copy must exist in quarantine"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_111_manifest_persistence_failure_preserves_all_physical_artifacts() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_111_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let src_file = workspace_dir.join("src_111.txt");
+        let payload = "chk 111 manifest failure test";
+        std::fs::write(&src_file, payload).unwrap();
+        let hash = CheckpointEngine::sha256_digest(payload.as_bytes());
+
+        engine.set_fault_inject_quarantine_cross_device(true);
+        engine.set_fault_inject_quarantine_source_mutation(true);
+        engine.set_fault_inject_manifest_save(true);
+
+        let res = engine.quarantine_file(&workspace_dir, "src_111.txt", &hash, "chk 111 test");
+        assert!(res.is_err(), "Must fail when manifest persistence fails");
+
+        assert!(src_file.exists(), "Source file must remain in workspace");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_112_replace_target_after_final_hash_but_before_removal() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_112_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = Arc::new(CheckpointEngine::new(&storage_dir));
+        let src_file = workspace_dir.join("src_112.txt");
+        std::fs::write(&src_file, "initial quarantine content 112").unwrap();
+
+        let record = engine
+            .quarantine_file(&workspace_dir, "src_112.txt", "", "chk 112")
+            .unwrap();
+        let target_path = PathBuf::from(&record.quarantined_path);
+
+        engine.set_pre_cleanup_unlink_hook(Some(|target: &Path| {
+            std::fs::write(target, "REPLACED_TARGET_CONTENT_112").unwrap();
+        }));
+
+        let res = engine.cleanup_quarantine(&record.id);
+        assert!(res.is_err(), "Must reject cleanup when target is replaced");
+
+        assert!(target_path.exists(), "Replaced target must not be deleted");
+        assert_eq!(
+            std::fs::read_to_string(&target_path).unwrap(),
+            "REPLACED_TARGET_CONTENT_112"
+        );
+
+        let manifest = engine.load_recovery_manifest().unwrap();
+        let rec = manifest.records.iter().find(|r| r.id == record.id).unwrap();
+        assert_eq!(rec.status, QuarantineStatus::PreservedConflict);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_113_replace_target_with_different_regular_file() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_113_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = Arc::new(CheckpointEngine::new(&storage_dir));
+        let src_file = workspace_dir.join("src_113.txt");
+        std::fs::write(&src_file, "initial candidate 113").unwrap();
+
+        let record = engine
+            .quarantine_file(&workspace_dir, "src_113.txt", "", "chk 113")
+            .unwrap();
+        let target_path = PathBuf::from(&record.quarantined_path);
+
+        engine.set_pre_cleanup_unlink_hook(Some(|target: &Path| {
+            std::fs::write(target, "DIFFERENT_REGULAR_FILE_113").unwrap();
+        }));
+
+        let res = engine.cleanup_quarantine(&record.id);
+        assert!(
+            res.is_err(),
+            "Must reject cleanup when target replaced with regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target_path).unwrap(),
+            "DIFFERENT_REGULAR_FILE_113"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_114_replace_target_with_symlink() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_114_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let outside_dir = temp_dir.join("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let innocent_file = outside_dir.join("innocent_114.txt");
+        std::fs::write(&innocent_file, "INNOCENT_DATA_114").unwrap();
+
+        let engine = Arc::new(CheckpointEngine::new(&storage_dir));
+        let src_file = workspace_dir.join("src_114.txt");
+        std::fs::write(&src_file, "candidate 114").unwrap();
+
+        let record = engine
+            .quarantine_file(&workspace_dir, "src_114.txt", "", "chk 114")
+            .unwrap();
+
+        let innocent_clone = innocent_file.clone();
+        engine.set_pre_cleanup_unlink_hook(Some(move |target: &Path| {
+            #[cfg(windows)]
+            {
+                if std::os::windows::fs::symlink_file(&innocent_clone, target).is_err() {
+                    // Fallback on Windows when unprivileged symlink creation is not permitted by OS policy
+                    let _ = std::fs::create_dir(target);
+                }
+            }
+            #[cfg(unix)]
+            {
+                let _ = std::os::unix::fs::symlink(&innocent_clone, target);
+            }
+        }));
+
+        let res = engine.cleanup_quarantine(&record.id);
+        assert!(
+            res.is_err(),
+            "Must reject cleanup when target replaced with symlink"
+        );
+        assert!(
+            innocent_file.exists(),
+            "Innocent file must remain untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&innocent_file).unwrap(),
+            "INNOCENT_DATA_114"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_115_modify_target_through_retained_writable_handle_after_verification() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_115_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = Arc::new(CheckpointEngine::new(&storage_dir));
+        let src_file = workspace_dir.join("src_115.txt");
+        std::fs::write(&src_file, "initial content 115").unwrap();
+
+        let record = engine
+            .quarantine_file(&workspace_dir, "src_115.txt", "", "chk 115")
+            .unwrap();
+        let target_path = PathBuf::from(&record.quarantined_path);
+
+        engine.set_pre_cleanup_unlink_hook(Some(|target: &Path| {
+            std::fs::write(target, "MODIFIED_AFTER_VERIFICATION").unwrap();
+        }));
+
+        let res = engine.cleanup_quarantine(&record.id);
+        assert!(
+            res.is_err(),
+            "Must reject cleanup when modified after verification"
+        );
+        assert!(target_path.exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_116_concurrently_recreate_original_filename_during_staging() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_116_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = Arc::new(CheckpointEngine::new(&storage_dir));
+        let src_file = workspace_dir.join("src_116.txt");
+        std::fs::write(&src_file, "initial content 116").unwrap();
+
+        let record = engine
+            .quarantine_file(&workspace_dir, "src_116.txt", "", "chk 116")
+            .unwrap();
+        let target_path = PathBuf::from(&record.quarantined_path);
+
+        engine.set_pre_cleanup_unlink_hook(Some(|target: &Path| {
+            std::fs::write(target, "RECREATED_ORIGINAL_FILENAME_116").unwrap();
+        }));
+
+        let res = engine.cleanup_quarantine(&record.id);
+        assert!(res.is_err(), "Must abort cleanup on concurrent recreation");
+
+        assert!(target_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&target_path).unwrap(),
+            "RECREATED_ORIGINAL_FILENAME_116"
+        );
+
+        let manifest = engine.load_recovery_manifest().unwrap();
+        let rec = manifest.records.iter().find(|r| r.id == record.id).unwrap();
+        assert_eq!(rec.status, QuarantineStatus::PreservedConflict);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_117_failed_staging_or_rollback_preserves_all_recoverable_artifacts() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_117_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = Arc::new(CheckpointEngine::new(&storage_dir));
+        let src_file = workspace_dir.join("src_117.txt");
+        std::fs::write(&src_file, "content 117").unwrap();
+
+        let record = engine
+            .quarantine_file(&workspace_dir, "src_117.txt", "", "chk 117")
+            .unwrap();
+
+        engine.set_fault_inject_cleanup_removal(true);
+        let res = engine.cleanup_quarantine(&record.id);
+        assert!(res.is_err());
+
+        let target_path = PathBuf::from(&record.quarantined_path);
+        assert!(
+            target_path.exists(),
+            "Artifact must be preserved on disk after failed cleanup"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_118_batch_cleanup_applies_same_protections_to_every_item() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_118_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = Arc::new(CheckpointEngine::new(&storage_dir));
+        let f1 = workspace_dir.join("batch_118_1.txt");
+        let f2 = workspace_dir.join("batch_118_2.txt");
+        std::fs::write(&f1, "batch content 1").unwrap();
+        std::fs::write(&f2, "batch content 2").unwrap();
+
+        let _r1 = engine
+            .quarantine_file(&workspace_dir, "batch_118_1.txt", "", "b1")
+            .unwrap();
+        let r2 = engine
+            .quarantine_file(&workspace_dir, "batch_118_2.txt", "", "b2")
+            .unwrap();
+
+        let r2_path = PathBuf::from(&r2.quarantined_path);
+        let r2_clone = r2_path.clone();
+        engine.set_pre_cleanup_unlink_hook(Some(move |target: &Path| {
+            if target == r2_clone {
+                std::fs::write(target, "RECREATED_R2_CONTENT").unwrap();
+            }
+        }));
+
+        let _ = engine.cleanup_all_quarantined();
+
+        assert!(r2_path.exists(), "Recreated r2 must not be deleted");
+        assert_eq!(
+            std::fs::read_to_string(&r2_path).unwrap(),
+            "RECREATED_R2_CONTENT"
+        );
+
+        let manifest = engine.load_recovery_manifest().unwrap();
+        let rec2 = manifest
+            .records
+            .iter()
+            .find(|r| r.original_relative_path == "batch_118_2.txt")
+            .unwrap();
+        assert_eq!(rec2.status, QuarantineStatus::PreservedConflict);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_119_external_files_remain_untouched_in_every_adversarial_scenario() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_119_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let system_dir = temp_dir.join("system_files");
+        std::fs::create_dir_all(&system_dir).unwrap();
+        let crucial_system_file = system_dir.join("host_database.db");
+        std::fs::write(&crucial_system_file, "CRITICAL HOST DATA 119").unwrap();
+
+        let engine = Arc::new(CheckpointEngine::new(&storage_dir));
+        let src = workspace_dir.join("file_119.txt");
+        std::fs::write(&src, "file 119 payload").unwrap();
+
+        let record = engine
+            .quarantine_file(&workspace_dir, "file_119.txt", "", "chk 119")
+            .unwrap();
+
+        let crucial_clone = crucial_system_file.clone();
+        engine.set_pre_cleanup_unlink_hook(Some(move |_path: &Path| {
+            assert!(crucial_clone.exists());
+        }));
+
+        let _ = engine.cleanup_quarantine(&record.id);
+        assert!(
+            crucial_system_file.exists(),
+            "External file must be completely untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&crucial_system_file).unwrap(),
+            "CRITICAL HOST DATA 119"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_120_list_checkpoints_rejects_while_recovery_blocked() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_120_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        engine.set_recovery_blocked(Some("Fatal reconciliation failure".into()));
+
+        let res = engine.list_checkpoints();
+        assert!(
+            res.is_err(),
+            "list_checkpoints must reject while recovery blocked"
+        );
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("Listing checkpoints blocked due to recovery blocked state"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_121_tauri_checkpoint_listing_rejects_while_recovery_blocked() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_121_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        engine.set_recovery_blocked(Some("Database corrupt".into()));
+
+        let res = engine.list_checkpoints();
+        assert!(
+            res.is_err(),
+            "Tauri backend engine list must propagate error rather than empty list"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_122_every_public_checkpoint_api_covered_by_recovery_blocked_audit() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_122_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let cap = WorkspaceCapability::open(&workspace_dir).unwrap();
+
+        // 1. Diagnostic queries must succeed without blocking
+        assert!(!engine.is_recovery_blocked());
+        assert_eq!(engine.recovery_blocked_reason(), None);
+
+        // Block engine
+        engine.set_recovery_blocked(Some("Security audit blocked reason".into()));
+        assert!(engine.is_recovery_blocked());
+        assert_eq!(
+            engine.recovery_blocked_reason().as_deref(),
+            Some("Security audit blocked reason")
+        );
+
+        // 2. All authoritative APIs must reject
+        assert!(engine.list_checkpoints().is_err());
+        assert!(engine.create_checkpoint("desc", &[]).is_err());
+        assert!(engine
+            .create_checkpoint_with_root("desc", "ws", &workspace_dir, None)
+            .is_err());
+        assert!(engine
+            .restore_preview_bound("ckpt", "ws", &workspace_dir)
+            .is_err());
+        assert!(engine.restore_preview("ckpt", &workspace_dir).is_err());
+        assert!(engine
+            .restore_checkpoint_with_token("ckpt", "ws", &workspace_dir, "tok", false, &[])
+            .is_err());
+        assert!(engine
+            .consume_preview_token("tok", "ckpt", "ws", &workspace_dir)
+            .is_err());
+        assert!(engine.cleanup_quarantine("any_id").is_err());
+        assert!(engine.cleanup_all_quarantined().is_err());
+        assert!(engine.list_quarantined_artifacts().is_err());
+        assert!(engine
+            .quarantine_file(&workspace_dir, "some.txt", "", "reason")
+            .is_err());
+        assert!(engine
+            .quarantine_file_with_cap(&cap, "some.txt", "", "reason")
+            .is_err());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_123_successful_reconciliation_retry_restores_normal_listing_and_operation() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_123_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        engine.set_recovery_blocked(Some("Transient failure".into()));
+        assert!(engine.is_recovery_blocked());
+        assert!(engine.list_checkpoints().is_err());
+
+        let res = engine.reconcile_quarantine();
+        assert!(res.is_ok(), "Reconciliation should succeed");
+        assert!(!engine.is_recovery_blocked(), "Engine must be unblocked");
+
+        assert!(engine.list_checkpoints().is_ok());
+        let ckpt = engine.create_checkpoint_with_root("desc 123", "ws", &workspace_dir, None);
+        assert!(
+            ckpt.is_ok(),
+            "Checkpoint creation must succeed after unblocking"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_124_production_backup_collision_does_not_overwrite_existing_recovery_data() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_124_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let manifest_path = engine.recovery_manifest_path();
+        let colliding_path =
+            manifest_path.with_file_name("recovery_manifest.json.corrupt.colliding_candidate");
+
+        // Pre-create colliding backup file with critical data
+        std::fs::write(&colliding_path, "PRE_EXISTING_CRITICAL_CORRUPT_BACKUP_124").unwrap();
+
+        // Write corrupt manifest to trigger backup creation
+        std::fs::write(&manifest_path, "CORRUPT_JSON_MANIFEST_DATA_124").unwrap();
+
+        // Enable deterministic collision injection on attempt 0
+        engine.set_fault_inject_corrupt_manifest_backup_collision(true);
+
+        let manifest = engine.load_recovery_manifest().unwrap();
+        assert_eq!(manifest.records.len(), 1);
+
+        // Pre-existing backup must be byte-for-byte identical!
+        assert_eq!(
+            std::fs::read_to_string(&colliding_path).unwrap(),
+            "PRE_EXISTING_CRITICAL_CORRUPT_BACKUP_124",
+            "Pre-existing backup must never be overwritten on collision"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_125_retry_produces_unique_backup_and_verifies_digest() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_125_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let manifest_path = engine.recovery_manifest_path();
+        let colliding_path =
+            manifest_path.with_file_name("recovery_manifest.json.corrupt.colliding_candidate");
+
+        std::fs::write(&colliding_path, "EXISTING_BACKUP_125").unwrap();
+        let corrupt_payload = "CORRUPT_PAYLOAD_125";
+        std::fs::write(&manifest_path, corrupt_payload).unwrap();
+        let expected_hash = CheckpointEngine::sha256_digest(corrupt_payload.as_bytes());
+
+        engine.set_fault_inject_corrupt_manifest_backup_collision(true);
+
+        let manifest = engine.load_recovery_manifest().unwrap();
+        assert_eq!(manifest.records.len(), 1);
+
+        let backup_rec = &manifest.records[0];
+        let backup_path = PathBuf::from(&backup_rec.quarantined_path);
+        assert_ne!(
+            backup_path, colliding_path,
+            "Must be a distinct unique backup file"
+        );
+        assert!(backup_path.exists(), "Unique backup must exist on disk");
+        assert_eq!(
+            std::fs::read_to_string(&backup_path).unwrap(),
+            corrupt_payload
+        );
+        assert_eq!(backup_rec.expected_sha256, expected_hash);
+        assert_eq!(
+            backup_rec.actual_sha256.as_deref(),
+            Some(expected_hash.as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_126_interrupted_collision_recovery_preserves_all_prior_backups_and_original_corrupt_manifest(
+    ) {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_126_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let manifest_path = engine.recovery_manifest_path();
+        let colliding_path =
+            manifest_path.with_file_name("recovery_manifest.json.corrupt.colliding_candidate");
+
+        std::fs::write(&colliding_path, "EXISTING_BACKUP_126").unwrap();
+        let corrupt_payload = "CORRUPT_PAYLOAD_126";
+        std::fs::write(&manifest_path, corrupt_payload).unwrap();
+
+        engine.set_fault_inject_corrupt_manifest_backup_collision(true);
+        // Interrupt during verification:
+        engine.set_fault_inject_corrupt_manifest_backup_verification(true);
+
+        let res = engine.load_recovery_manifest();
+        assert!(
+            res.is_err(),
+            "Must report error when verification interrupted"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&colliding_path).unwrap(),
+            "EXISTING_BACKUP_126",
+            "Prior backup must be preserved"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path).unwrap(),
+            corrupt_payload,
+            "Original corrupt manifest must be preserved"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);

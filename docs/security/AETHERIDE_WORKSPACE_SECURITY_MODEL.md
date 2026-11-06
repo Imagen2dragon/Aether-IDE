@@ -234,6 +234,41 @@ To eliminate irreversible destruction of recoverable user data when external pro
    - Quarantined artifacts, preserved backups, and recovery conflicts are surfaced in the desktop workbench UI with explicit status badges (`PendingCleanup`, `CleanedUp`, `PreservedConflict`), requiring explicit user confirmation before executing any cleanup.
    - Reconcile action in the UI allows triggering on-demand storage reconciliation and displays reconciliation status banners. No automated destructive cleanup is executed in any normal UI workflow.
 
+### 5.3 Sprint 23.2.11 Security Advancements: Target Object Identity, Source Stability & API Gating
+
+1. **Directory Confinement vs. Target-Object Identity:**
+   - Pinned directory handles (`cap_std::fs::Dir`) guarantee boundary confinement and prevent path traversal or symlink redirection outside the quarantine directory. However, a pinned directory handle alone does **not** guarantee that a relative filename continues to refer to the identical file object that was hashed if an adversarial or external process swaps or replaces that file between userland verification and unlinking.
+   - To guarantee target-object identity, AetherIDE implements the **Stage-Within-Quarantine Protocol**:
+     1. The candidate object is atomically moved within the pinned quarantine directory to a unique private staging name (`.aether-clean-stage-<uuid>`).
+     2. Metadata and content hash are inspected directly on the isolated stage candidate.
+     3. If a concurrent process replaces or recreates the original target filename while staged, cleanup detects the recreated object, aborts removal, and preserves both files without overwriting either.
+     4. Rollback via `rollback_cleanup_stage` checks if the original filename was recreated; if so, it never overwrites the new file, but instead preserves the staged candidate under `.preserved-conflict.<uuid>`.
+     5. Only the isolated staged candidate is ever unlinked, ensuring external replacements are never deleted or unlinked.
+
+2. **Hash Verification vs. Atomic Deletion:**
+   - Userland hash verification (reading bytes, computing a SHA-256 digest, and comparing against an approved hash) does **not** equal atomic check-and-unlink. A race window unavoidably exists between reading the final byte of a file and issuing an `unlink()` or `remove_file()` system call.
+   - AetherIDE explicitly documents this limitation and never claims userland hash checks achieve atomic deletion. Instead, destructive cleanup is isolated to uniquely staged objects, and on Windows, relies on exclusive handle sharing semantics.
+
+3. **Platform-Specific Source Stability: Windows Sharing vs. POSIX Retained Descriptors:**
+   - **Windows:** Utilizes `remove_file_windows_exclusive`:
+     * Opens the file with `share_mode(0)` (no sharing: denying concurrent read, write, or delete) and access rights `GENERIC_READ | GENERIC_WRITE | DELETE`.
+     * If any other process holds an open handle, opening immediately fails, proving lack of exclusive stability.
+     * While holding the exclusive handle, reads the file, verifies the SHA-256 digest against expected content, and sets `FileDispositionInfo (DeleteFile = 1)`.
+     * Closing the handle atomically unlinks the file at the kernel level without race.
+   - **POSIX (Linux, macOS):** Standard POSIX semantics do not enforce mandatory file sharing exclusion against uncooperative processes holding open writable descriptors. Therefore, exclusive stability through destructive cross-device operations cannot be proven in userland.
+   - **POSIX Fail-Closed Rule:** On Linux and macOS, cross-device fallback **never unlinks the source file**. When cross-device copy occurs, both the workspace source and the quarantine copy are durably preserved, and recorded in the recovery manifest as `QuarantineStatus::PreservedConflict`. Data preservation strictly overrides deletion completion.
+
+4. **RecoveryBlocked Gating: Authoritative vs. Diagnostic Access:**
+   - When the engine enters `RecoveryBlocked` (e.g. startup reconciliation failure, database or manifest corruption):
+     * **Authoritative Checkpoint APIs Blocked:** `create_checkpoint`, `create_checkpoint_with_root`, `list_checkpoints`, `restore_preview_bound`, `restore_preview`, `restore_checkpoint_with_token`, `consume_preview_token`, `cleanup_quarantine`, `cleanup_all_quarantined`, `list_quarantined_artifacts`, and `quarantine_file_with_cap` strictly reject operations with `PermissionDenied`. Stale state is never presented as authoritative.
+     * **Diagnostic Queries Permitted:** Harmless diagnostic status methods (`is_recovery_blocked`, `recovery_blocked_reason`, and Tauri command `checkpoint_get_recovery_status`) remain fully accessible to surface the failure reason to the UI.
+     * **Unblocking Authority:** Successful retry of `reconcile_quarantine()` is the **sole operation** authorized to clear `RecoveryBlocked`.
+
+5. **Collision-Safe Corrupt-Manifest Recovery:**
+   - When startup detects a corrupt manifest, backup creation executes a retry loop (up to 5 attempts) using `create_new(true)`.
+   - Pre-existing backup files are never overwritten on collision.
+   - The retry loop generates fresh collision-safe UUID backup names and verifies the read-back digest before constructing a fresh manifest. If interrupted or failed, the original corrupt manifest and all prior backups remain byte-for-byte intact.
+
 ---
 
 ## 6. AI Gateway Streaming & Cancellation

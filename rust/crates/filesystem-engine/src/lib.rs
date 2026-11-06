@@ -32,6 +32,70 @@ pub fn is_cross_device_error(err: &std::io::Error) -> bool {
     false
 }
 
+#[cfg(windows)]
+pub fn remove_file_windows_exclusive(path: &Path, expected_hash: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    const DELETE: u32 = 0x00010000;
+    const GENERIC_READ: u32 = 0x80000000;
+    const GENERIC_WRITE: u32 = 0x40000000;
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+        .share_mode(0) // EXCLUSIVE: no sharing with other handles
+        .open(path)
+        .map_err(AetherError::Io)?;
+
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(AetherError::Io)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let current_hash = format!("{:x}", hasher.finalize());
+
+    if !expected_hash.is_empty() && current_hash != expected_hash {
+        return Err(AetherError::PermissionDenied(format!(
+            "Concurrent modification detected during exclusive verification of '{}'. Staged source preserved without deletion.",
+            path.display()
+        )));
+    }
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct FILE_DISPOSITION_INFO {
+        DeleteFile: u8,
+    }
+    #[allow(non_snake_case)]
+    extern "system" {
+        fn SetFileInformationByHandle(
+            hFile: *mut std::ffi::c_void,
+            FileInformationClass: u32,
+            lpFileInformation: *mut std::ffi::c_void,
+            dwBufferSize: u32,
+        ) -> i32;
+    }
+    let mut info = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    let res = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            4, // FileDispositionInfo
+            &mut info as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+
+    if res == 0 {
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+
+    drop(file);
+    Ok(())
+}
+
 /// Sanitizes an untrusted user-provided relative path for capability operations.
 /// Strictly rejects path traversals (`..`), drive prefixes, absolute roots,
 /// Alternate Data Streams (`:`), Windows device names (CON, NUL, PRN, etc.),
@@ -1288,37 +1352,37 @@ impl WorkspaceCapability {
                             hook(&stage_abs);
                         }
 
-                        // Re-verify source stability immediately before unlinking
-                        let pre_unlink_bytes =
-                            self.dir.read(&stage_rel).map_err(AetherError::Io)?;
-                        let mut pre_unlink_hasher = Sha256::new();
-                        pre_unlink_hasher.update(&pre_unlink_bytes);
-                        let pre_unlink_hash = format!("{:x}", pre_unlink_hasher.finalize());
-                        if pre_unlink_hash != expected_hash {
+                        #[cfg(not(windows))]
+                        {
+                            // On POSIX systems (Linux, macOS), mandatory locking against uncooperative processes holding
+                            // open file descriptors is not supported by standard kernel semantics. Therefore, exclusive
+                            // stability through destructive operations cannot be proven, and the staged source must never be unlinked.
                             return Err(AetherError::PermissionDenied(format!(
-                                "Concurrent source modification detected via retained handle during cross-device quarantine copy for '{}'. Staged source preserved without deletion.",
-                                user_path
+                                "Cross-device quarantine fallback cannot guarantee exclusive source stability on POSIX systems against retained open descriptors for '{}'. Staged source preserved at '{}' and quarantine copy preserved at '{}'.",
+                                user_path,
+                                stage_abs.display(),
+                                target.display()
                             )));
                         }
 
                         #[cfg(windows)]
                         {
-                            use std::os::windows::fs::OpenOptionsExt;
-                            if let Err(err) = std::fs::OpenOptions::new()
-                                .read(true)
-                                .write(true)
-                                .share_mode(0)
-                                .open(&stage_abs)
+                            // On Windows, use exclusive handle deletion:
+                            // 1. Open with share_mode(0) (exclusive access) and DELETE permission.
+                            //    If any other process holds any open handle, open fails immediately.
+                            // 2. While holding the handle, read bytes and verify hash against expected_hash.
+                            // 3. If hash matches, set FileDispositionInfo (DeleteFile = 1) on the handle.
+                            // 4. Closing the handle unlinks the file atomically at kernel level without race.
+                            if let Err(err) =
+                                remove_file_windows_exclusive(&stage_abs, expected_hash)
                             {
                                 return Err(AetherError::PermissionDenied(format!(
-                                    "Exclusive source stability could not be verified for '{}' (retained handle detected: {}). Staged source preserved without deletion.",
-                                    user_path, err
+                                    "Exclusive source stability could not be verified for '{}' ({}). Staged source preserved at '{}' and quarantine copy preserved at '{}'.",
+                                    user_path, err, stage_abs.display(), target.display()
                                 )));
                             }
+                            target
                         }
-
-                        self.dir.remove_file(&stage_rel).map_err(AetherError::Io)?;
-                        target
                     }
                     Err(e) => {
                         return Err(AetherError::Io(e));
