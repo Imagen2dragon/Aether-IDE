@@ -159,7 +159,20 @@ Multi-file restore across a workspace directory is **NOT** an ACID filesystem tr
    - **Platform-Specific Open-Handle Behavior:**
      - On Windows, file locking and sharing flags (`FILE_SHARE_READ`, `FILE_SHARE_WRITE`, `FILE_SHARE_DELETE`) govern handle interactions. Retained handles without delete sharing cause staging rename or unlinking to fail with sharing violations; AetherIDE treats these fail-closed and preserves the artifacts.
      - On Linux and macOS, POSIX filesystem semantics allow unlinking a directory entry while open file descriptors remain valid and connected to the inode. Data written through an open descriptor after the unlink syscall executes is held on the unreferenced inode until the descriptor closes, at which point the kernel releases the storage blocks.
-   - **Residual Race Limitation:** Because general-purpose OS kernels do not expose an atomic combined syscall for `hash_verify_and_unlink(fd, expected_hash)`, a minute residual window exists between the userland second hash read and the subsequent unlink syscall. A detached writable handle writing in this exact interval cannot be detected by userland before the unlink syscall executes. AetherIDE makes no unsupported claims of kernel-level immunity against uncooperative detached file descriptors; rather, it guarantees that all detectable mutations, I/O uncertainties, and rollback collisions choose data preservation over silent loss.
+   - **Residual Race Limitation & The Quarantine Architecture:** Because general-purpose OS kernels do not expose an atomic combined syscall for `hash_verify_and_unlink(fd, expected_hash)`, a minute residual window exists between the userland second hash read and the subsequent unlink syscall. A detached writable handle writing in this exact interval cannot be detected by userland before the unlink syscall executes. AetherIDE makes no unsupported claims of kernel-level immunity against uncooperative detached file descriptors; rather, it adheres to the principle of **recoverability over irreversible deletion**. Where exclusive deletion cannot be proven at the OS level, artifacts are quarantined into dedicated storage, tracked in a durable recovery manifest (`recovery_manifest.json`), and preserved until explicit user or maintenance cleanup.
+
+### 5.6 Quarantine & Durable Recovery Manifest Architecture
+To eliminate irreversible destruction of recoverable user data when external processes hold open handles, AetherIDE implements a durable quarantine subsystem:
+1. **Durable Recovery Manifest (`recovery_manifest.json`):**
+   - Quarantined artifacts are recorded in `.aether/checkpoints/recovery_manifest.json`.
+   - Each entry records a unique UUID, original workspace relative path, quarantine path on disk, expected digest, actual digest at quarantine time, reason, and status (`PendingCleanup`, `CleanedUp`, or `PreservedConflict`).
+   - Manifest updates use atomic temporary write and rename, preventing corruption across process interruptions.
+2. **Controlled Cleanup Operations:**
+   - Physical deletion of quarantined artifacts is deferred to separately controlled cleanup operations (`cleanup_quarantine`, `cleanup_all_quarantined`).
+   - The engine never reports successful permanent deletion when an operation merely moved a file into quarantine (`was_deleted` remains false, `quarantined` is true, and `cleanup_pending` is flagged).
+   - If a cleanup operation is interrupted or crashes, on next startup the application reads the recovery manifest, discovers the remaining quarantined artifacts, and keeps them recoverable without silent data loss.
+3. **Structured UI Surfacing:**
+   - Quarantined artifacts, preserved backups, and recovery conflicts are surfaced in the desktop workbench UI with explicit paths, providing users actionable locations for manual recovery.
 
 ---
 

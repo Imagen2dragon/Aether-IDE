@@ -73,6 +73,12 @@ This matrix establishes the comprehensive test results and security validations 
 | **CHK-045** | Checkpoints | Non-AlreadyExists hard-link rollback failure never falls back to overwrite rename; preserves conflict artifact fail-closed | `checkpoint-engine/src/lib.rs` | `test_chk_045_hard_link_rollback_failure_never_falls_back_to_overwrite_rename` | **PASS** |
 | **CHK-046** | Checkpoints | Metadata inspection failure during rollback fails closed without touching destination | `checkpoint-engine/src/lib.rs` | `test_chk_046_metadata_inspection_failure_during_rollback_fails_closed` | **PASS** |
 | **CHK-047** | Checkpoints | Ordinary production wrapper with default hooks executes unconditional pre-unlink second verification | `checkpoint-engine/src/lib.rs` | `test_chk_047_production_wrapper_default_hooks_executes_second_verification` | **PASS** |
+| **CHK-048** | Checkpoints | Mutation after final verification via retained writable handle detected before physical unlink; prevents silent data destruction and preserves artifact | `checkpoint-engine/src/lib.rs` | `test_chk_048_mutation_after_final_verification_preserves_artifact` | **PASS** |
+| **CHK-049** | Checkpoints | Quarantined artifact remains durable, discoverable, and recoverable through recovery manifest after interrupted cleanup | `checkpoint-engine/src/lib.rs` | `test_chk_049_quarantine_recovery_manifest_preserves_artifact` | **PASS** |
+| **CHK-050** | Checkpoints | Concurrent destination recreation during rollback preserves both destination and staged artifact without overwrite | `checkpoint-engine/src/lib.rs` | `test_chk_050_concurrent_destination_recreation_during_rollback_preserves_both` | **PASS** |
+| **CHK-051** | Checkpoints | PermissionDenied, I/O errors, and uncertain metadata inspection fail closed without assuming absence | `checkpoint-engine/src/lib.rs` | `test_chk_051_permission_and_metadata_failures_fail_closed` | **PASS** |
+| **CHK-052** | Checkpoints | Structured recovery reporting surfaces restored files, compensated files, preserved backups, quarantined artifacts, conflicts, and pending cleanup | `checkpoint-engine/src/lib.rs` | `test_chk_052_structured_recovery_report_surfaces_quarantine_conflicts_and_cleanup` | **PASS** |
+| **CHK-053** | Checkpoints | Interrupted cleanup during batch processing leaves remaining quarantined artifacts intact and discoverable across application restart | `checkpoint-engine/src/lib.rs` | `test_chk_053_interrupted_cleanup_preserves_remaining_quarantined_artifacts` | **PASS** |
 | **BLD-011** | Build Security | Shared executable launch pipeline (`ApprovedBuildProcess`) executes complex arguments (&, \|, >, <, %TEMP%, spaces, quotes, backslashes) keeping test helper out of production whitelist | `apps/desktop/src-tauri/tests/windows_argument_escaping_integration_test.rs` | `test_windows_process_argument_escaping_integration_test_binary` | **PASS** |
 | **AI-001** | AI Streaming | Fake streaming fallback eliminated; unsupported providers fail closed | `model-gateway/src/lib.rs` | `test_fake_streaming_eliminated_unsupported_provider_fails_closed` | **PASS** |
 | **AI-002** | AI Streaming | Cancellation token halts stream immediately and drops HTTP connection | `model-gateway/src/lib.rs` | `test_cancellation_aborts_stream_immediately` | **PASS** |
@@ -131,6 +137,19 @@ Binary files (e.g. PNG files containing `0x89 0x50 0x4E 0x47` and arbitrary byte
   - Staged files modified through open writable handles after initial hash verification are caught by pre-unlink re-verification and preserved as conflict artifacts rather than deleted (`test_chk_040`).
   - Rollback rename of staged files uses atomic no-overwrite publication; if the original destination was recreated, the staged file is preserved under a unique conflict path without overwriting the recreated destination (`test_chk_041`).
   - Compensation of missing files uses exclusive creation (`replace_file_bytes_conditional_with_hooks(expected_hash: None)` via `hard_link`), preventing overwrite of destinations created concurrently between inspection and compensation (`test_chk_042`).
+- Production verification, strict no-overwrite recovery, and retained writable handle testing (`test_chk_043` through `test_chk_047`) proves that:
+  - Unconditional pre-unlink second verification executes on every production deletion attempt and traps retained writable handle writes (`test_chk_043`).
+  - Recreated destination before hard link rollback publication preserves both the recreated destination and the staged artifact without overwrite (`test_chk_044`).
+  - Non-AlreadyExists hard link failure preserves the staged conflict artifact without fallback to overwrite rename (`test_chk_045`).
+  - Metadata inspection failures during rollback fail closed without touching destination (`test_chk_046`).
+  - Production wrapper with default hooks reliably traps retained handle mutation across high-core runners (`test_chk_047`).
+- Final filesystem safety, mutation detection, and quarantine recovery manifest architecture (`test_chk_048` through `test_chk_053`) proves that:
+  - Writes through retained handles after final verification immediately abort physical deletion, preserving user data fail-closed as conflict artifacts (`test_chk_048`).
+  - Quarantined artifacts are recorded in a durable recovery manifest (`recovery_manifest.json`) and remain discoverable and recoverable across failed or interrupted cleanups (`test_chk_049`).
+  - Concurrently recreated destinations during rollback are never overwritten; both survive on disk (`test_chk_050`).
+  - Inaccessible files or metadata inspection errors fail closed and are never assumed absent (`test_chk_051`).
+  - Structured recovery reports accurately communicate restored files, compensated files, preserved backups, quarantined artifacts, recovery conflicts, and pending cleanup operations (`test_chk_052`).
+  - Interrupted cleanups during batch processing leave remaining artifacts safely tracked in the manifest, preventing silent data destruction on subsequent application startups (`test_chk_053`).
 
 ### 3.4 Model Gateway Streaming
 The previous default trait implementation of `ModelProvider::stream_completion` which silently called `complete()` and returned a single fake chunk was eliminated. Tests confirm:

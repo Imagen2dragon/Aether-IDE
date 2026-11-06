@@ -169,9 +169,31 @@ export const BuildStoragePanel: React.FC<BuildStoragePanelProps> = ({ onBuildLog
         if (res.preserved_backups && res.preserved_backups.length > 0) {
           msg += ` [Preserved backups: ${res.preserved_backups.join(", ")}]`;
         }
+        if (res.quarantined_artifacts && res.quarantined_artifacts.length > 0) {
+          msg += ` [Quarantined: ${res.quarantined_artifacts.join(", ")}]`;
+        }
+        if (res.recovery_conflicts && res.recovery_conflicts.length > 0) {
+          msg += ` [Conflicts: ${res.recovery_conflicts.join(", ")}]`;
+        }
+        if (res.cleanup_pending) {
+          msg += ` (Pending cleanup operations remain)`;
+        }
         setCkptMsg(msg);
       } else {
-        setCkptMsg(`Restore completed with warnings: ${res.errors.join("; ")}`);
+        let warnMsg = `Restore incomplete: ${res.errors.join("; ")}`;
+        if (res.compensated_files && res.compensated_files.length > 0) {
+          warnMsg += ` [Compensated files: ${res.compensated_files.join(", ")}]`;
+        }
+        if (res.quarantined_artifacts && res.quarantined_artifacts.length > 0) {
+          warnMsg += ` [Quarantined artifacts: ${res.quarantined_artifacts.join(", ")}]`;
+        }
+        if (res.recovery_conflicts && res.recovery_conflicts.length > 0) {
+          warnMsg += ` [Recovery conflicts: ${res.recovery_conflicts.join(", ")}]`;
+        }
+        if (res.preserved_backups && res.preserved_backups.length > 0) {
+          warnMsg += ` [Preserved backups: ${res.preserved_backups.join(", ")}]`;
+        }
+        setCkptMsg(warnMsg);
       }
     } catch (err: any) {
       setCkptMsg(`Restore failed: ${err}`);

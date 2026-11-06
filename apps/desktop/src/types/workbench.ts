@@ -271,6 +271,8 @@ export interface CheckpointRestoreReport {
   preserved_backups?: string[];
   compensated_files?: string[];
   recovery_conflicts?: string[];
+  quarantined_artifacts?: string[];
+  cleanup_pending?: boolean;
 }
 
 // Git Engine

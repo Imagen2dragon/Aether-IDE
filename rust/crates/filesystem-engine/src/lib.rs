@@ -218,14 +218,32 @@ pub struct ConditionalReplaceHooks<'a> {
     pub fault_inject_backup_removal: bool,
 }
 
+/// Final disposition of a conditional file deletion attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeletionDisposition {
+    /// Confirmed already absent on disk prior to staging
+    ConfirmedAbsent,
+    /// Physically unlinked after passing exclusive pre-unlink verification
+    Unlinked,
+    /// Moved to quarantine because exclusive deletion cannot be proven or cleanup is deferred
+    Quarantined { quarantine_path: PathBuf },
+    /// Preserved as a recovery conflict artifact due to concurrent modification or uncertain state
+    ConflictPreserved { conflict_path: PathBuf },
+}
+
 /// Outcome of conditional file deletion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConditionalDeleteOutcome {
-    /// True if the file was verified and successfully unlinked.
+    /// True ONLY if the file was physically unlinked or confirmed absent.
+    /// NEVER true when an artifact is quarantined or preserved!
     pub was_deleted: bool,
     /// If deletion could not proceed (e.g. concurrent modification detected, read failure,
-    /// or removal failure), this contains the surviving path of the preserved file.
+    /// quarantined, or removal failure), this contains the surviving path of the preserved file.
     pub surviving_path: Option<PathBuf>,
+    /// Exact disposition of the deletion attempt.
+    pub disposition: DeletionDisposition,
+    /// True if the artifact was preserved in quarantine for safe, non-destructive recovery.
+    pub quarantined: bool,
 }
 
 /// Optional hooks and fault-injection flags for conditional file deletion.
@@ -236,8 +254,15 @@ pub struct ConditionalDeleteHooks<'a> {
     /// Injected after first hash verification and immediately before second verification.
     /// Simulates concurrent writes through pre-existing open writable handles.
     pub post_hash_hook: Option<&'a (dyn Fn(&Path) + 'a)>,
+    /// Injected after second hash verification and immediately before physical unlink.
+    /// Simulates concurrent writes through retained handles after final verification (CHK-048).
+    pub pre_unlink_hook: Option<&'a (dyn Fn(&Path) + 'a)>,
     /// Injected immediately before hard-link rollback publication (after destination metadata check).
     pub pre_hard_link_hook: Option<&'a (dyn Fn(&Path) + 'a)>,
+    /// If true, defers physical deletion and safely preserves the staged file into quarantine.
+    pub defer_to_quarantine: bool,
+    /// Optional quarantine destination directory.
+    pub quarantine_dir: Option<PathBuf>,
     /// Injected fault: simulate I/O error during deletion removal.
     pub fault_inject_delete_removal: bool,
     /// Injected fault: simulate failure during rollback.
@@ -937,6 +962,8 @@ impl WorkspaceCapability {
                 return Ok(ConditionalDeleteOutcome {
                     was_deleted: true,
                     surviving_path: None,
+                    disposition: DeletionDisposition::ConfirmedAbsent,
+                    quarantined: false,
                 });
             }
             Err(e) => return Err(AetherError::Io(e)),
@@ -1031,6 +1058,44 @@ impl WorkspaceCapability {
                     );
                     // A failed read or hash operation must abort deletion and preserve the staged artifact.
                     is_modified_or_unverified = true;
+                }
+            }
+        }
+
+        // 5b. Pre-Unlink Hook (CHK-048: Simulates writes through retained handles immediately before physical deletion)
+        if !is_modified_or_unverified {
+            if let Some(hook) = hooks.pre_unlink_hook {
+                hook(&self.root_path.join(&stage_rel));
+
+                // Re-verify immediately before physical unlink attempt
+                let post_hook_check: std::io::Result<bool> = (|| {
+                    let mut f = self.dir.open(&stage_rel)?;
+                    let mut b = Vec::new();
+                    f.read_to_end(&mut b)?;
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::new();
+                    hasher.update(&b);
+                    let h = format!("{:x}", hasher.finalize());
+                    Ok(h != expected_hash)
+                })();
+
+                match post_hook_check {
+                    Ok(modified) => {
+                        if modified {
+                            warn!(
+                                "Pre-unlink final check detected modification through retained handle on '{}'. Aborting deletion.",
+                                user_path
+                            );
+                            is_modified_or_unverified = true;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Pre-unlink final check read failed on '{}' ({}). Aborting deletion to protect data.",
+                            user_path, e
+                        );
+                        is_modified_or_unverified = true;
+                    }
                 }
             }
         }
@@ -1136,7 +1201,59 @@ impl WorkspaceCapability {
 
             return Ok(ConditionalDeleteOutcome {
                 was_deleted: false,
-                surviving_path: Some(surviving),
+                surviving_path: Some(surviving.clone()),
+                disposition: DeletionDisposition::ConflictPreserved {
+                    conflict_path: surviving,
+                },
+                quarantined: false,
+            });
+        }
+
+        // 5c. Defer to Quarantine (prefer recoverability over irreversible deletion)
+        if hooks.defer_to_quarantine {
+            let quarantine_path = if let Some(ref q_dir) = hooks.quarantine_dir {
+                let _ = std::fs::create_dir_all(q_dir);
+                let q_file_name = format!(
+                    "{}.aether-quarantine-{}",
+                    rel.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
+                    uuid::Uuid::new_v4().simple()
+                );
+                let target = q_dir.join(&q_file_name);
+                let stage_abs = self.root_path.join(&stage_rel);
+                match std::fs::rename(&stage_abs, &target) {
+                    Ok(()) => target,
+                    Err(_) => match std::fs::copy(&stage_abs, &target) {
+                        Ok(_) => {
+                            let _ = self.dir.remove_file(&stage_rel);
+                            target
+                        }
+                        Err(_) => self.root_path.join(&stage_rel),
+                    },
+                }
+            } else {
+                let q_name = format!(
+                    "{}.aether-quarantine-{}",
+                    user_path,
+                    uuid::Uuid::new_v4().simple()
+                );
+                let q_rel = PathBuf::from(q_name);
+                match self.dir.rename(&stage_rel, &self.dir, &q_rel) {
+                    Ok(()) => self.root_path.join(&q_rel),
+                    Err(_) => self.root_path.join(&stage_rel),
+                }
+            };
+
+            warn!(
+                "Conditional deletion deferred to quarantine for '{}': preserved at '{}'.",
+                user_path,
+                quarantine_path.display()
+            );
+
+            return Ok(ConditionalDeleteOutcome {
+                was_deleted: false,
+                surviving_path: Some(quarantine_path.clone()),
+                disposition: DeletionDisposition::Quarantined { quarantine_path },
+                quarantined: true,
             });
         }
 
@@ -1151,6 +1268,8 @@ impl WorkspaceCapability {
             Ok(()) => Ok(ConditionalDeleteOutcome {
                 was_deleted: true,
                 surviving_path: None,
+                disposition: DeletionDisposition::Unlinked,
+                quarantined: false,
             }),
             Err(rm_err) => {
                 let surviving = Self::preserve_staged_deletion_conflict(
@@ -1168,7 +1287,11 @@ impl WorkspaceCapability {
                 );
                 Ok(ConditionalDeleteOutcome {
                     was_deleted: false,
-                    surviving_path: Some(surviving),
+                    surviving_path: Some(surviving.clone()),
+                    disposition: DeletionDisposition::ConflictPreserved {
+                        conflict_path: surviving,
+                    },
+                    quarantined: false,
                 })
             }
         }
