@@ -116,6 +116,21 @@
 5. **Desktop Frontend Workbench Build:**
    - `npm --prefix apps/desktop run build`: **TypeScript clean, 3,092 modules bundled in 13.53s**.
 
+### 5.1 Cross-Platform GitHub Actions CI Matrix (Commit `4adfac1e7a939bdd561e022c2e1e5a6541af68fc`)
+
+Cross-platform verification executed across both PR (`42238031914`) and push (`42238022747`) pipelines:
+
+| Job Name | CI Run ID | Duration | Status | Release Artifact |
+|---|---|---|---|---|
+| **TypeScript & Frontend Workbench Verification** | `42238031914` / `42238022747` | 48s / 45s | **PASS (SUCCESS)** | N/A |
+| **Code Formatting & Quality** | `42238031914` / `42238022747` | 1m10s / 1m1s | **PASS (SUCCESS)** | N/A |
+| **Linux x64 (GNU) Build & Package** | `42238031914` / `42238022747` | 5m52s / 4m35s | **PASS (SUCCESS)** | `AetherIDE-v0.1.0-beta.2-linux-x64` |
+| **Windows x64 (MSVC) Build & Package** | `42238031914` / `42238022747` | 11m20s / 9m10s | **PASS (SUCCESS)** | `AetherIDE-v0.1.0-beta.2-windows-x64` |
+| **macOS ARM64 (Apple Silicon) Build & Package** | `42238031914` / `42238022747` | 4m59s / 5m30s | **PASS (SUCCESS)** | `AetherIDE-v0.1.0-beta.2-macos-arm64` |
+
+- **GitHub PR Mergeability:** `MERGEABLE`
+- **GitHub Merge State Status:** `CLEAN`
+
 ---
 
 ## 6. Review & Merge Readiness
