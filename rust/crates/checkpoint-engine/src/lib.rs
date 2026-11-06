@@ -6667,7 +6667,10 @@ mod tests {
             .iter()
             .find(|r| r.original_relative_path == "chk067_file.txt");
         assert!(item.is_some(), "Interrupted artifact must be tracked!");
+        #[cfg(windows)]
         assert_eq!(item.unwrap().status, QuarantineStatus::PendingCleanup);
+        #[cfg(not(windows))]
+        assert_eq!(item.unwrap().status, QuarantineStatus::PreservedConflict);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
