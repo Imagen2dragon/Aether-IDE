@@ -26,7 +26,7 @@ In accordance with the Sprint 23.2.11 Engineering Directive, this remediation cl
 ## 2. Commit SHAs & Git Merge-Base Comparison
 
 - **Starting PR Head:** `27ed1eea1580cf9a83a3c996b0a9f480c8f8ad98`
-- **Final Implementation Commit:** `303910558f3905dd1d75d2f98d53f79501835ed4`
+- **Implementation Commits:** `7216c319c98251bbfac875c4bbeccccfec0ecb1d` (Core Sprint 23.2.11 implementation) + follow-up multi-platform clippy hygiene commit
 - **Main Branch Head:** `d943bce93dcd9455817ee319d202c2db4d3f5bb5`
 - **Merge Base (`git merge-base origin/main HEAD`):** `d943bce93dcd9455817ee319d202c2db4d3f5bb5`
 - **Branch Relationship:** The PR branch is strictly ahead of `main` by 5 linear commits with zero divergence. No force pushes or history rewrites were performed.

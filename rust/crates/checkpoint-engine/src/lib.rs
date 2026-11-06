@@ -1162,11 +1162,15 @@ impl CheckpointEngine {
                     .map(|b| Self::sha256_digest(b))
                     .ok();
 
+                #[cfg(windows)]
                 let is_mutated = src_mutation_injected
                     || match &current_src_hash {
                         Some(h) => h != &staged_hash,
                         None => true,
                     };
+
+                #[cfg(not(windows))]
+                let _ = src_mutation_injected;
 
                 #[cfg(not(windows))]
                 let exclusive_stability_proven = false;
@@ -1457,6 +1461,7 @@ impl CheckpointEngine {
             return Err(AetherError::Io(e));
         }
 
+        #[cfg(windows)]
         let stage_abs = q_dir.join(&clean_stage_name);
 
         // Step 2: Inspect metadata and content of staged candidate
@@ -1696,6 +1701,7 @@ impl CheckpointEngine {
                 continue;
             }
 
+            #[cfg(windows)]
             let stage_abs = q_dir.join(&clean_stage_name);
 
             let meta = match q_cap_dir.symlink_metadata(&clean_stage_name) {
@@ -8020,6 +8026,7 @@ mod tests {
         let test_file = temp_dir.join("test_107.txt");
         let payload = "exclusive handle test content";
         std::fs::write(&test_file, payload).unwrap();
+        #[cfg(windows)]
         let hash = CheckpointEngine::sha256_digest(payload.as_bytes());
 
         #[cfg(windows)]
