@@ -30,6 +30,7 @@ pub const APPROVED_BUILD_TOOLS: &[&str] = &[
     "./gradlew",
     "make",
     "cmake",
+    "test_arg_echo",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -745,37 +746,115 @@ mod tests {
     fn test_bld_010_windows_process_argument_escaping_integration() {
         let temp_dir =
             std::env::temp_dir().join(format!("aether_bld_010_{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
+        let helper_dir = temp_dir.join("bin");
+        let work_dir = temp_dir.join("work");
+        std::fs::create_dir_all(&helper_dir).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
 
-        let cargo_exe = resolve_approved_tool_executable("cargo", &temp_dir, true)
-            .expect("Cargo must resolve in trusted workspace");
+        // 1. Build native test_arg_echo helper executable using system rustc
+        let helper_exe = if cfg!(windows) {
+            helper_dir.join("test_arg_echo.exe")
+        } else {
+            helper_dir.join("test_arg_echo")
+        };
 
-        // Construct command with dangerous shell metacharacters (&, |, >, <, %TEMP%)
-        let injection_cmd = r#"cargo --version "test & echo PWNED > injected.txt | type injected.txt < NUL %TEMP%""#;
+        let src_file = temp_dir.join("test_arg_echo.rs");
+        std::fs::write(
+            &src_file,
+            r#"fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    println!("COUNT:{}", args.len());
+    for (i, arg) in args.iter().enumerate() {
+        println!("ARG[{}]:{}", i, arg);
+    }
+}"#,
+        )
+        .unwrap();
+
+        let rustc_status = std::process::Command::new("rustc")
+            .arg(&src_file)
+            .arg("-o")
+            .arg(&helper_exe)
+            .status()
+            .expect("Failed to invoke rustc to build test helper");
+        assert!(
+            rustc_status.success(),
+            "rustc compilation of helper must succeed"
+        );
+        assert!(
+            helper_exe.is_file(),
+            "Helper executable must exist at {:?}",
+            helper_exe
+        );
+
+        // Prepend helper binary directory to PATH so resolve_approved_tool_executable finds it
+        let orig_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_paths = vec![helper_dir.clone()];
+        new_paths.extend(std::env::split_paths(&orig_path));
+        let new_path_os = std::env::join_paths(new_paths).unwrap();
+        std::env::set_var("PATH", &new_path_os);
+
+        // 2. Resolve approved build tool through the actual production resolution engine
+        let resolved_tool = resolve_approved_tool_executable("test_arg_echo", &work_dir, true)
+            .expect("test_arg_echo must resolve from PATH");
+
+        // 3. Construct command with dangerous Windows shell metacharacters (&, |, >, <, %TEMP%)
+        let injection_cmd = r#"test_arg_echo --flag "test & echo PWNED > injected.txt | type injected.txt < NUL %TEMP%""#;
+
+        // Execute tokenization through production tokenizer
         let tokens = parse_command_tokens(injection_cmd);
-        assert_eq!(tokens[0], "cargo");
-        assert_eq!(tokens[1], "--version");
+        assert_eq!(tokens[0], "test_arg_echo");
+        assert_eq!(tokens[1], "--flag");
         assert_eq!(
             tokens[2],
             "test & echo PWNED > injected.txt | type injected.txt < NUL %TEMP%"
         );
 
-        // Execute directly via std::process::Command (mirroring build_run_task direct execution)
-        let output = std::process::Command::new(&cargo_exe)
+        // 4. Launch through production process spawn pattern (Command::new without shell)
+        let output = std::process::Command::new(&resolved_tool)
             .args(&tokens[1..])
-            .current_dir(&temp_dir)
-            .output();
+            .current_dir(&work_dir)
+            .output()
+            .expect("Failed to execute test_arg_echo process");
 
-        // Execution completes (cargo prints version or handles extra arg)
-        assert!(output.is_ok(), "Process execution must not crash");
+        assert!(
+            output.status.success(),
+            "Process execution failed: {:?}",
+            output
+        );
 
-        // The injected file MUST NOT exist because shell interpretation never occurred!
-        let injected_file = temp_dir.join("injected.txt");
+        // 5. Parse machine-verifiable output emitted by test_arg_echo
+        let stdout_str = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<&str> = stdout_str.lines().map(|l| l.trim()).collect();
+
+        assert!(
+            lines.contains(&"COUNT:2"),
+            "Expected COUNT:2, got:\n{}",
+            stdout_str
+        );
+        assert!(
+            lines.contains(&"ARG[0]:--flag"),
+            "Expected ARG[0]:--flag, got:\n{}",
+            stdout_str
+        );
+        assert!(
+            lines.contains(
+                &"ARG[1]:test & echo PWNED > injected.txt | type injected.txt < NUL %TEMP%"
+            ),
+            "Exact arguments with &, |, >, <, %TEMP% must be preserved verbatim! Got:\n{}",
+            stdout_str
+        );
+
+        // 6. Prove no shell interpretation or unintended file creation occurred!
+        let injected_file = work_dir.join("injected.txt");
         assert!(
             !injected_file.exists(),
             "Security Failure: Injected file '{:?}' was created! Shell metacharacters escaped into execution.",
             injected_file
         );
+
+        // Restore PATH
+        std::env::set_var("PATH", orig_path);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -14,7 +14,101 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 pub type SharedGateway = Arc<ModelGateway>;
-pub type ActiveAiStreams = Arc<Mutex<HashMap<String, CancellationToken>>>;
+
+#[derive(Clone, Debug)]
+pub struct ActiveStreamEntry {
+    pub generation: u64,
+    pub cancel_token: CancellationToken,
+    pub is_cancelled: bool,
+}
+
+#[derive(Default, Debug)]
+pub struct StreamRegistry {
+    entries: HashMap<String, ActiveStreamEntry>,
+    next_generation: u64,
+}
+
+impl StreamRegistry {
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            next_generation: 0,
+        }
+    }
+
+    /// Registers a new stream for `req_id`.
+    /// - Rejects with error if a stream with `req_id` is currently active (and not cancelled),
+    ///   enforcing duplicate-ID rejection.
+    /// - If a prior stream was cancelled or finished, increments generation and assigns a new
+    ///   isolated generation counter, returning the new generation and fresh cancellation token.
+    pub fn register(&mut self, req_id: &str) -> Result<(u64, CancellationToken), String> {
+        if let Some(entry) = self.entries.get(req_id) {
+            if !entry.is_cancelled {
+                return Err(format!(
+                    "An active AI streaming request with ID '{}' is already in progress. Duplicate request IDs are prohibited to prevent stream hijacking.",
+                    req_id
+                ));
+            }
+        }
+
+        self.next_generation += 1;
+        let gen = self.next_generation;
+        let cancel_token = CancellationToken::new();
+
+        self.entries.insert(
+            req_id.to_string(),
+            ActiveStreamEntry {
+                generation: gen,
+                cancel_token: cancel_token.clone(),
+                is_cancelled: false,
+            },
+        );
+
+        Ok((gen, cancel_token))
+    }
+
+    /// Cancels the currently registered stream for `req_id` without premature map removal.
+    /// Returns the cancellation token and the generation that was cancelled.
+    pub fn cancel(&mut self, req_id: &str) -> Option<(u64, CancellationToken)> {
+        if let Some(entry) = self.entries.get_mut(req_id) {
+            entry.is_cancelled = true;
+            entry.cancel_token.cancel();
+            Some((entry.generation, entry.cancel_token.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// Cleans up an active stream entry only if its generation matches the calling stream.
+    /// If an older stream finishes after a newer stream with the same ID was registered,
+    /// this check ensures the older stream never removes the newer stream's entry.
+    pub fn cleanup(&mut self, req_id: &str, generation: u64) -> bool {
+        if let Some(entry) = self.entries.get(req_id) {
+            if entry.generation == generation {
+                self.entries.remove(req_id);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn get_token(&self, req_id: &str) -> Option<CancellationToken> {
+        self.entries.get(req_id).map(|e| e.cancel_token.clone())
+    }
+
+    pub fn is_active(&self, req_id: &str) -> bool {
+        self.entries
+            .get(req_id)
+            .map(|e| !e.is_cancelled)
+            .unwrap_or(false)
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+pub type ActiveAiStreams = Arc<Mutex<StreamRegistry>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StructuredProposal {
@@ -111,18 +205,11 @@ pub async fn ai_stream_prompt(
 
     let gw = app.state::<SharedGateway>().inner().clone();
     let streams_arc = app.state::<ActiveAiStreams>();
-    let cancel_token = CancellationToken::new();
 
-    {
+    let (generation, cancel_token) = {
         let mut streams = streams_arc.lock();
-        if streams.contains_key(&req_id) {
-            return Err(format!(
-                "An active AI streaming request with ID '{}' is already in progress. Duplicate request IDs are prohibited to prevent stream hijacking.",
-                req_id
-            ));
-        }
-        streams.insert(req_id.clone(), cancel_token.clone());
-    }
+        streams.register(&req_id)?
+    };
 
     let req = CompletionRequest {
         prompt: full_prompt,
@@ -197,10 +284,10 @@ pub async fn ai_stream_prompt(
 
     let exec_res = gw.execute_stream(&req, &req_id, tx, cancel_token).await;
 
-    // Clean up active streams map
+    // Clean up active streams map safely using generation check
     {
         let mut streams = streams_arc.lock();
-        streams.remove(&req_id);
+        streams.cleanup(&req_id, generation);
     }
 
     match exec_res {
@@ -226,9 +313,12 @@ pub async fn ai_stream_prompt(
 #[tauri::command]
 pub async fn ai_cancel_stream(app: AppHandle, request_id: String) -> Result<bool, String> {
     let streams_arc = app.state::<ActiveAiStreams>();
-    let mut streams = streams_arc.lock();
-    if let Some(token) = streams.remove(&request_id) {
-        token.cancel();
+    let cancelled = {
+        let mut streams = streams_arc.lock();
+        streams.cancel(&request_id)
+    };
+
+    if let Some((_gen, _token)) = cancelled {
         let _ = app.emit("ai-stream-cancelled", json!({ "request_id": &request_id }));
         info!("Cancelled active AI streaming request: {}", request_id);
         Ok(true)
@@ -374,5 +464,94 @@ mod tests {
 
         let no_conflict = !base_hash.is_empty() && base_hash == original_hash;
         assert!(no_conflict, "No conflict when base hash matches disk hash");
+    }
+
+    #[test]
+    fn test_ai_stream_registry_duplicate_registration_rejected() {
+        let mut registry = StreamRegistry::new();
+        let reg1 = registry.register("req-1");
+        assert!(reg1.is_ok());
+
+        // Second registration while active is rejected
+        let reg2 = registry.register("req-1");
+        assert!(reg2.is_err());
+        assert!(reg2
+            .unwrap_err()
+            .contains("Duplicate request IDs are prohibited"));
+    }
+
+    #[test]
+    fn test_ai_stream_registry_cancellation_preserves_entry_until_cleanup() {
+        let mut registry = StreamRegistry::new();
+        let (gen1, token1) = registry.register("req-cancel").unwrap();
+        assert_eq!(gen1, 1);
+        assert!(!token1.is_cancelled());
+
+        // Cancel stream
+        let cancelled = registry.cancel("req-cancel");
+        assert!(cancelled.is_some());
+        let (c_gen, c_tok) = cancelled.unwrap();
+        assert_eq!(c_gen, 1);
+        assert!(c_tok.is_cancelled());
+        assert!(token1.is_cancelled());
+
+        // Invariant: Cancellation must NOT prematurely delete the entry from the registry!
+        assert_eq!(registry.entry_count(), 1);
+        assert!(!registry.is_active("req-cancel"));
+    }
+
+    #[test]
+    fn test_ai_stream_registry_immediate_reuse_after_cancellation() {
+        let mut registry = StreamRegistry::new();
+        let (gen1, token1) = registry.register("req-reuse").unwrap();
+        assert_eq!(gen1, 1);
+
+        // Stream cancelled by user
+        registry.cancel("req-reuse");
+        assert!(token1.is_cancelled());
+
+        // Immediate reuse of the same request_id succeeds with fresh generation
+        let (gen2, token2) = registry.register("req-reuse").unwrap();
+        assert_eq!(gen2, 2);
+        assert!(
+            !token2.is_cancelled(),
+            "New generation must have a fresh, non-cancelled token"
+        );
+        assert!(registry.is_active("req-reuse"));
+    }
+
+    #[test]
+    fn test_ai_stream_registry_old_stream_completion_does_not_remove_new_generation() {
+        let mut registry = StreamRegistry::new();
+        let (gen1, _token1) = registry.register("req-race").unwrap();
+        assert_eq!(gen1, 1);
+
+        // User cancels gen 1
+        registry.cancel("req-race");
+
+        // Immediate reuse: gen 2 registered while gen 1 is still unwinding
+        let (gen2, token2) = registry.register("req-race").unwrap();
+        assert_eq!(gen2, 2);
+
+        // Old stream (gen 1) finally reaches cleanup block
+        let cleaned_gen1 = registry.cleanup("req-race", 1);
+        assert!(
+            !cleaned_gen1,
+            "Old stream cleanup must NOT remove a newer generation"
+        );
+
+        // Invariant: gen 2 must still be present and cancellable
+        assert_eq!(registry.entry_count(), 1);
+        assert!(registry.is_active("req-race"));
+
+        let cancel_res = registry.cancel("req-race");
+        assert!(cancel_res.is_some());
+        assert_eq!(cancel_res.unwrap().0, 2, "Cancellation must cancel gen 2");
+        assert!(token2.is_cancelled(), "Gen 2 token must be cancelled");
+
+        // Gen 2 finishes and cleans up
+        let cleaned_gen2 = registry.cleanup("req-race", 2);
+        assert!(cleaned_gen2, "Matching generation cleanup must succeed");
+        assert_eq!(registry.entry_count(), 0);
     }
 }

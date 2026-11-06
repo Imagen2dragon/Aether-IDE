@@ -74,10 +74,43 @@ pub struct CheckpointRestoreReport {
     pub backup_checkpoint_id: Option<String>,
 }
 
+type PreReplaceHook = Arc<dyn Fn(&Path) + Send + Sync>;
+
+struct PathLockGuard {
+    set: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    path: PathBuf,
+}
+
+impl PathLockGuard {
+    fn acquire(set: &Arc<Mutex<std::collections::HashSet<PathBuf>>>, path: &Path) -> Result<Self> {
+        let mut guard = set.lock();
+        if guard.contains(path) {
+            return Err(AetherError::PermissionDenied(format!(
+                "Concurrent restore or modification lock active on path '{:?}'",
+                path
+            )));
+        }
+        guard.insert(path.to_path_buf());
+        Ok(Self {
+            set: Arc::clone(set),
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for PathLockGuard {
+    fn drop(&mut self) {
+        let mut guard = self.set.lock();
+        guard.remove(&self.path);
+    }
+}
+
 pub struct CheckpointEngine {
     storage_dir: PathBuf,
     active_previews: Arc<Mutex<HashMap<String, ActivePreviewSession>>>,
     simulate_backup_failure: std::sync::atomic::AtomicBool,
+    active_restore_paths: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    pre_replace_hook: Arc<Mutex<Option<PreReplaceHook>>>,
 }
 
 impl CheckpointEngine {
@@ -88,6 +121,8 @@ impl CheckpointEngine {
             storage_dir: p,
             active_previews: Arc::new(Mutex::new(HashMap::new())),
             simulate_backup_failure: std::sync::atomic::AtomicBool::new(false),
+            active_restore_paths: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            pre_replace_hook: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -95,6 +130,20 @@ impl CheckpointEngine {
     pub fn set_simulate_backup_failure(&self, simulate: bool) {
         self.simulate_backup_failure
             .store(simulate, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn set_pre_replace_hook<F>(&self, hook: Option<F>)
+    where
+        F: Fn(&Path) + Send + Sync + 'static,
+    {
+        let mut guard = self.pre_replace_hook.lock();
+        *guard = hook.map(|h| Arc::new(h) as PreReplaceHook);
+    }
+
+    #[doc(hidden)]
+    pub fn set_storage_dir(&mut self, path: PathBuf) {
+        self.storage_dir = path;
     }
 
     /// Recursively collects source files from a workspace directory, ignoring generated caches.
@@ -724,7 +773,10 @@ impl CheckpointEngine {
         for (record, blob_bytes) in prepared_records {
             let dest_path = canonical_root.join(&record.relative_path);
 
-            // Re-validate disk state immediately before writing this specific file
+            // 1. Acquire in-process path synchronization lock
+            let _path_lock = PathLockGuard::acquire(&self.active_restore_paths, &dest_path)?;
+
+            // 2. Re-validate disk state immediately before writing this specific file
             let recorded_state = session
                 .preview
                 .file_states
@@ -738,8 +790,27 @@ impl CheckpointEngine {
 
             Self::verify_file_disk_state(&dest_path, &record.relative_path, recorded_state)?;
 
-            // Atomic byte-perfect write
-            cap.write_file_bytes_atomic(&record.relative_path, &blob_bytes)?;
+            let expected_hash = match recorded_state {
+                FileDiskState::Present { sha256, .. } => Some(sha256.as_str()),
+                FileDiskState::Missing => None,
+                FileDiskState::Inaccessible { reason } => {
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Restore race detected: file '{}' was inaccessible during preview generation ({}). Restore aborted.",
+                        record.relative_path, reason
+                    )));
+                }
+            };
+
+            let hook_opt = self.pre_replace_hook.lock().clone();
+            let hook_ref = hook_opt.as_ref().map(|h| h.as_ref() as &dyn Fn(&Path));
+
+            // 3. Staged conditional atomic replacement with automatic rollback on detected modifications
+            cap.replace_file_bytes_conditional(
+                &record.relative_path,
+                &blob_bytes,
+                expected_hash,
+                hook_ref,
+            )?;
 
             // Immediate post-write verification
             let dest = canonical_root.join(&record.relative_path);
@@ -1726,6 +1797,156 @@ mod tests {
         // File is now restored to original
         let restored_content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(restored_content, "console.log('original');");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_022_actual_filesystem_failure_during_safety_backup_aborts_without_mutations() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_022_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let file = workspace_dir.join("actual_io_fail.txt");
+        std::fs::write(&file, "initial committed state").unwrap();
+
+        let mut engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("Real I/O test", "ws-real-io", &workspace_dir, None)
+            .unwrap();
+
+        // User makes uncommitted edits on disk
+        std::fs::write(&file, "precious uncommitted edits").unwrap();
+
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-real-io", &workspace_dir)
+            .unwrap();
+
+        // Create an unwritable storage target: a regular file blocking directory creation
+        let blocking_file = temp_dir.join("blocked_storage");
+        std::fs::write(&blocking_file, b"this file blocks directory creation").unwrap();
+        let unwritable_storage_dir = blocking_file.join("sub_checkpoints");
+
+        // Point engine to unwritable storage location to induce an actual OS-level I/O failure
+        engine.set_storage_dir(unwritable_storage_dir);
+
+        let res = engine.restore_checkpoint_with_token(
+            &ckpt.checkpoint_id,
+            "ws-real-io",
+            &workspace_dir,
+            &preview.preview_token,
+            true,
+            &[],
+        );
+
+        // Actual OS filesystem failure during safety backup must abort restore
+        assert!(
+            res.is_err(),
+            "Actual filesystem I/O error must abort restore"
+        );
+        let err_msg = res.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("Mandatory pre-restore safety backup failed"),
+            "Error must identify safety backup failure: {}",
+            err_msg
+        );
+
+        // Crucial invariant: user uncommitted data MUST be completely untouched!
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(
+            content, "precious uncommitted edits",
+            "Target file must not be modified when real storage I/O fails"
+        );
+
+        // Resolve storage failure: point back to valid storage directory
+        engine.set_storage_dir(storage_dir);
+
+        // Generate fresh preview and retry restore
+        let fresh_preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-real-io", &workspace_dir)
+            .unwrap();
+
+        let report = engine
+            .restore_checkpoint_with_token(
+                &ckpt.checkpoint_id,
+                "ws-real-io",
+                &workspace_dir,
+                &fresh_preview.preview_token,
+                true,
+                &[],
+            )
+            .expect("Restore must succeed once storage failure is resolved");
+
+        assert!(report.success);
+        assert!(report.backup_checkpoint_id.is_some());
+
+        // File is now restored to initial snapshot version
+        let restored_content = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(restored_content, "initial committed state");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_023_deterministic_toctou_mutation_between_validation_and_replacement_aborted() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_023_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let target_file = workspace_dir.join("toctou_race_target.txt");
+        std::fs::write(&target_file, "original version 1.0").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("TOCTOU race test", "ws-toctou-race", &workspace_dir, None)
+            .unwrap();
+
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-toctou-race", &workspace_dir)
+            .unwrap();
+
+        // Inject a deterministic hook that mutates the file in the exact interval between validation and replacement!
+        engine.set_pre_replace_hook(Some(|dest: &Path| {
+            if dest.file_name() == Some(std::ffi::OsStr::new("toctou_race_target.txt")) {
+                // Mutate the destination file right before replacement occurs!
+                std::fs::write(dest, "adversarial concurrent write in TOCTOU window").unwrap();
+            }
+        }));
+
+        let res = engine.restore_checkpoint_with_token(
+            &ckpt.checkpoint_id,
+            "ws-toctou-race",
+            &workspace_dir,
+            &preview.preview_token,
+            true,
+            &[],
+        );
+
+        // The staged conditional replacement must detect that the captured file was modified in the TOCTOU window!
+        assert!(
+            res.is_err(),
+            "Restore must abort when target file is modified in TOCTOU window"
+        );
+        let err_msg = res.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("Restore race detected") && err_msg.contains("prior to replacement"),
+            "Error must identify TOCTOU race detection: {}",
+            err_msg
+        );
+
+        // Crucial invariant: the rollback MUST restore the concurrent modification intact!
+        let surviving_content = std::fs::read_to_string(&target_file).unwrap();
+        assert_eq!(
+            surviving_content, "adversarial concurrent write in TOCTOU window",
+            "Concurrent modification in TOCTOU window must NOT be silently overwritten!"
+        );
+
+        // Clear hook
+        engine.set_pre_replace_hook::<fn(&Path)>(None);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

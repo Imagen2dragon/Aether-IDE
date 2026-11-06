@@ -100,16 +100,26 @@ Checkpoints record raw binary bytes. Lossy conversions (`String::from_utf8_lossy
 - By default, restoration aborts on unresolved conflicts (`PermissionDenied`) unless the user explicitly authorizes them via `force: true` or `explicit_overwrite_conflicts`.
 - Legacy un-tokenized restoration methods (`restore_checkpoint` and `restore_checkpoint_into`) are deprecated and strictly reject all invocations with `PermissionDenied`, eliminating any bypass of preview token validation.
 
-### 5.3 Immediate Per-File TOCTOU Race Condition Defense
-To completely close the Time-of-Check to Time-of-Use (TOCTOU) race condition window between preview generation and restoration:
+### 5.3 Staged-Swap Conditional Replacement & TOCTOU Defense
+To close the Time-of-Check to Time-of-Use (TOCTOU) race condition window between preview generation and restoration across Windows, Linux, and macOS:
 1. **In-Memory Blob Preflight:** All checkpoint blobs are pre-verified and loaded into memory before touching disk, preventing partial restoration due to mid-flight blob corruption or missing files.
-2. **Immediate Per-File Revalidation:** Immediately before overwriting or creating each file, `CheckpointEngine::verify_file_disk_state` inspects the destination path with `symlink_metadata`:
+2. **In-Process Path Synchronization:** `CheckpointEngine` synchronizes restoration across concurrent threads using an internal `active_restore_paths` set guarded by RAII `PathLockGuard`. Attempting to restore to a path currently undergoing an active restore immediately rejects the concurrent operation fail-closed.
+3. **Immediate Per-File Pre-Flight Revalidation:** Immediately before replacement, `CheckpointEngine::verify_file_disk_state` inspects the destination path with `symlink_metadata`:
    - Distinguishes `ErrorKind::NotFound` from `ErrorKind::PermissionDenied` and other I/O errors fail-closed.
    - Rejects the restoration if the file was modified, deleted, newly created, or replaced with a symlink or directory after preview generation.
-3. **Atomic Writes & Post-Write Verification:** Writes use `cap.write_file_bytes_atomic` and immediately verify that the on-disk SHA-256 digest matches the checkpoint manifest.
+4. **Conditional Replacement with Staged-Swap & Rollback (`replace_file_bytes_conditional`):**
+   - **For Missing Files:** Utilizes OS-level atomic exclusive creation (`create_new(true)` on Windows and `O_CREAT | O_EXCL` on POSIX). If an unrecorded file was created on disk after preview generation, the OS rejects file creation immediately.
+   - **For Present Files:** Writes incoming data to a temporary stage file `.aether-stage.<uuid>`, atomically renames the destination file to `.aether-backup.<uuid>`, verifies the SHA-256 hash of `.aether-backup`, commits the stage file to the destination, and purges the backup.
+   - **Automatic Rollback:** If the destination file was mutated between the pre-flight check and replacement, the hash check of the backup fails. The engine immediately rolls `.aether-backup` back to the destination path, preserving the concurrent user modifications intact, and returns `PermissionDenied`.
+
+#### 5.3.1 Residual Threat Model & OS Platform Invariants
+Neither POSIX (`rename`) nor Windows Win32 (`MoveFileExW`) provides an atomic kernel-level syscall of the form `rename_if_source_hash_matches(from, to, expected_hash)`. Consequently:
+- **Residual Microsecond Window:** Between the atomic destination-to-backup rename and the final stage-to-destination commit, external non-cooperating processes outside the IDE process boundary could attempt concurrent I/O.
+- **Rollback Guarantee:** If any error or digest mismatch occurs during the swap, the engine initiates synchronous atomic rollback from `.aether-backup` to restore the pre-existing disk state before surfacing an error to the user.
+- **Symlink Protection:** Directory and file traversals are guarded by `WorkspaceCapability` path verification, preventing symlink escapes or directory clobbering.
 
 ### 5.4 Mandatory Pre-Restore Safety Snapshots
-Before applying any file modifications during restore, `CheckpointEngine::restore_checkpoint_with_token` automatically creates a mandatory safety checkpoint snapshot of the current workspace state. If snapshot generation fails, restoration immediately aborts fail-closed, leaving all workspace files completely untouched.
+Before applying any file modifications during restore, `CheckpointEngine::restore_checkpoint_with_token` automatically creates a mandatory safety checkpoint snapshot of the current workspace state. If snapshot generation fails for any reason (including actual OS filesystem permission errors or disk I/O failures), restoration immediately aborts fail-closed, leaving all workspace files completely untouched. Clean retry is supported once filesystem permissions or storage directories are corrected.
 
 ---
 
@@ -126,5 +136,8 @@ When a user clicks "Stop" or cancels an active stream (`ai_cancel_stream`):
 - Stalled HTTP error body reads (`resp.text()`) and connection establishments are bound to cancellation via `tokio::select!`, preventing un-cancellable blocking on unresponsive upstreams.
 - The underlying `reqwest` HTTP response byte stream is dropped, terminating the TCP/TLS connection to the provider and saving user API tokens.
 
-### 6.3 Stream Identifier Uniqueness
-In desktop `ai_stream_prompt`, incoming `request_id` values are checked against active streams. Duplicate request IDs are rejected fail-closed, preventing stream hijacking or premature cancellation token deletion.
+### 6.3 Stream Registry Lifecycle & Monotonic Generation Tracking
+In desktop `ai_stream_prompt`, active streams are managed by `StreamRegistry`:
+- **Duplicate Request Rejection:** Active, non-cancelled requests strictly reject duplicate IDs fail-closed.
+- **Immediate Reuse via Generations:** When a user cancels a stream and immediately resubmits using the same `request_id`, `StreamRegistry::register` allocates a monotonically increasing `generation: u64` counter and issues a fresh, un-cancelled `CancellationToken`.
+- **Race-Free Cleanup:** When the previous asynchronous stream task terminates and invokes `cleanup(request_id, generation)`, it only removes the registry entry if its generation matches. Stale completions from earlier cancelled streams cannot prematurely delete or invalidate the active token of a newer generation.

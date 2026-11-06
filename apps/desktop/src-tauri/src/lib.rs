@@ -50,7 +50,7 @@ pub fn run() {
 
             // 5. Streams, Storage Candidates & Build Tracking
             let active_streams: commands::ai::ActiveAiStreams =
-                Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+                Arc::new(parking_lot::Mutex::new(commands::ai::StreamRegistry::new()));
             let storage_candidates: commands::storage::SharedStorageCandidates =
                 Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
             let active_builds: commands::build::SharedActiveBuilds =

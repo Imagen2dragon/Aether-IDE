@@ -305,6 +305,187 @@ impl WorkspaceCapability {
         Ok(self.root_path.join(rel))
     }
 
+    /// Writes raw binary bytes to a file inside the capability using atomic handle-level operations
+    /// with strict conditional replacement semantics.
+    ///
+    /// If `expected_hash` is `None` (expected Missing):
+    /// - Performs an exclusive creation (`create_new(true)`) anchored to capability.
+    /// - If the target was created concurrently on disk, the OS kernel atomically aborts with
+    ///   `AlreadyExists`, completely closing any creation race.
+    ///
+    /// If `expected_hash` is `Some(hash)` (expected Present):
+    /// 1. Prepares the replacement bytes in `.aether-stage-<uuid>` and syncs to disk.
+    /// 2. If `pre_replace_hook` is provided, executes it (for deterministic adversarial test injection).
+    /// 3. Atomically moves the existing target to `.aether-backup-<uuid>`.
+    /// 4. Inspects the captured backup file: asserts it is a regular file (not symlink) and verifies its SHA-256 hash.
+    ///    - If the hash DOES NOT MATCH `expected_hash` (concurrent modification occurred):
+    ///      Atomically rolls back `.aether-backup-<uuid>` to the target path, removes `.aether-stage-<uuid>`,
+    ///      and returns `AetherError::PermissionDenied`. The concurrent modification is preserved intact.
+    ///    - If the hash MATCHES:
+    ///      Atomically moves `.aether-stage-<uuid>` to the target path and removes `.aether-backup-<uuid>`.
+    pub fn replace_file_bytes_conditional(
+        &self,
+        user_path: &str,
+        bytes: &[u8],
+        expected_hash: Option<&str>,
+        pre_replace_hook: Option<&dyn Fn(&Path)>,
+    ) -> Result<PathBuf> {
+        let rel = sanitize_relative_path(user_path)?;
+
+        if let Some(parent) = rel.parent() {
+            if !parent.as_os_str().is_empty() {
+                self.dir.create_dir_all(parent).map_err(AetherError::Io)?;
+            }
+        }
+
+        let dest_abs = self.root_path.join(&rel);
+
+        if expected_hash.is_none() {
+            if let Some(hook) = pre_replace_hook {
+                hook(&dest_abs);
+            }
+
+            // Expected Missing: atomic exclusive creation
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+
+            match self.dir.open_with(&rel, &opts) {
+                Ok(mut f) => {
+                    f.write_all(bytes).map_err(AetherError::Io)?;
+                    f.sync_all().map_err(AetherError::Io)?;
+                    return Ok(dest_abs);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Restore race detected: target file '{}' was newly created on disk before replacement. Restore aborted.",
+                        user_path
+                    )));
+                }
+                Err(e) => return Err(AetherError::Io(e)),
+            }
+        }
+
+        let expected = expected_hash.unwrap();
+
+        // 1. Prepare staged replacement file
+        let stage_name = format!(".aether-stage-{}", uuid::Uuid::new_v4().simple());
+        let stage_rel = if let Some(parent) = rel.parent() {
+            parent.join(&stage_name)
+        } else {
+            PathBuf::from(&stage_name)
+        };
+
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+
+        let mut f = self
+            .dir
+            .open_with(&stage_rel, &opts)
+            .map_err(AetherError::Io)?;
+        f.write_all(bytes).map_err(AetherError::Io)?;
+        f.sync_all().map_err(AetherError::Io)?;
+        drop(f);
+
+        // 2. Invoke pre_replace_hook if configured (deterministic test injection)
+        if let Some(hook) = pre_replace_hook {
+            hook(&dest_abs);
+        }
+
+        // 3. Staged move of target to backup
+        let backup_name = format!(".aether-backup-{}", uuid::Uuid::new_v4().simple());
+        let backup_rel = if let Some(parent) = rel.parent() {
+            parent.join(&backup_name)
+        } else {
+            PathBuf::from(&backup_name)
+        };
+
+        if let Err(e) = self.dir.rename(&rel, &self.dir, &backup_rel) {
+            let _ = self.dir.remove_file(&stage_rel);
+            return Err(AetherError::PermissionDenied(format!(
+                "Restore race detected: target file '{}' could not be staged for verification ({}). Restore aborted.",
+                user_path, e
+            )));
+        }
+
+        // 4. Verify captured backup file
+        let backup_meta = match self.dir.symlink_metadata(&backup_rel) {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = self.dir.rename(&backup_rel, &self.dir, &rel);
+                let _ = self.dir.remove_file(&stage_rel);
+                return Err(AetherError::PermissionDenied(format!(
+                    "Restore race detected: target file '{}' metadata inspection failed ({}). Rolled back.",
+                    user_path, e
+                )));
+            }
+        };
+
+        if backup_meta.is_symlink() || !backup_meta.is_file() {
+            let _ = self.dir.rename(&backup_rel, &self.dir, &rel);
+            let _ = self.dir.remove_file(&stage_rel);
+            return Err(AetherError::PermissionDenied(format!(
+                "Restore race detected: target file '{}' is a symlink or non-regular file. Rolled back.",
+                user_path
+            )));
+        }
+
+        let mut backup_file = match self.dir.open(&backup_rel) {
+            Ok(bf) => bf,
+            Err(e) => {
+                let _ = self.dir.rename(&backup_rel, &self.dir, &rel);
+                let _ = self.dir.remove_file(&stage_rel);
+                return Err(AetherError::PermissionDenied(format!(
+                    "Restore race detected: target file '{}' could not be opened for verification ({}). Rolled back.",
+                    user_path, e
+                )));
+            }
+        };
+
+        let mut current_bytes = Vec::new();
+        if let Err(e) = backup_file.read_to_end(&mut current_bytes) {
+            drop(backup_file);
+            let _ = self.dir.rename(&backup_rel, &self.dir, &rel);
+            let _ = self.dir.remove_file(&stage_rel);
+            return Err(AetherError::PermissionDenied(format!(
+                "Restore race detected: target file '{}' could not be read ({}). Rolled back.",
+                user_path, e
+            )));
+        }
+        drop(backup_file);
+
+        let current_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&current_bytes);
+            format!("{:x}", hasher.finalize())
+        };
+
+        if current_hash != expected {
+            // Concurrent modification detected! Roll back immediately.
+            let _ = self.dir.rename(&backup_rel, &self.dir, &rel);
+            let _ = self.dir.remove_file(&stage_rel);
+            return Err(AetherError::PermissionDenied(format!(
+                "Restore race detected: file '{}' was modified on disk prior to replacement (Expected: {}, Found: {}). Restore aborted, target rolled back.",
+                user_path, expected, current_hash
+            )));
+        }
+
+        // Hash matches! Commit replacement: move stage to target
+        if let Err(e) = self.dir.rename(&stage_rel, &self.dir, &rel) {
+            let _ = self.dir.rename(&backup_rel, &self.dir, &rel);
+            let _ = self.dir.remove_file(&stage_rel);
+            return Err(AetherError::Internal(format!(
+                "Failed to commit replacement file for '{}': {}. Target rolled back.",
+                user_path, e
+            )));
+        }
+
+        // Cleanup backup file
+        let _ = self.dir.remove_file(&backup_rel);
+
+        Ok(dest_abs)
+    }
+
     /// Writes content to a file inside the capability using atomic handle-level operations.
     pub fn write_file_atomic(&self, user_path: &str, content: &str) -> Result<PathBuf> {
         self.write_file_bytes_atomic(user_path, content.as_bytes())
@@ -887,6 +1068,79 @@ mod tests {
             .any(|f| f.to_string_lossy().contains(".git")));
         assert!(report.is_complete);
         assert_eq!(report.permission_errors.len(), 0);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_replace_file_bytes_conditional_missing_and_present() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_fs_conditional_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        // 1. Missing file creation succeeds when truly missing
+        let res_missing =
+            cap.replace_file_bytes_conditional("new_file.txt", b"initial content", None, None);
+        assert!(res_missing.is_ok());
+        assert_eq!(
+            fs::read_to_string(temp_dir.join("new_file.txt")).unwrap(),
+            "initial content"
+        );
+
+        // 2. Missing file creation fails atomically when file already exists
+        let res_exists =
+            cap.replace_file_bytes_conditional("new_file.txt", b"should not overwrite", None, None);
+        assert!(res_exists.is_err());
+        assert!(matches!(
+            res_exists.err().unwrap(),
+            AetherError::PermissionDenied(_)
+        ));
+        assert_eq!(
+            fs::read_to_string(temp_dir.join("new_file.txt")).unwrap(),
+            "initial content"
+        );
+
+        // Compute hash of "initial content"
+        let initial_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(b"initial content");
+            format!("{:x}", hasher.finalize())
+        };
+
+        // 3. Conditional replacement succeeds when hash matches
+        let res_match = cap.replace_file_bytes_conditional(
+            "new_file.txt",
+            b"updated version 2",
+            Some(&initial_hash),
+            None,
+        );
+        assert!(res_match.is_ok());
+        assert_eq!(
+            fs::read_to_string(temp_dir.join("new_file.txt")).unwrap(),
+            "updated version 2"
+        );
+
+        // 4. Conditional replacement detects mismatch and rolls back without data loss
+        let res_mismatch = cap.replace_file_bytes_conditional(
+            "new_file.txt",
+            b"overwritten version 3",
+            Some("wrong_hash_deadbeef"),
+            None,
+        );
+        assert!(res_mismatch.is_err());
+        assert!(matches!(
+            res_mismatch.err().unwrap(),
+            AetherError::PermissionDenied(_)
+        ));
+        // Data rolled back and intact!
+        assert_eq!(
+            fs::read_to_string(temp_dir.join("new_file.txt")).unwrap(),
+            "updated version 2"
+        );
 
         let _ = fs::remove_dir_all(temp_dir);
     }

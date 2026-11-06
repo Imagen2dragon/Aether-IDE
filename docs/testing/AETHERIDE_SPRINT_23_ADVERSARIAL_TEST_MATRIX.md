@@ -47,6 +47,8 @@ This matrix establishes the comprehensive test results and security validations 
 | **CHK-019** | Checkpoints | Missing-state handling strictly checks NotFound and rejects Inaccessible/existing objects | `checkpoint-engine/src/lib.rs` | `test_chk_019_missing_state_rejects_inaccessible_and_non_notfound` | **PASS** |
 | **CHK-020** | Checkpoints | Preview token binding mismatches rejected; concurrent race allows exactly 1 consumer | `checkpoint-engine/src/lib.rs` | `test_chk_020_token_binding_mismatches_and_concurrency` | **PASS** |
 | **CHK-021** | Checkpoints | Simulated backup failure halts restore with zero mutations, retries cleanly with fresh preview | `checkpoint-engine/src/lib.rs` | `test_chk_021_mandatory_safety_snapshot_failure_aborts_without_mutations` | **PASS** |
+| **CHK-022** | Checkpoints | Actual OS filesystem I/O failure during safety snapshot aborts with zero mutations and permits clean retry | `checkpoint-engine/src/lib.rs` | `test_chk_022_actual_filesystem_failure_during_safety_backup_aborts_without_mutations` | **PASS** |
+| **CHK-023** | Checkpoints | Deterministic TOCTOU race mutation between validation and atomic swap triggers automatic rollback preserving concurrent edit | `checkpoint-engine/src/lib.rs` | `test_chk_023_deterministic_toctou_mutation_between_validation_and_replacement_aborted` | **PASS** |
 | **AI-001** | AI Streaming | Fake streaming fallback eliminated; unsupported providers fail closed | `model-gateway/src/lib.rs` | `test_fake_streaming_eliminated_unsupported_provider_fails_closed` | **PASS** |
 | **AI-002** | AI Streaming | Cancellation token halts stream immediately and drops HTTP connection | `model-gateway/src/lib.rs` | `test_cancellation_aborts_stream_immediately` | **PASS** |
 | **AI-003** | AI Streaming | Genuine SSE streaming implemented for OpenAI-compatible providers | `model-gateway/src/lib.rs` | `stream_openai_compatible` | **PASS** |
@@ -54,11 +56,15 @@ This matrix establishes the comprehensive test results and security validations 
 | **AI-005** | AI Streaming | Genuine SSE streaming implemented for Google Gemini (`candidates/.../text`) | `model-gateway/src/lib.rs` | `stream_gemini` | **PASS** |
 | **AI-006** | AI Streaming | Cancellation token aborts stalled HTTP response read via `tokio::select!` | `model-gateway/src/lib.rs` | `test_ai_006_cancellation_while_http_response_is_stalled` | **PASS** |
 | **AI-007** | AI Streaming | Cancellation token aborts stalled connection establishment via `tokio::select!` | `model-gateway/src/lib.rs` | `test_ai_007_cancellation_during_connection_establishment` | **PASS** |
-| **AI-008** | AI Streaming | Duplicate request IDs rejected in desktop stream map, preventing stream hijacking | `apps/desktop/src-tauri/src/commands/ai.rs` | `commands::ai::ai_stream_prompt` | **PASS** |
+| **AI-008** | AI Streaming | Duplicate request IDs rejected in desktop stream map, preventing stream hijacking | `apps/desktop/src-tauri/src/commands/ai.rs` | `test_ai_stream_registry_duplicate_registration_rejected` | **PASS** |
 | **AI-009** | AI Streaming | Cancellation during error response body read interrupts stalled HTTP connection | `model-gateway/src/lib.rs` | `test_ai_009_cancellation_during_error_response_body_read` | **PASS** |
 | **AI-010** | AI Streaming | Anthropic provider error body read cancellation interruption | `model-gateway/src/lib.rs` | `test_ai_010_provider_cancellation_anthropic` | **PASS** |
 | **AI-011** | AI Streaming | Gemini provider error body read cancellation interruption | `model-gateway/src/lib.rs` | `test_ai_011_provider_cancellation_gemini` | **PASS** |
 | **AI-012** | AI Streaming | Ollama provider error body read cancellation interruption | `model-gateway/src/lib.rs` | `test_ai_012_provider_cancellation_ollama` | **PASS** |
+| **AI-013** | AI Streaming | Stream registry duplicate registration fails closed with descriptive error | `apps/desktop/src-tauri/src/commands/ai.rs` | `test_ai_stream_registry_duplicate_registration_rejected` | **PASS** |
+| **AI-014** | AI Streaming | Stream cancellation marks entry as cancelled while preserving registration until cleanup | `apps/desktop/src-tauri/src/commands/ai.rs` | `test_ai_stream_registry_cancellation_preserves_entry_until_cleanup` | **PASS** |
+| **AI-015** | AI Streaming | Immediate reuse of request ID post-cancellation increments generation counter | `apps/desktop/src-tauri/src/commands/ai.rs` | `test_ai_stream_registry_immediate_reuse_after_cancellation` | **PASS** |
+| **AI-016** | AI Streaming | Stale/old stream cleanup does not remove or cancel newer generation streams | `apps/desktop/src-tauri/src/commands/ai.rs` | `test_ai_stream_registry_old_stream_completion_does_not_remove_new_generation` | **PASS** |
 | **E2E-001** | Product E2E | End-to-end product lifecycle in disposable git repository | `aether-daemon/tests/e2e_full_product_test.rs` | `test_e2e_full_product_lifecycle_disposable_project` | **PASS** |
 | **E2E-002** | Multi-Agent | Swarm DAG scheduling, cycle rejection, and three-way merge resolution | `agent-orchestrator/tests/swarm_execution_test.rs` | `test_multi_agent_dag_scheduling_and_lifecycle` | **PASS** |
 | **E2E-003** | Release Packaging | Tauri 2 desktop app compiles and builds production release installer | `apps/desktop` | `npm run tauri build` | **PASS** |
@@ -84,9 +90,12 @@ Binary files (e.g. PNG files containing `0x89 0x50 0x4E 0x47` and arbitrary byte
 - Zero conversion to UTF-8 replacement characters (`U+FFFD`).
 - SHA-256 digest match before snapshot and after restore.
 - Race conditions caused by concurrent modifications between preview and restore are trapped and rejected with `PermissionDenied`.
+- Pre-replace hooks inject deterministic concurrent mutations immediately before atomic replacement (`test_chk_023`), proving that the staged-swap strategy verifies backup digests and automatically rolls back concurrent edits intact.
+- Actual OS filesystem failures during safety snapshot creation (`test_chk_022`) abort restore fail-closed, leaving all workspace files untouched and allowing retry.
 
 ### 3.4 Model Gateway Streaming
 The previous default trait implementation of `ModelProvider::stream_completion` which silently called `complete()` and returned a single fake chunk was eliminated. Tests confirm:
 - Providers that do not implement streaming explicitly fail with a descriptive `AetherError::ModelProvider`.
 - Pre-cancelled requests abort without network socket initialization.
 - In-flight cancellations break stream loops and drop response handles.
+- `StreamRegistry` manages stream lifecycles via monotonic generation counters, ensuring out-of-order completions from earlier cancelled streams never purge or cancel active tokens of newer generation streams.
