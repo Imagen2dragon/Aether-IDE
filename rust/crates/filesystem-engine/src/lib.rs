@@ -233,6 +233,9 @@ pub struct ConditionalDeleteOutcome {
 pub struct ConditionalDeleteHooks<'a> {
     /// Injected after moving target to staging and before hash verification.
     pub pre_delete_hook: Option<&'a (dyn Fn(&Path) + 'a)>,
+    /// Injected after hash verification and immediately before removal.
+    /// Simulates concurrent writes through pre-existing open writable handles.
+    pub post_hash_hook: Option<&'a (dyn Fn(&Path) + 'a)>,
     /// Injected fault: simulate I/O error during deletion removal.
     pub fault_inject_delete_removal: bool,
     /// Injected fault: simulate failure during rollback rename.
@@ -866,6 +869,45 @@ impl WorkspaceCapability {
         self.dir.remove_file(&rel).map_err(AetherError::Io)
     }
 
+    fn preserve_staged_deletion_conflict(
+        dir: &Dir,
+        root_path: &Path,
+        stage_rel: &Path,
+        rel: &Path,
+        user_path: &str,
+    ) -> PathBuf {
+        let conflict_name = format!(
+            "{}.aether-del-conflict-{}",
+            user_path,
+            uuid::Uuid::new_v4().simple()
+        );
+        let conflict_rel = if let Some(parent) = rel.parent() {
+            parent.join(&conflict_name)
+        } else {
+            PathBuf::from(&conflict_name)
+        };
+
+        let surviving = match dir.rename(stage_rel, dir, &conflict_rel) {
+            Ok(()) => root_path.join(&conflict_rel),
+            Err(e) => {
+                warn!(
+                    "Failed to rename staged conflict '{}' to '{}' ({}). Preserved at original stage path.",
+                    stage_rel.display(),
+                    conflict_rel.display(),
+                    e
+                );
+                root_path.join(stage_rel)
+            }
+        };
+
+        warn!(
+            "Conditional deletion conflict for '{}': preserved at '{}'.",
+            user_path,
+            surviving.display()
+        );
+        surviving
+    }
+
     /// Conditionally deletes a file inside workspace capability using staged verification.
     /// Safely moves the target file to staging, verifies its content digest matches `expected_hash`,
     /// catches open-handle modifications via pre-delete hooks, and only unlinks if verified.
@@ -931,7 +973,7 @@ impl WorkspaceCapability {
             Ok(h != expected_hash)
         })();
 
-        let is_modified_or_unverified = match stage_check_result {
+        let mut is_modified_or_unverified = match stage_check_result {
             Ok(is_modified) => is_modified,
             Err(e) => {
                 warn!(
@@ -942,42 +984,92 @@ impl WorkspaceCapability {
             }
         };
 
-        if is_modified_or_unverified {
-            // Concurrent modification detected! DO NOT DELETE!
-            // Roll back: restore to target destination (or conflict name if target was recreated)
-            let rb_res = if hooks.fault_inject_rollback_failure {
-                Err(std::io::Error::other("Injected deletion rollback failure"))
-            } else {
-                self.dir.rename(&stage_rel, &self.dir, &rel)
-            };
+        // 5. Post-hash hook: simulates concurrent modification via pre-existing open writable handle
+        // after initial hash verification but before attempted removal
+        if !is_modified_or_unverified {
+            if let Some(hook) = hooks.post_hash_hook {
+                hook(&self.root_path.join(&stage_rel));
+                // Re-verify after post_hash_hook to detect open-handle mutations
+                let post_check: std::io::Result<bool> = (|| {
+                    let mut f = self.dir.open(&stage_rel)?;
+                    let mut b = Vec::new();
+                    f.read_to_end(&mut b)?;
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::new();
+                    hasher.update(&b);
+                    let h = format!("{:x}", hasher.finalize());
+                    Ok(h != expected_hash)
+                })();
 
-            let surviving = match rb_res {
-                Ok(()) => {
+                if post_check.unwrap_or(true) {
                     warn!(
-                        "Conditional deletion aborted for '{}': concurrent modification detected. Preserved at '{}'.",
-                        user_path, dest_abs.display()
+                        "Post-hash verification detected open-handle mutation on '{}'. Aborting deletion to protect data.",
+                        user_path
                     );
-                    dest_abs
+                    is_modified_or_unverified = true;
                 }
-                Err(rb_err) => {
-                    let conflict_name = format!(
-                        "{}.aether-conflict-{}",
-                        user_path,
-                        uuid::Uuid::new_v4().simple()
-                    );
-                    let conflict_rel = PathBuf::from(&conflict_name);
-                    let surviving_path = match self.dir.rename(&stage_rel, &self.dir, &conflict_rel)
-                    {
-                        Ok(()) => self.root_path.join(&conflict_rel),
-                        Err(_) => self.root_path.join(&stage_rel),
-                    };
-                    warn!(
-                        "Conditional deletion rollback failed ({}) for '{}'. Preserved at '{}'.",
-                        rb_err,
-                        user_path,
-                        surviving_path.display()
-                    );
-                    surviving_path
+            }
+        }
+
+        if is_modified_or_unverified {
+            // Concurrent modification or open-handle mutation detected! DO NOT DELETE!
+            // First check if destination was recreated concurrently
+            let dest_recreated = self.dir.symlink_metadata(&rel).is_ok();
+
+            let surviving = if dest_recreated || hooks.fault_inject_rollback_failure {
+                // Destination exists or rollback failure injected: preserve under conflict path!
+                // NEVER overwrite the concurrently recreated destination!
+                Self::preserve_staged_deletion_conflict(
+                    &self.dir,
+                    &self.root_path,
+                    &stage_rel,
+                    &rel,
+                    user_path,
+                )
+            } else {
+                // Destination does not exist: attempt atomic no-overwrite rollback
+                let link_res = self.dir.hard_link(&stage_rel, &self.dir, &rel);
+                match link_res {
+                    Ok(()) => {
+                        let _ = self.dir.remove_file(&stage_rel);
+                        warn!(
+                            "Conditional deletion aborted for '{}': concurrent modification detected. Restored to destination '{}'.",
+                            user_path,
+                            dest_abs.display()
+                        );
+                        dest_abs
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        Self::preserve_staged_deletion_conflict(
+                            &self.dir,
+                            &self.root_path,
+                            &stage_rel,
+                            &rel,
+                            user_path,
+                        )
+                    }
+                    Err(_) => {
+                        if self.dir.symlink_metadata(&rel).is_ok() {
+                            Self::preserve_staged_deletion_conflict(
+                                &self.dir,
+                                &self.root_path,
+                                &stage_rel,
+                                &rel,
+                                user_path,
+                            )
+                        } else {
+                            match self.dir.rename(&stage_rel, &self.dir, &rel) {
+                                Ok(()) => dest_abs,
+                                Err(_) => Self::preserve_staged_deletion_conflict(
+                                    &self.dir,
+                                    &self.root_path,
+                                    &stage_rel,
+                                    &rel,
+                                    user_path,
+                                ),
+                            }
+                        }
+                    }
                 }
             };
 
@@ -987,7 +1079,7 @@ impl WorkspaceCapability {
             });
         }
 
-        // 5. Cleanup: unlink verified stage file
+        // 6. Cleanup: unlink verified stage file
         let remove_res = if hooks.fault_inject_delete_removal {
             Err(std::io::Error::other("Injected delete removal failure"))
         } else {
@@ -1000,9 +1092,15 @@ impl WorkspaceCapability {
                 surviving_path: None,
             }),
             Err(rm_err) => {
-                let surviving = self.root_path.join(&stage_rel);
+                let surviving = Self::preserve_staged_deletion_conflict(
+                    &self.dir,
+                    &self.root_path,
+                    &stage_rel,
+                    &rel,
+                    user_path,
+                );
                 warn!(
-                    "Stage cleanup failed ({}) for '{}'. Preserved at '{}'.",
+                    "Stage cleanup failed ({}) for '{}'. Preserved as conflict at '{}'.",
                     rm_err,
                     user_path,
                     surviving.display()
@@ -2202,6 +2300,115 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&file_path).unwrap(),
             "concurrent edit while in deletion staging!"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_delete_file_conditional_post_hash_mutation_preserves_conflict() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_del_post_hash_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("open_handle.txt");
+        fs::write(&file_path, "clean base state").unwrap();
+
+        let initial_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(b"clean base state");
+            format!("{:x}", hasher.finalize())
+        };
+
+        // post_hash_hook modifies the file after initial hash check
+        let post_hook = |staged_path: &Path| {
+            fs::write(staged_path, "mutation via open handle after hash check!").unwrap();
+        };
+
+        let hooks = ConditionalDeleteHooks {
+            post_hash_hook: Some(&post_hook),
+            ..Default::default()
+        };
+
+        let outcome = cap
+            .delete_file_conditional_with_hooks("open_handle.txt", &initial_hash, hooks)
+            .unwrap();
+        assert!(
+            !outcome.was_deleted,
+            "Must not delete file modified after hash check!"
+        );
+        assert!(outcome.surviving_path.is_some());
+        let surviving = outcome.surviving_path.unwrap();
+        assert!(surviving.exists(), "Surviving file must exist on disk!");
+        assert_eq!(
+            fs::read_to_string(&surviving).unwrap(),
+            "mutation via open handle after hash check!"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_delete_file_conditional_recreated_dest_preserves_both() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_del_recreated_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("target.txt");
+        fs::write(&file_path, "staged original content").unwrap();
+
+        let initial_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(b"staged original content");
+            format!("{:x}", hasher.finalize())
+        };
+
+        // pre_delete_hook modifies staged file AND concurrently recreates destination!
+        let dest_clone = file_path.clone();
+        let pre_hook = move |staged_path: &Path| {
+            fs::write(staged_path, "staged file mutated").unwrap();
+            fs::write(&dest_clone, "concurrently recreated destination payload").unwrap();
+        };
+
+        let hooks = ConditionalDeleteHooks {
+            pre_delete_hook: Some(&pre_hook),
+            ..Default::default()
+        };
+
+        let outcome = cap
+            .delete_file_conditional_with_hooks("target.txt", &initial_hash, hooks)
+            .unwrap();
+
+        assert!(!outcome.was_deleted);
+        assert!(outcome.surviving_path.is_some());
+        let conflict_path = outcome.surviving_path.unwrap();
+
+        // 1. Concurrently recreated destination MUST survive with its new payload untouched!
+        assert!(file_path.exists());
+        assert_eq!(
+            fs::read_to_string(&file_path).unwrap(),
+            "concurrently recreated destination payload",
+            "Destination MUST NOT be overwritten!"
+        );
+
+        // 2. Staged recovery artifact MUST survive under conflict path!
+        assert!(conflict_path.exists());
+        assert_ne!(
+            conflict_path, file_path,
+            "Conflict path must not equal destination path!"
+        );
+        assert_eq!(
+            fs::read_to_string(&conflict_path).unwrap(),
+            "staged file mutated",
+            "Staged artifact must be preserved under conflict path!"
         );
 
         let _ = fs::remove_dir_all(temp_dir);

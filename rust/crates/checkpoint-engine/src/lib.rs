@@ -131,6 +131,7 @@ pub struct CheckpointEngine {
     fault_inject_post_write_verification: std::sync::atomic::AtomicBool,
     fault_inject_compensation_write: std::sync::atomic::AtomicBool,
     pre_delete_hook: Arc<Mutex<Option<PreReplaceHook>>>,
+    post_hash_delete_hook: Arc<Mutex<Option<PreReplaceHook>>>,
     fault_inject_metadata_failure: std::sync::atomic::AtomicBool,
     fault_inject_delete_removal: std::sync::atomic::AtomicBool,
     fault_inject_backup_removal: std::sync::atomic::AtomicBool,
@@ -151,6 +152,7 @@ impl CheckpointEngine {
             fault_inject_post_write_verification: std::sync::atomic::AtomicBool::new(false),
             fault_inject_compensation_write: std::sync::atomic::AtomicBool::new(false),
             pre_delete_hook: Arc::new(Mutex::new(None)),
+            post_hash_delete_hook: Arc::new(Mutex::new(None)),
             fault_inject_metadata_failure: std::sync::atomic::AtomicBool::new(false),
             fault_inject_delete_removal: std::sync::atomic::AtomicBool::new(false),
             fault_inject_backup_removal: std::sync::atomic::AtomicBool::new(false),
@@ -208,6 +210,15 @@ impl CheckpointEngine {
         F: Fn(&Path) + Send + Sync + 'static,
     {
         let mut guard = self.pre_delete_hook.lock();
+        *guard = hook.map(|h| Arc::new(h) as PreReplaceHook);
+    }
+
+    #[doc(hidden)]
+    pub fn set_post_hash_delete_hook<F>(&self, hook: Option<F>)
+    where
+        F: Fn(&Path) + Send + Sync + 'static,
+    {
+        let mut guard = self.post_hash_delete_hook.lock();
         *guard = hook.map(|h| Arc::new(h) as PreReplaceHook);
     }
 
@@ -1048,21 +1059,47 @@ impl CheckpointEngine {
 
             match meta_res {
                 Err(AetherError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Confirmed absent on disk
+                    // Confirmed absent on disk at inspection time
                     if let Some(backup_rec) = in_backup {
                         let blob_file = backup_blobs_dir.join(&backup_rec.sha256);
                         match std::fs::read(&blob_file) {
                             Ok(orig_bytes) => {
-                                match cap
-                                    .write_file_bytes_atomic(&committed.relative_path, &orig_bytes)
-                                {
-                                    Ok(_) => {
+                                let pre_rep_hook_opt = self.pre_replace_hook.lock().clone();
+                                let pre_rep_ref = pre_rep_hook_opt
+                                    .as_ref()
+                                    .map(|h| h.as_ref() as &dyn Fn(&Path));
+                                let replace_hooks = ConditionalReplaceHooks {
+                                    pre_replace_hook: pre_rep_ref,
+                                    ..Default::default()
+                                };
+
+                                match cap.replace_file_bytes_conditional_with_hooks(
+                                    &committed.relative_path,
+                                    &orig_bytes,
+                                    None, // Exclusive hard-link creation: never overwrites recreated destination!
+                                    replace_hooks,
+                                ) {
+                                    Ok(outcome) => {
                                         rolled_back_count += 1;
                                         compensated_files.push(committed.relative_path.clone());
+                                        if let Some(surviving) = outcome.preserved_backup {
+                                            preserved_backups.push(surviving.display().to_string());
+                                        }
+                                    }
+                                    Err(AetherError::PermissionDenied(msg))
+                                        if msg.contains("newly created")
+                                            || msg.contains("race detected") =>
+                                    {
+                                        let conflict_msg = format!(
+                                            "Missing file '{}' was concurrently recreated before compensation: {}. Concurrently recreated file preserved in workspace without overwrite.",
+                                            committed.relative_path, msg
+                                        );
+                                        warn!("{}", conflict_msg);
+                                        recovery_conflicts.push(conflict_msg);
                                     }
                                     Err(err) => {
                                         rollback_errors.push(format!(
-                                            "Failed to recreate missing file '{}' from backup: {}",
+                                            "Failed to recreate missing file '{}' exclusively from backup: {}",
                                             committed.relative_path, err
                                         ));
                                     }
@@ -1192,8 +1229,13 @@ impl CheckpointEngine {
                         let pre_del_ref = pre_del_hook_opt
                             .as_ref()
                             .map(|h| h.as_ref() as &dyn Fn(&Path));
+                        let post_hash_del_hook_opt = self.post_hash_delete_hook.lock().clone();
+                        let post_hash_del_ref = post_hash_del_hook_opt
+                            .as_ref()
+                            .map(|h| h.as_ref() as &dyn Fn(&Path));
                         let del_hooks = filesystem_engine::ConditionalDeleteHooks {
                             pre_delete_hook: pre_del_ref,
+                            post_hash_hook: post_hash_del_ref,
                             fault_inject_delete_removal: self
                                 .fault_inject_delete_removal
                                 .load(std::sync::atomic::Ordering::SeqCst),
@@ -3140,6 +3182,282 @@ mod tests {
 
         engine.set_pre_replace_hook::<fn(&Path)>(None);
         engine.set_post_write_hook::<fn(&Path)>(None);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_040_open_handle_mutation_after_hash_preserves_staged_artifact() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_040_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let f_new = workspace_dir.join("new_file.txt");
+        let f_fail = workspace_dir.join("z_fail.txt");
+
+        std::fs::write(&f_new, "clean payload v1").unwrap();
+        std::fs::write(&f_fail, "fail base v1").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("Chk040 base", "ws-chk040", &workspace_dir, None)
+            .unwrap();
+
+        // Remove new_file from workspace so restore will create it as a new file
+        let _ = std::fs::remove_file(&f_new);
+
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-chk040", &workspace_dir)
+            .unwrap();
+
+        // Cause z_fail to abort restore after new_file was committed
+        engine.set_pre_replace_hook(Some(|dest: &Path| {
+            if dest.file_name() == Some(std::ffi::OsStr::new("z_fail.txt")) {
+                std::fs::write(dest, "mutation on fail to abort").unwrap();
+            }
+        }));
+
+        // Mutate staged file in post_hash_delete_hook simulating an open writable handle
+        // writing after initial hash check but before unlink
+        engine.set_post_hash_delete_hook(Some(|staged_path: &Path| {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(staged_path)
+                .unwrap();
+            use std::io::Write;
+            f.write_all(b"open handle mutation after hash verification!")
+                .unwrap();
+        }));
+
+        let res = engine.restore_checkpoint_with_token(
+            &ckpt.checkpoint_id,
+            "ws-chk040",
+            &workspace_dir,
+            &preview.preview_token,
+            true,
+            &[],
+        );
+
+        assert!(res.is_err());
+        let err_msg = res.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("Files requiring manual recovery"),
+            "Must report conflict for open-handle mutation: {}",
+            err_msg
+        );
+
+        // Extract preserved path and assert user's modification remains recoverable on disk
+        let marker = "staging preserved at '";
+        assert!(
+            err_msg.contains(marker),
+            "Error must identify surviving staged artifact: {}",
+            err_msg
+        );
+        let start = err_msg.find(marker).unwrap() + marker.len();
+        let end = err_msg[start..].find('\'').unwrap() + start;
+        let preserved_str = err_msg[start..end].replace(r"\\", r"\");
+        let preserved_path = PathBuf::from(&preserved_str);
+
+        assert!(
+            preserved_path.exists(),
+            "Preserved artifact must physically exist on disk at '{}'",
+            preserved_path.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&preserved_path).unwrap(),
+            "open handle mutation after hash verification!",
+            "User modifications made through open handle must remain recoverable!"
+        );
+
+        engine.set_pre_replace_hook::<fn(&Path)>(None);
+        engine.set_post_hash_delete_hook::<fn(&Path)>(None);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_041_rollback_rename_does_not_overwrite_recreated_destination() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_041_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let f_new = workspace_dir.join("new_file.txt");
+        let f_fail = workspace_dir.join("z_fail.txt");
+
+        std::fs::write(&f_new, "initial new file payload").unwrap();
+        std::fs::write(&f_fail, "fail base v1").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("Chk041 base", "ws-chk041", &workspace_dir, None)
+            .unwrap();
+
+        let _ = std::fs::remove_file(&f_new);
+
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-chk041", &workspace_dir)
+            .unwrap();
+
+        // Cause z_fail to abort
+        engine.set_pre_replace_hook(Some(|dest: &Path| {
+            if dest.file_name() == Some(std::ffi::OsStr::new("z_fail.txt")) {
+                std::fs::write(dest, "mutation on fail to abort").unwrap();
+            }
+        }));
+
+        // In pre_delete_hook on new_file:
+        // 1. Mutate the staged file (triggering rollback)
+        // 2. Concurrently recreate the original destination!
+        let dest_clone = f_new.clone();
+        engine.set_pre_delete_hook(Some(move |staged_path: &Path| {
+            std::fs::write(staged_path, "staged file modified").unwrap();
+            std::fs::write(&dest_clone, "concurrently recreated destination payload").unwrap();
+        }));
+
+        let res = engine.restore_checkpoint_with_token(
+            &ckpt.checkpoint_id,
+            "ws-chk041",
+            &workspace_dir,
+            &preview.preview_token,
+            true,
+            &[],
+        );
+
+        assert!(res.is_err());
+        let err_msg = res.err().unwrap().to_string();
+
+        // 1. Recreated destination MUST survive on disk with its recreated payload!
+        assert!(f_new.exists());
+        assert_eq!(
+            std::fs::read_to_string(&f_new).unwrap(),
+            "concurrently recreated destination payload",
+            "Destination MUST NOT be overwritten by rollback rename!"
+        );
+
+        // 2. Staged recovery artifact MUST survive on disk under a conflict path!
+        let marker = "staging preserved at '";
+        assert!(
+            err_msg.contains(marker),
+            "Must report conflict surviving path: {}",
+            err_msg
+        );
+        let start = err_msg.find(marker).unwrap() + marker.len();
+        let end = err_msg[start..].find('\'').unwrap() + start;
+        let conflict_str = err_msg[start..end].replace(r"\\", r"\");
+        let conflict_path = PathBuf::from(&conflict_str);
+
+        assert!(
+            conflict_path.exists(),
+            "Conflict artifact must physically exist at '{}'",
+            conflict_path.display()
+        );
+        assert_ne!(
+            conflict_path, f_new,
+            "Conflict path must not equal destination path!"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&conflict_path).unwrap(),
+            "staged file modified",
+            "Staged artifact must retain its modified content!"
+        );
+
+        engine.set_pre_replace_hook::<fn(&Path)>(None);
+        engine.set_pre_delete_hook::<fn(&Path)>(None);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_042_missing_file_compensation_exclusive_prevents_overwrite_of_recreated_destination(
+    ) {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_042_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let f_orig = workspace_dir.join("orig.txt");
+        let f_fail = workspace_dir.join("z_fail.txt");
+
+        std::fs::write(&f_orig, "orig v1 in checkpoint").unwrap();
+        std::fs::write(&f_fail, "fail base v1").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("Chk042 base", "ws-chk042", &workspace_dir, None)
+            .unwrap();
+
+        // User has uncommitted edit in workspace
+        std::fs::write(&f_orig, "orig uncommitted user edit").unwrap();
+
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-chk042", &workspace_dir)
+            .unwrap();
+
+        // In pre_replace_hook:
+        // - When processing z_fail.txt: delete orig.txt so compensation will see it as NotFound!
+        // - When processing orig.txt during compensation: recreate orig.txt with concurrent edit!
+        let orig_clone = f_orig.clone();
+        let fail_triggered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fail_flag = fail_triggered.clone();
+        engine.set_pre_replace_hook(Some(move |dest: &Path| {
+            if dest.file_name() == Some(std::ffi::OsStr::new("z_fail.txt")) {
+                fail_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = std::fs::remove_file(&orig_clone);
+                std::fs::write(dest, "mutation on fail to abort").unwrap();
+            } else if dest.file_name() == Some(std::ffi::OsStr::new("orig.txt"))
+                && fail_flag.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                std::fs::write(
+                    &orig_clone,
+                    "concurrently created between NotFound check and compensation publication",
+                )
+                .unwrap();
+            }
+        }));
+
+        let res = engine.restore_checkpoint_with_token(
+            &ckpt.checkpoint_id,
+            "ws-chk042",
+            &workspace_dir,
+            &preview.preview_token,
+            true,
+            &[],
+        );
+
+        assert!(res.is_err());
+        let err_msg = res.err().unwrap().to_string();
+
+        assert!(
+            err_msg
+                .contains("Missing file 'orig.txt' was concurrently recreated before compensation"),
+            "Error must explicitly report exclusive creation conflict: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("0/1 files cleanly rolled back"),
+            "Conflicted file must not be counted as cleanly rolled back: {}",
+            err_msg
+        );
+
+        // Invariant: orig.txt must NEVER be overwritten!
+        assert!(f_orig.exists());
+        assert_eq!(
+            std::fs::read_to_string(&f_orig).unwrap(),
+            "concurrently created between NotFound check and compensation publication",
+            "Concurrently recreated file must be preserved intact!"
+        );
+
+        // Safety snapshot blob must remain intact in storage
+        let marker = "Mandatory safety checkpoint '";
+        let start = err_msg.find(marker).unwrap() + marker.len();
+        let end = err_msg[start..].find('\'').unwrap() + start;
+        let safety_id = &err_msg[start..end];
+        let safety_dir = storage_dir.join(safety_id);
+        assert!(safety_dir.exists());
+
+        engine.set_pre_replace_hook::<fn(&Path)>(None);
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
