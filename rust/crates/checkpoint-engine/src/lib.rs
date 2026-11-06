@@ -132,9 +132,13 @@ pub struct CheckpointEngine {
     fault_inject_compensation_write: std::sync::atomic::AtomicBool,
     pre_delete_hook: Arc<Mutex<Option<PreReplaceHook>>>,
     post_hash_delete_hook: Arc<Mutex<Option<PreReplaceHook>>>,
+    pre_hard_link_delete_hook: Arc<Mutex<Option<PreReplaceHook>>>,
     fault_inject_metadata_failure: std::sync::atomic::AtomicBool,
     fault_inject_delete_removal: std::sync::atomic::AtomicBool,
     fault_inject_backup_removal: std::sync::atomic::AtomicBool,
+    fault_inject_rollback_metadata_failure: std::sync::atomic::AtomicBool,
+    fault_inject_hard_link_rollback_failure: std::sync::atomic::AtomicBool,
+    fault_inject_second_verification_read_failure: std::sync::atomic::AtomicBool,
 }
 
 impl CheckpointEngine {
@@ -153,9 +157,15 @@ impl CheckpointEngine {
             fault_inject_compensation_write: std::sync::atomic::AtomicBool::new(false),
             pre_delete_hook: Arc::new(Mutex::new(None)),
             post_hash_delete_hook: Arc::new(Mutex::new(None)),
+            pre_hard_link_delete_hook: Arc::new(Mutex::new(None)),
             fault_inject_metadata_failure: std::sync::atomic::AtomicBool::new(false),
             fault_inject_delete_removal: std::sync::atomic::AtomicBool::new(false),
             fault_inject_backup_removal: std::sync::atomic::AtomicBool::new(false),
+            fault_inject_rollback_metadata_failure: std::sync::atomic::AtomicBool::new(false),
+            fault_inject_hard_link_rollback_failure: std::sync::atomic::AtomicBool::new(false),
+            fault_inject_second_verification_read_failure: std::sync::atomic::AtomicBool::new(
+                false,
+            ),
         }
     }
 
@@ -237,6 +247,33 @@ impl CheckpointEngine {
     #[doc(hidden)]
     pub fn set_fault_inject_backup_removal(&self, inject: bool) {
         self.fault_inject_backup_removal
+            .store(inject, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn set_pre_hard_link_delete_hook<F>(&self, hook: Option<F>)
+    where
+        F: Fn(&Path) + Send + Sync + 'static,
+    {
+        let mut guard = self.pre_hard_link_delete_hook.lock();
+        *guard = hook.map(|h| Arc::new(h) as PreReplaceHook);
+    }
+
+    #[doc(hidden)]
+    pub fn set_fault_inject_rollback_metadata_failure(&self, inject: bool) {
+        self.fault_inject_rollback_metadata_failure
+            .store(inject, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn set_fault_inject_hard_link_rollback_failure(&self, inject: bool) {
+        self.fault_inject_hard_link_rollback_failure
+            .store(inject, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn set_fault_inject_second_verification_read_failure(&self, inject: bool) {
+        self.fault_inject_second_verification_read_failure
             .store(inject, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -1233,13 +1270,27 @@ impl CheckpointEngine {
                         let post_hash_del_ref = post_hash_del_hook_opt
                             .as_ref()
                             .map(|h| h.as_ref() as &dyn Fn(&Path));
+                        let pre_hl_del_hook_opt = self.pre_hard_link_delete_hook.lock().clone();
+                        let pre_hl_del_ref = pre_hl_del_hook_opt
+                            .as_ref()
+                            .map(|h| h.as_ref() as &dyn Fn(&Path));
                         let del_hooks = filesystem_engine::ConditionalDeleteHooks {
                             pre_delete_hook: pre_del_ref,
                             post_hash_hook: post_hash_del_ref,
+                            pre_hard_link_hook: pre_hl_del_ref,
                             fault_inject_delete_removal: self
                                 .fault_inject_delete_removal
                                 .load(std::sync::atomic::Ordering::SeqCst),
                             fault_inject_rollback_failure: false,
+                            fault_inject_rollback_metadata_failure: self
+                                .fault_inject_rollback_metadata_failure
+                                .load(std::sync::atomic::Ordering::SeqCst),
+                            fault_inject_hard_link_failure: self
+                                .fault_inject_hard_link_rollback_failure
+                                .load(std::sync::atomic::Ordering::SeqCst),
+                            fault_inject_second_verification_read_failure: self
+                                .fault_inject_second_verification_read_failure
+                                .load(std::sync::atomic::Ordering::SeqCst),
                         };
 
                         match cap.delete_file_conditional_with_hooks(
@@ -1253,7 +1304,7 @@ impl CheckpointEngine {
                                     compensated_files.push(committed.relative_path.clone());
                                 } else if let Some(surviving) = outcome.surviving_path {
                                     let msg = format!(
-                                        "Newly created file '{}' modified after restore (or staging preserved at '{}'). File preserved in workspace without deletion.",
+                                        "Newly created file '{}' modified after restore (or staging preserved at '{}'). Preserved recovery conflict artifact: File preserved in workspace without deletion.",
                                         committed.relative_path, surviving.display()
                                     );
                                     warn!("{}", msg);
@@ -1261,7 +1312,7 @@ impl CheckpointEngine {
                                     preserved_backups.push(surviving.display().to_string());
                                 } else {
                                     let msg = format!(
-                                        "Newly created file '{}' modified after restore. File preserved in workspace without deletion.",
+                                        "Newly created file '{}' modified after restore. Preserved recovery conflict artifact: File preserved in workspace without deletion.",
                                         committed.relative_path
                                     );
                                     warn!("{}", msg);
@@ -3211,23 +3262,38 @@ mod tests {
             .restore_preview_bound(&ckpt.checkpoint_id, "ws-chk040", &workspace_dir)
             .unwrap();
 
-        // Cause z_fail to abort restore after new_file was committed
-        engine.set_pre_replace_hook(Some(|dest: &Path| {
+        // Open new_file with a retained writable handle BEFORE staging rename
+        let retained_handle_arc = Arc::new(Mutex::new(None));
+        let handle_writer_clone = retained_handle_arc.clone();
+        let new_file_clone = f_new.clone();
+
+        // Cause z_fail to abort restore after new_file was committed, and capture retained writable handle
+        engine.set_pre_replace_hook(Some(move |dest: &Path| {
             if dest.file_name() == Some(std::ffi::OsStr::new("z_fail.txt")) {
+                let f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&new_file_clone)
+                    .unwrap();
+                *handle_writer_clone.lock() = Some(f);
                 std::fs::write(dest, "mutation on fail to abort").unwrap();
             }
         }));
 
-        // Mutate staged file in post_hash_delete_hook simulating an open writable handle
-        // writing after initial hash check but before unlink
-        engine.set_post_hash_delete_hook(Some(|staged_path: &Path| {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(staged_path)
-                .unwrap();
-            use std::io::Write;
-            f.write_all(b"open handle mutation after hash verification!")
-                .unwrap();
+        // Mutate staged file through the retained writable handle in post_hash_delete_hook
+        // after initial hash check but before unlink
+        let handle_post_clone = retained_handle_arc.clone();
+        engine.set_post_hash_delete_hook(Some(move |_staged_path: &Path| {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut guard = handle_post_clone.lock();
+            if let Some(ref mut f) = *guard {
+                f.seek(SeekFrom::Start(0)).unwrap();
+                f.write_all(b"open handle mutation after hash verification!")
+                    .unwrap();
+                f.set_len(b"open handle mutation after hash verification!".len() as u64)
+                    .unwrap();
+                f.flush().unwrap();
+            }
         }));
 
         let res = engine.restore_checkpoint_with_token(
@@ -3458,6 +3524,394 @@ mod tests {
         assert!(safety_dir.exists());
 
         engine.set_pre_replace_hook::<fn(&Path)>(None);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_043_retained_writable_handle_detected_by_unconditional_second_verification() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_043_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let f_new = workspace_dir.join("new_file.txt");
+        let f_fail = workspace_dir.join("z_fail.txt");
+
+        std::fs::write(&f_new, "clean payload v1").unwrap();
+        std::fs::write(&f_fail, "fail base v1").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("Chk043 base", "ws-chk043", &workspace_dir, None)
+            .unwrap();
+
+        let _ = std::fs::remove_file(&f_new);
+
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-chk043", &workspace_dir)
+            .unwrap();
+
+        // Capture retained handle in pre_replace_hook before staging rename
+        let retained_handle_arc = Arc::new(Mutex::new(None));
+        let handle_writer_clone = retained_handle_arc.clone();
+        let new_file_clone = f_new.clone();
+
+        engine.set_pre_replace_hook(Some(move |dest: &Path| {
+            if dest.file_name() == Some(std::ffi::OsStr::new("z_fail.txt")) {
+                let f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&new_file_clone)
+                    .unwrap();
+                *handle_writer_clone.lock() = Some(f);
+                std::fs::write(dest, "mutation on fail to abort").unwrap();
+            }
+        }));
+
+        // Mutate through retained handle in post_hash_delete_hook
+        let handle_post_clone = retained_handle_arc.clone();
+        engine.set_post_hash_delete_hook(Some(move |_staged_path: &Path| {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut guard = handle_post_clone.lock();
+            if let Some(ref mut f) = *guard {
+                f.seek(SeekFrom::Start(0)).unwrap();
+                f.write_all(b"mutation via retained writable handle in chk043!")
+                    .unwrap();
+                f.set_len(b"mutation via retained writable handle in chk043!".len() as u64)
+                    .unwrap();
+                f.flush().unwrap();
+            }
+        }));
+
+        let res = engine.restore_checkpoint_with_token(
+            &ckpt.checkpoint_id,
+            "ws-chk043",
+            &workspace_dir,
+            &preview.preview_token,
+            true,
+            &[],
+        );
+
+        assert!(res.is_err());
+        let err_msg = res.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("Files requiring manual recovery"),
+            "Error must report recovery conflict: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("0/1 files cleanly rolled back"),
+            "Mutated file must not be counted as cleanly rolled back: {}",
+            err_msg
+        );
+
+        let marker = "staging preserved at '";
+        assert!(err_msg.contains(marker));
+        let start = err_msg.find(marker).unwrap() + marker.len();
+        let end = err_msg[start..].find('\'').unwrap() + start;
+        let preserved_str = err_msg[start..end].replace(r"\\", r"\");
+        let preserved_path = PathBuf::from(&preserved_str);
+
+        assert!(preserved_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&preserved_path).unwrap(),
+            "mutation via retained writable handle in chk043!"
+        );
+
+        engine.set_pre_replace_hook::<fn(&Path)>(None);
+        engine.set_post_hash_delete_hook::<fn(&Path)>(None);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_044_recreated_destination_before_hard_link_rollback_preserves_both_no_overwrite() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_044_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let f_new = workspace_dir.join("new_file.txt");
+        let f_fail = workspace_dir.join("z_fail.txt");
+
+        std::fs::write(&f_new, "initial new file payload").unwrap();
+        std::fs::write(&f_fail, "fail base v1").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("Chk044 base", "ws-chk044", &workspace_dir, None)
+            .unwrap();
+
+        let _ = std::fs::remove_file(&f_new);
+
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-chk044", &workspace_dir)
+            .unwrap();
+
+        engine.set_pre_replace_hook(Some(|dest: &Path| {
+            if dest.file_name() == Some(std::ffi::OsStr::new("z_fail.txt")) {
+                std::fs::write(dest, "mutation on fail to abort").unwrap();
+            }
+        }));
+
+        // Mutate staged file to trigger rollback
+        engine.set_pre_delete_hook(Some(|staged_path: &Path| {
+            std::fs::write(staged_path, "staged file mutated").unwrap();
+        }));
+
+        // Concurrently recreate destination right before hard link publication
+        let f_new_clone = f_new.clone();
+        engine.set_pre_hard_link_delete_hook(Some(move |_dest_abs: &Path| {
+            std::fs::write(&f_new_clone, "recreated before hard link in chk044").unwrap();
+        }));
+
+        let res = engine.restore_checkpoint_with_token(
+            &ckpt.checkpoint_id,
+            "ws-chk044",
+            &workspace_dir,
+            &preview.preview_token,
+            true,
+            &[],
+        );
+
+        assert!(res.is_err());
+        let err_msg = res.err().unwrap().to_string();
+
+        // 1. Recreated destination must survive on disk without overwrite
+        assert!(f_new.exists());
+        assert_eq!(
+            std::fs::read_to_string(&f_new).unwrap(),
+            "recreated before hard link in chk044",
+            "Destination MUST NOT be overwritten!"
+        );
+
+        // 2. Staged recovery artifact must survive on disk under a conflict path
+        let marker = "staging preserved at '";
+        assert!(err_msg.contains(marker));
+        let start = err_msg.find(marker).unwrap() + marker.len();
+        let end = err_msg[start..].find('\'').unwrap() + start;
+        let conflict_str = err_msg[start..end].replace(r"\\", r"\");
+        let conflict_path = PathBuf::from(&conflict_str);
+
+        assert!(conflict_path.exists());
+        assert_ne!(conflict_path, f_new);
+        assert_eq!(
+            std::fs::read_to_string(&conflict_path).unwrap(),
+            "staged file mutated"
+        );
+
+        engine.set_pre_replace_hook::<fn(&Path)>(None);
+        engine.set_pre_delete_hook::<fn(&Path)>(None);
+        engine.set_pre_hard_link_delete_hook::<fn(&Path)>(None);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_045_hard_link_rollback_failure_never_falls_back_to_overwrite_rename() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_045_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let f_new = workspace_dir.join("new_file.txt");
+        let f_fail = workspace_dir.join("z_fail.txt");
+
+        std::fs::write(&f_new, "initial new file payload").unwrap();
+        std::fs::write(&f_fail, "fail base v1").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("Chk045 base", "ws-chk045", &workspace_dir, None)
+            .unwrap();
+
+        let _ = std::fs::remove_file(&f_new);
+
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-chk045", &workspace_dir)
+            .unwrap();
+
+        engine.set_pre_replace_hook(Some(|dest: &Path| {
+            if dest.file_name() == Some(std::ffi::OsStr::new("z_fail.txt")) {
+                std::fs::write(dest, "mutation on fail to abort").unwrap();
+            }
+        }));
+
+        engine.set_pre_delete_hook(Some(|staged_path: &Path| {
+            std::fs::write(staged_path, "staged payload for chk045").unwrap();
+        }));
+
+        // Inject non-AlreadyExists hard link failure
+        engine.set_fault_inject_hard_link_rollback_failure(true);
+
+        let res = engine.restore_checkpoint_with_token(
+            &ckpt.checkpoint_id,
+            "ws-chk045",
+            &workspace_dir,
+            &preview.preview_token,
+            true,
+            &[],
+        );
+
+        assert!(res.is_err());
+        let err_msg = res.err().unwrap().to_string();
+
+        // Ordinary rename fallback must NOT occur: f_new must NOT exist
+        assert!(
+            !f_new.exists(),
+            "Ordinary rename fallback must NOT have created destination!"
+        );
+
+        // Staged conflict artifact MUST be preserved
+        let marker = "staging preserved at '";
+        assert!(err_msg.contains(marker));
+        let start = err_msg.find(marker).unwrap() + marker.len();
+        let end = err_msg[start..].find('\'').unwrap() + start;
+        let conflict_str = err_msg[start..end].replace(r"\\", r"\");
+        let conflict_path = PathBuf::from(&conflict_str);
+
+        assert!(conflict_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&conflict_path).unwrap(),
+            "staged payload for chk045"
+        );
+
+        engine.set_pre_replace_hook::<fn(&Path)>(None);
+        engine.set_pre_delete_hook::<fn(&Path)>(None);
+        engine.set_fault_inject_hard_link_rollback_failure(false);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_046_metadata_inspection_failure_during_rollback_fails_closed() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_046_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let f_new = workspace_dir.join("new_file.txt");
+        let f_fail = workspace_dir.join("z_fail.txt");
+
+        std::fs::write(&f_new, "initial new file payload").unwrap();
+        std::fs::write(&f_fail, "fail base v1").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("Chk046 base", "ws-chk046", &workspace_dir, None)
+            .unwrap();
+
+        let _ = std::fs::remove_file(&f_new);
+
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-chk046", &workspace_dir)
+            .unwrap();
+
+        engine.set_pre_replace_hook(Some(|dest: &Path| {
+            if dest.file_name() == Some(std::ffi::OsStr::new("z_fail.txt")) {
+                std::fs::write(dest, "mutation on fail to abort").unwrap();
+            }
+        }));
+
+        engine.set_pre_delete_hook(Some(|staged_path: &Path| {
+            std::fs::write(staged_path, "staged payload for chk046").unwrap();
+        }));
+
+        // Inject metadata failure during rollback
+        engine.set_fault_inject_rollback_metadata_failure(true);
+
+        let res = engine.restore_checkpoint_with_token(
+            &ckpt.checkpoint_id,
+            "ws-chk046",
+            &workspace_dir,
+            &preview.preview_token,
+            true,
+            &[],
+        );
+
+        assert!(res.is_err());
+        let err_msg = res.err().unwrap().to_string();
+
+        assert!(!f_new.exists());
+
+        let marker = "staging preserved at '";
+        assert!(err_msg.contains(marker));
+        let start = err_msg.find(marker).unwrap() + marker.len();
+        let end = err_msg[start..].find('\'').unwrap() + start;
+        let conflict_str = err_msg[start..end].replace(r"\\", r"\");
+        let conflict_path = PathBuf::from(&conflict_str);
+
+        assert!(conflict_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&conflict_path).unwrap(),
+            "staged payload for chk046"
+        );
+
+        engine.set_pre_replace_hook::<fn(&Path)>(None);
+        engine.set_pre_delete_hook::<fn(&Path)>(None);
+        engine.set_fault_inject_rollback_metadata_failure(false);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_047_production_wrapper_default_hooks_executes_second_verification() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_047_{}", uuid::Uuid::new_v4().simple()));
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let cap = filesystem_engine::WorkspaceCapability::open(&workspace_dir).unwrap();
+        let f_prod = workspace_dir.join("prod_file.txt");
+        std::fs::write(&f_prod, "initial payload for chk047").unwrap();
+
+        let initial_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(b"initial payload for chk047");
+            format!("{:x}", hasher.finalize())
+        };
+
+        let mut retained_handle = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&f_prod)
+            .unwrap();
+
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let r_flag = running.clone();
+        let writer_thread = std::thread::spawn(move || {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut counter = 0u64;
+            while r_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                counter += 1;
+                let msg = format!(
+                    "mutation via retained handle in chk047! iteration {}",
+                    counter
+                );
+                let _ = retained_handle.seek(SeekFrom::Start(0));
+                let _ = retained_handle.write_all(msg.as_bytes());
+                let _ = retained_handle.set_len(msg.len() as u64);
+                let _ = retained_handle.flush();
+                std::thread::yield_now();
+            }
+        });
+
+        // Delete using production wrapper with DEFAULT hooks
+        let outcome = cap
+            .delete_file_conditional("prod_file.txt", &initial_hash)
+            .unwrap();
+
+        running.store(false, std::sync::atomic::Ordering::SeqCst);
+        writer_thread.join().unwrap();
+
+        assert!(!outcome.was_deleted);
+        assert!(outcome.surviving_path.is_some());
+        let surviving = outcome.surviving_path.unwrap();
+        assert!(surviving.exists());
+        let content = std::fs::read_to_string(&surviving).unwrap();
+        assert!(content.contains("mutation via retained handle in chk047!"));
+
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
