@@ -107,19 +107,40 @@ To close the Time-of-Check to Time-of-Use (TOCTOU) race condition window between
 3. **Immediate Per-File Pre-Flight Revalidation:** Immediately before replacement, `CheckpointEngine::verify_file_disk_state` inspects the destination path with `symlink_metadata`:
    - Distinguishes `ErrorKind::NotFound` from `ErrorKind::PermissionDenied` and other I/O errors fail-closed.
    - Rejects the restoration if the file was modified, deleted, newly created, or replaced with a symlink or directory after preview generation.
-4. **Conditional Replacement with Staged-Swap & Rollback (`replace_file_bytes_conditional`):**
-   - **For Missing Files:** Utilizes OS-level atomic exclusive creation (`create_new(true)` on Windows and `O_CREAT | O_EXCL` on POSIX). If an unrecorded file was created on disk after preview generation, the OS rejects file creation immediately.
-   - **For Present Files:** Writes incoming data to a temporary stage file `.aether-stage.<uuid>`, atomically renames the destination file to `.aether-backup.<uuid>`, verifies the SHA-256 hash of `.aether-backup`, commits the stage file to the destination, and purges the backup.
-   - **Automatic Rollback:** If the destination file was mutated between the pre-flight check and replacement, the hash check of the backup fails. The engine immediately rolls `.aether-backup` back to the destination path, preserving the concurrent user modifications intact, and returns `PermissionDenied`.
+4. **Failure-Safe Missing-File Restoration:**
+   - Content is written to a temporary staged file (`.aether-stage.<uuid>`) and explicitly synced to durable storage (`sync_all()`).
+   - If writing or syncing fails, the temporary stage file is cleaned up immediately, guaranteeing that no partial, empty, or corrupted destination file is ever left at the target path.
+   - The verified file is published using an atomic exclusive operation (`hard_link`). If another process created a file at the target path concurrently, the operation rejects fail-closed with `AlreadyExists`, cleans the stage file, and leaves the existing file untouched.
+5. **Conditional Replacement with Staged-Swap, Post-Hash Recheck & Rollback:**
+   - **For Present Files:** Writes incoming data to `.aether-stage.<uuid>` and syncs it. Atomically renames the destination file to `.aether-backup.<uuid>`.
+   - **Initial Hash Verification:** Computes the SHA-256 hash of `.aether-backup` to ensure it matches the pre-flight expected hash.
+   - **Post-Hash Re-Verification (Open Handle Trap):** Re-checks the hash and metadata of `.aether-backup` immediately before committing the replacement. If a non-cooperating process holding an open file handle modified the file after the initial hash check, the mismatch is detected and restoration aborts.
+   - **Automatic Rollback:** On detected race or modification, the engine immediately rolls `.aether-backup` back to the destination path, preserving concurrent edits intact.
+   - **Trailing Modification Guard:** After the stage file is committed to the target path, `.aether-backup` is re-inspected before removal. If a process holding an open handle wrote trailing modifications, the backup is NOT deleted; it is renamed to `.aether-conflict-<uuid>` to guarantee zero silent data loss.
 
-#### 5.3.1 Residual Threat Model & OS Platform Invariants
+#### 5.3.1 Observable & Recoverable Rollback Failures
+Every rollback operation is strictly checked (`perform_rollback`). Ignored rollback results (`let _ = rename(...)`) are eliminated:
+- If a rollback rename fails (e.g. destination file locked exclusively by another process or OS permissions altered):
+  - The backup file is **never deleted**. It is preserved intact at `.aether-backup-<uuid>`.
+  - The engine returns an explicit `AetherError::Internal` stating `RESTORE ROLLBACK FAILURE`, reporting the exact failure reason, and providing the full absolute path of the preserved backup file for manual recovery.
+  - The engine never reports that rollback succeeded when it failed.
+
+#### 5.3.2 Residual Threat Model & OS Platform Invariants
 Neither POSIX (`rename`) nor Windows Win32 (`MoveFileExW`) provides an atomic kernel-level syscall of the form `rename_if_source_hash_matches(from, to, expected_hash)`. Consequently:
-- **Residual Microsecond Window:** Between the atomic destination-to-backup rename and the final stage-to-destination commit, external non-cooperating processes outside the IDE process boundary could attempt concurrent I/O.
+- **Threat Boundary:** On general-purpose operating systems without kernel volume snapshots (VSS, ZFS/Btrfs snapshot transactions), non-cooperating external processes holding pre-existing write handles write to the underlying file inode/object. The engine's two-phase recheck catches modifications before commit (rolling back intact) and guards backup cleanup after commit (preserving diverged backups), guaranteeing zero silent data loss.
 - **Rollback Guarantee:** If any error or digest mismatch occurs during the swap, the engine initiates synchronous atomic rollback from `.aether-backup` to restore the pre-existing disk state before surfacing an error to the user.
 - **Symlink Protection:** Directory and file traversals are guarded by `WorkspaceCapability` path verification, preventing symlink escapes or directory clobbering.
 
 ### 5.4 Mandatory Pre-Restore Safety Snapshots
 Before applying any file modifications during restore, `CheckpointEngine::restore_checkpoint_with_token` automatically creates a mandatory safety checkpoint snapshot of the current workspace state. If snapshot generation fails for any reason (including actual OS filesystem permission errors or disk I/O failures), restoration immediately aborts fail-closed, leaving all workspace files completely untouched. Clean retry is supported once filesystem permissions or storage directories are corrected.
+
+### 5.5 Multi-File Restoration Failure & Compensating Rollback Model
+Multi-file restore across a workspace directory is **NOT** an ACID filesystem transaction, because general-purpose operating system filesystems do not support atomic multi-file multi-directory commits without filesystem-level volume snapshots:
+1. **Sequential Staged Swaps:** The engine applies restorations sequentially file-by-file, where each individual file is guarded by staged-swap conditional replacement.
+2. **Automatic Compensating Rollback:** If an error occurs on file $N$ after files $1 \dots N-1$ have been restored, the engine initiates an automatic compensating rollback:
+   - For every previously modified file, the engine reads its original pre-restore content from the mandatory safety checkpoint snapshot blobs and writes it back atomically.
+   - For newly created files that did not exist before restoration, the engine deletes them.
+3. **Safety Snapshot Preservation:** Regardless of whether compensating rollback succeeds or encounters an I/O error, the full mandatory safety checkpoint snapshot is permanently preserved in storage (`.aether/checkpoints/<id>`), ensuring that the user can manually inspect or completely re-apply the snapshot.
 
 ---
 

@@ -4,6 +4,7 @@ use cap_std::fs::{Dir, OpenOptions};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use tracing::warn;
 
 /// Sanitizes an untrusted user-provided relative path for capability operations.
 /// Strictly rejects path traversals (`..`), drive prefixes, absolute roots,
@@ -183,6 +184,21 @@ pub struct WorkspaceScanReport {
     pub is_complete: bool,
 }
 
+/// Optional hooks and fault-injection flags for conditional file replacement.
+#[derive(Default, Clone)]
+pub struct ConditionalReplaceHooks<'a> {
+    /// Injected immediately before the existing target file is moved to backup.
+    pub pre_replace_hook: Option<&'a (dyn Fn(&Path) + 'a)>,
+    /// Injected after backup hash calculation and before the stage-to-destination commit.
+    pub post_hash_hook: Option<&'a (dyn Fn(&Path) + 'a)>,
+    /// Injected fault: simulate I/O error during stage file write.
+    pub fault_inject_stage_write: bool,
+    /// Injected fault: simulate I/O error during stage file sync.
+    pub fault_inject_stage_sync: bool,
+    /// Injected fault: simulate failure during rollback rename.
+    pub fault_inject_rollback_failure: bool,
+}
+
 /// Capability-based workspace directory handle.
 /// All file and directory operations are anchored directly to the opened directory capability (`Dir`).
 /// Enforces genuine handle-level capability boundaries across Windows, Linux, and macOS.
@@ -305,33 +321,56 @@ impl WorkspaceCapability {
         Ok(self.root_path.join(rel))
     }
 
-    /// Writes raw binary bytes to a file inside the capability using atomic handle-level operations
-    /// with strict conditional replacement semantics.
-    ///
-    /// If `expected_hash` is `None` (expected Missing):
-    /// - Performs an exclusive creation (`create_new(true)`) anchored to capability.
-    /// - If the target was created concurrently on disk, the OS kernel atomically aborts with
-    ///   `AlreadyExists`, completely closing any creation race.
-    ///
-    /// If `expected_hash` is `Some(hash)` (expected Present):
-    /// 1. Prepares the replacement bytes in `.aether-stage-<uuid>` and syncs to disk.
-    /// 2. If `pre_replace_hook` is provided, executes it (for deterministic adversarial test injection).
-    /// 3. Atomically moves the existing target to `.aether-backup-<uuid>`.
-    /// 4. Inspects the captured backup file: asserts it is a regular file (not symlink) and verifies its SHA-256 hash.
-    ///    - If the hash DOES NOT MATCH `expected_hash` (concurrent modification occurred):
-    ///      Atomically rolls back `.aether-backup-<uuid>` to the target path, removes `.aether-stage-<uuid>`,
-    ///      and returns `AetherError::PermissionDenied`. The concurrent modification is preserved intact.
-    ///    - If the hash MATCHES:
-    ///      Atomically moves `.aether-stage-<uuid>` to the target path and removes `.aether-backup-<uuid>`.
-    pub fn replace_file_bytes_conditional(
+    /// Internal rollback helper that strictly verifies rollback rename results.
+    /// If rollback fails, the backup file is preserved on disk without deletion,
+    /// and an explicit `AetherError::Internal` containing the backup location is returned.
+    fn perform_rollback(
+        &self,
+        backup_rel: &Path,
+        rel: &Path,
+        stage_rel: Option<&Path>,
+        user_path: &str,
+        cause_msg: &str,
+        fault_inject_rollback_failure: bool,
+    ) -> AetherError {
+        // Clean up temporary incoming stage file if present
+        if let Some(stage) = stage_rel {
+            let _ = self.dir.remove_file(stage);
+        }
+
+        let rollback_res = if fault_inject_rollback_failure {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Injected rollback failure: destination locked or unwritable",
+            ))
+        } else {
+            self.dir.rename(backup_rel, &self.dir, rel)
+        };
+
+        match rollback_res {
+            Ok(()) => AetherError::PermissionDenied(format!(
+                "Restore race detected: {}. Restore aborted, target rolled back successfully.",
+                cause_msg
+            )),
+            Err(rb_err) => {
+                let backup_abs = self.root_path.join(backup_rel);
+                AetherError::Internal(format!(
+                    "RESTORE ROLLBACK FAILURE on '{}': {}. Attempted rollback to destination failed ({}). User data PRESERVED at '{}'. Do not delete this file; manual recovery required.",
+                    user_path, cause_msg, rb_err, backup_abs.display()
+                ))
+            }
+        }
+    }
+
+    /// Conditionally replaces or creates a file inside workspace capability with full hook support.
+    pub fn replace_file_bytes_conditional_with_hooks(
         &self,
         user_path: &str,
         bytes: &[u8],
         expected_hash: Option<&str>,
-        pre_replace_hook: Option<&dyn Fn(&Path)>,
+        hooks: ConditionalReplaceHooks,
     ) -> Result<PathBuf> {
         let rel = sanitize_relative_path(user_path)?;
-
         if let Some(parent) = rel.parent() {
             if !parent.as_os_str().is_empty() {
                 self.dir.create_dir_all(parent).map_err(AetherError::Io)?;
@@ -341,27 +380,82 @@ impl WorkspaceCapability {
         let dest_abs = self.root_path.join(&rel);
 
         if expected_hash.is_none() {
-            if let Some(hook) = pre_replace_hook {
+            // Target was recorded as Missing at preview generation.
+            if let Some(hook) = hooks.pre_replace_hook {
                 hook(&dest_abs);
             }
 
-            // Expected Missing: atomic exclusive creation
+            // 1. Stage content into temporary file with unique UUID
+            let stage_name = format!(".aether-stage-{}", uuid::Uuid::new_v4().simple());
+            let stage_rel = if let Some(parent) = rel.parent() {
+                parent.join(&stage_name)
+            } else {
+                PathBuf::from(&stage_name)
+            };
+
             let mut opts = OpenOptions::new();
             opts.write(true).create_new(true);
 
-            match self.dir.open_with(&rel, &opts) {
-                Ok(mut f) => {
-                    f.write_all(bytes).map_err(AetherError::Io)?;
-                    f.sync_all().map_err(AetherError::Io)?;
+            let mut f = self
+                .dir
+                .open_with(&stage_rel, &opts)
+                .map_err(AetherError::Io)?;
+
+            if hooks.fault_inject_stage_write {
+                drop(f);
+                let _ = self.dir.remove_file(&stage_rel);
+                return Err(AetherError::Io(std::io::Error::other(
+                    "Injected stage write failure",
+                )));
+            }
+
+            if let Err(e) = f.write_all(bytes) {
+                drop(f);
+                let _ = self.dir.remove_file(&stage_rel);
+                return Err(AetherError::Io(e));
+            }
+
+            if hooks.fault_inject_stage_sync {
+                drop(f);
+                let _ = self.dir.remove_file(&stage_rel);
+                return Err(AetherError::Io(std::io::Error::other(
+                    "Injected stage sync failure",
+                )));
+            }
+
+            if let Err(e) = f.sync_all() {
+                drop(f);
+                let _ = self.dir.remove_file(&stage_rel);
+                return Err(AetherError::Io(e));
+            }
+            drop(f);
+
+            // 2. Publish stage file using exclusive no-overwrite operation
+            let link_res = self.dir.hard_link(&stage_rel, &self.dir, &rel);
+            match link_res {
+                Ok(()) => {
+                    let _ = self.dir.remove_file(&stage_rel);
                     return Ok(dest_abs);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let _ = self.dir.remove_file(&stage_rel);
                     return Err(AetherError::PermissionDenied(format!(
                         "Restore race detected: target file '{}' was newly created on disk before replacement. Restore aborted.",
                         user_path
                     )));
                 }
-                Err(e) => return Err(AetherError::Io(e)),
+                Err(e) => {
+                    // Check if file exists to detect race condition
+                    if self.dir.symlink_metadata(&rel).is_ok() {
+                        let _ = self.dir.remove_file(&stage_rel);
+                        return Err(AetherError::PermissionDenied(format!(
+                            "Restore race detected: target file '{}' was newly created on disk before replacement. Restore aborted.",
+                            user_path
+                        )));
+                    }
+                    let _ = self.dir.remove_file(&stage_rel);
+                    return Err(AetherError::Io(e));
+                }
             }
         }
 
@@ -387,7 +481,7 @@ impl WorkspaceCapability {
         drop(f);
 
         // 2. Invoke pre_replace_hook if configured (deterministic test injection)
-        if let Some(hook) = pre_replace_hook {
+        if let Some(hook) = hooks.pre_replace_hook {
             hook(&dest_abs);
         }
 
@@ -411,45 +505,62 @@ impl WorkspaceCapability {
         let backup_meta = match self.dir.symlink_metadata(&backup_rel) {
             Ok(m) => m,
             Err(e) => {
-                let _ = self.dir.rename(&backup_rel, &self.dir, &rel);
-                let _ = self.dir.remove_file(&stage_rel);
-                return Err(AetherError::PermissionDenied(format!(
-                    "Restore race detected: target file '{}' metadata inspection failed ({}). Rolled back.",
-                    user_path, e
-                )));
+                return Err(self.perform_rollback(
+                    &backup_rel,
+                    &rel,
+                    Some(&stage_rel),
+                    user_path,
+                    &format!(
+                        "target file '{}' metadata inspection failed ({})",
+                        user_path, e
+                    ),
+                    hooks.fault_inject_rollback_failure,
+                ));
             }
         };
 
         if backup_meta.is_symlink() || !backup_meta.is_file() {
-            let _ = self.dir.rename(&backup_rel, &self.dir, &rel);
-            let _ = self.dir.remove_file(&stage_rel);
-            return Err(AetherError::PermissionDenied(format!(
-                "Restore race detected: target file '{}' is a symlink or non-regular file. Rolled back.",
-                user_path
-            )));
+            return Err(self.perform_rollback(
+                &backup_rel,
+                &rel,
+                Some(&stage_rel),
+                user_path,
+                &format!(
+                    "target file '{}' is a symlink or non-regular file",
+                    user_path
+                ),
+                hooks.fault_inject_rollback_failure,
+            ));
         }
 
         let mut backup_file = match self.dir.open(&backup_rel) {
             Ok(bf) => bf,
             Err(e) => {
-                let _ = self.dir.rename(&backup_rel, &self.dir, &rel);
-                let _ = self.dir.remove_file(&stage_rel);
-                return Err(AetherError::PermissionDenied(format!(
-                    "Restore race detected: target file '{}' could not be opened for verification ({}). Rolled back.",
-                    user_path, e
-                )));
+                return Err(self.perform_rollback(
+                    &backup_rel,
+                    &rel,
+                    Some(&stage_rel),
+                    user_path,
+                    &format!(
+                        "target file '{}' could not be opened for verification ({})",
+                        user_path, e
+                    ),
+                    hooks.fault_inject_rollback_failure,
+                ));
             }
         };
 
         let mut current_bytes = Vec::new();
         if let Err(e) = backup_file.read_to_end(&mut current_bytes) {
             drop(backup_file);
-            let _ = self.dir.rename(&backup_rel, &self.dir, &rel);
-            let _ = self.dir.remove_file(&stage_rel);
-            return Err(AetherError::PermissionDenied(format!(
-                "Restore race detected: target file '{}' could not be read ({}). Rolled back.",
-                user_path, e
-            )));
+            return Err(self.perform_rollback(
+                &backup_rel,
+                &rel,
+                Some(&stage_rel),
+                user_path,
+                &format!("target file '{}' could not be read ({})", user_path, e),
+                hooks.fault_inject_rollback_failure,
+            ));
         }
         drop(backup_file);
 
@@ -461,29 +572,132 @@ impl WorkspaceCapability {
         };
 
         if current_hash != expected {
-            // Concurrent modification detected! Roll back immediately.
-            let _ = self.dir.rename(&backup_rel, &self.dir, &rel);
-            let _ = self.dir.remove_file(&stage_rel);
-            return Err(AetherError::PermissionDenied(format!(
-                "Restore race detected: file '{}' was modified on disk prior to replacement (Expected: {}, Found: {}). Restore aborted, target rolled back.",
-                user_path, expected, current_hash
-            )));
+            // Concurrent modification detected before swap! Roll back immediately.
+            return Err(self.perform_rollback(
+                &backup_rel,
+                &rel,
+                Some(&stage_rel),
+                user_path,
+                &format!(
+                    "file '{}' was modified on disk prior to replacement (Expected: {}, Found: {})",
+                    user_path, expected, current_hash
+                ),
+                hooks.fault_inject_rollback_failure,
+            ));
         }
 
-        // Hash matches! Commit replacement: move stage to target
+        // 5. Post-hash hook: Deterministic test injection between hash calculation and stage-to-target commit
+        if let Some(hook) = hooks.post_hash_hook {
+            hook(&dest_abs);
+        }
+
+        // 6. Post-hash re-verification to catch modifications via pre-existing open file handles
+        let recheck_bytes = match self.dir.open(&backup_rel).and_then(|mut f| {
+            let mut b = Vec::new();
+            f.read_to_end(&mut b)?;
+            Ok(b)
+        }) {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(self.perform_rollback(
+                    &backup_rel,
+                    &rel,
+                    Some(&stage_rel),
+                    user_path,
+                    &format!(
+                        "target file '{}' could not be re-read after verification ({})",
+                        user_path, e
+                    ),
+                    hooks.fault_inject_rollback_failure,
+                ));
+            }
+        };
+
+        let recheck_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&recheck_bytes);
+            format!("{:x}", hasher.finalize())
+        };
+
+        if recheck_hash != expected {
+            // Concurrent modification detected via open handle between verification and commit!
+            // Roll back immediately, restoring user's modifications to target path.
+            return Err(self.perform_rollback(
+                &backup_rel,
+                &rel,
+                Some(&stage_rel),
+                user_path,
+                &format!(
+                    "file '{}' was modified via open handle after hash verification (Expected: {}, Found: {})",
+                    user_path, expected, recheck_hash
+                ),
+                hooks.fault_inject_rollback_failure,
+            ));
+        }
+
+        // 7. Hash verified! Commit replacement: move stage to target
         if let Err(e) = self.dir.rename(&stage_rel, &self.dir, &rel) {
-            let _ = self.dir.rename(&backup_rel, &self.dir, &rel);
-            let _ = self.dir.remove_file(&stage_rel);
-            return Err(AetherError::Internal(format!(
-                "Failed to commit replacement file for '{}': {}. Target rolled back.",
-                user_path, e
-            )));
+            return Err(self.perform_rollback(
+                &backup_rel,
+                &rel,
+                Some(&stage_rel),
+                user_path,
+                &format!("failed to commit replacement file ({})", e),
+                hooks.fault_inject_rollback_failure,
+            ));
         }
 
-        // Cleanup backup file
-        let _ = self.dir.remove_file(&backup_rel);
+        // 8. Final guard: verify backup file did not receive trailing modifications before removal
+        let trailing_modified = match self.dir.open(&backup_rel).and_then(|mut f| {
+            let mut b = Vec::new();
+            f.read_to_end(&mut b)?;
+            Ok(b)
+        }) {
+            Ok(b) => {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(&b);
+                format!("{:x}", hasher.finalize()) != expected
+            }
+            Err(_) => false,
+        };
+
+        if trailing_modified {
+            // A process holding an open handle wrote to the backup after commit!
+            // DO NOT DELETE backup! Keep it preserved with explicit conflict name.
+            let conflict_name = format!(
+                "{}.aether-conflict-{}",
+                user_path,
+                uuid::Uuid::new_v4().simple()
+            );
+            let conflict_rel = PathBuf::from(&conflict_name);
+            let _ = self.dir.rename(&backup_rel, &self.dir, &conflict_rel);
+            warn!(
+                "Trailing modification detected on backup of '{}'. Preserved at '{}'.",
+                user_path, conflict_name
+            );
+        } else {
+            let _ = self.dir.remove_file(&backup_rel);
+        }
 
         Ok(dest_abs)
+    }
+
+    /// Conditionally replaces or creates a file inside workspace capability using staged verification.
+    /// Backward-compatible wrapper around `replace_file_bytes_conditional_with_hooks`.
+    pub fn replace_file_bytes_conditional(
+        &self,
+        user_path: &str,
+        bytes: &[u8],
+        expected_hash: Option<&str>,
+        pre_replace_hook: Option<&dyn Fn(&Path)>,
+    ) -> Result<PathBuf> {
+        let hooks = ConditionalReplaceHooks {
+            pre_replace_hook,
+            ..Default::default()
+        };
+        self.replace_file_bytes_conditional_with_hooks(user_path, bytes, expected_hash, hooks)
     }
 
     /// Writes content to a file inside the capability using atomic handle-level operations.
@@ -1141,6 +1355,234 @@ mod tests {
             fs::read_to_string(temp_dir.join("new_file.txt")).unwrap(),
             "updated version 2"
         );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_post_hash_modification_via_open_handle_detected_and_rolled_back() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_post_hash_race_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("live_document.txt");
+        fs::write(&file_path, "initial base version").unwrap();
+
+        let initial_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(b"initial base version");
+            format!("{:x}", hasher.finalize())
+        };
+
+        // Open handle to file before restore begins and hold it
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("Must be able to open handle");
+
+        let handle_cell = std::sync::Mutex::new(Some(handle));
+
+        // Post-hash hook: writes into the open handle right after initial hash verification
+        let post_hash_hook = |_dest_path: &Path| {
+            let mut lock = handle_cell.lock().unwrap();
+            if let Some(ref mut h) = *lock {
+                use std::io::Seek;
+                h.seek(std::io::SeekFrom::Start(0)).unwrap();
+                h.write_all(b"CONCURRENT MUTATION VIA OPEN HANDLE!")
+                    .unwrap();
+                h.set_len(b"CONCURRENT MUTATION VIA OPEN HANDLE!".len() as u64)
+                    .unwrap();
+                h.sync_all().unwrap();
+            }
+        };
+
+        let hooks = ConditionalReplaceHooks {
+            post_hash_hook: Some(&post_hash_hook),
+            ..Default::default()
+        };
+
+        let res = cap.replace_file_bytes_conditional_with_hooks(
+            "live_document.txt",
+            b"RESTORED OVERWRITE FROM CHECKPOINT",
+            Some(&initial_hash),
+            hooks,
+        );
+
+        // Verification:
+        // 1. Must fail because post-hash check detects the open handle modification
+        assert!(
+            res.is_err(),
+            "Must reject restore when open handle mutated file post-hash check"
+        );
+        let err_str = res.err().unwrap().to_string();
+        assert!(
+            err_str.contains("modified via open handle after hash verification"),
+            "Error must specify open handle modification detection. Got: {}",
+            err_str
+        );
+
+        // 2. Drop the handle before inspecting destination
+        drop(handle_cell);
+
+        // 3. User's concurrent modification must NOT be lost! Target was rolled back intact!
+        let content_on_disk = fs::read_to_string(&file_path).unwrap();
+        assert_eq!(
+            content_on_disk, "CONCURRENT MUTATION VIA OPEN HANDLE!",
+            "Concurrent modification must be preserved at destination intact! Got: {}",
+            content_on_disk
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_rollback_failure_observable_preserves_backup_without_silent_loss() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_rollback_fail_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("critical_code.rs");
+        fs::write(&file_path, "important user code v1").unwrap();
+
+        let initial_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(b"important user code v1");
+            format!("{:x}", hasher.finalize())
+        };
+
+        // Mutate on disk to trigger rollback, AND inject rollback failure
+        let pre_hook = |dest_path: &Path| {
+            fs::write(dest_path, "concurrent edit v2").unwrap();
+        };
+
+        let hooks = ConditionalReplaceHooks {
+            pre_replace_hook: Some(&pre_hook),
+            fault_inject_rollback_failure: true,
+            ..Default::default()
+        };
+
+        let res = cap.replace_file_bytes_conditional_with_hooks(
+            "critical_code.rs",
+            b"restored code v3",
+            Some(&initial_hash),
+            hooks,
+        );
+
+        assert!(res.is_err(), "Must report failure");
+        let err = res.err().unwrap();
+        assert!(matches!(err, AetherError::Internal(_)));
+        let msg = err.to_string();
+
+        // Must explicitly report RESTORE ROLLBACK FAILURE and recovery path
+        assert!(
+            msg.contains("RESTORE ROLLBACK FAILURE"),
+            "Error must explicitly announce rollback failure: {}",
+            msg
+        );
+        assert!(
+            msg.contains("User data PRESERVED at"),
+            "Error must state that user data is preserved: {}",
+            msg
+        );
+        assert!(
+            msg.contains(".aether-backup-"),
+            "Error must specify the backup path: {}",
+            msg
+        );
+
+        // Verify that the backup file actually exists on disk and contains the user's data!
+        let mut backup_found = false;
+        for entry in fs::read_dir(&temp_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".aether-backup-") {
+                let backup_bytes = fs::read(entry.path()).unwrap();
+                assert_eq!(
+                    String::from_utf8_lossy(&backup_bytes),
+                    "concurrent edit v2",
+                    "Backup file must contain user's data intact without deletion!"
+                );
+                backup_found = true;
+            }
+        }
+        assert!(backup_found, "Preserved backup file must exist on disk!");
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_missing_file_restoration_fault_injection_leaves_no_corrupted_destination() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_missing_fault_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        let dest_path = temp_dir.join("missing_file.txt");
+
+        // 1. Fault inject write failure
+        let hooks_write_fail = ConditionalReplaceHooks {
+            fault_inject_stage_write: true,
+            ..Default::default()
+        };
+        let res_write_fail = cap.replace_file_bytes_conditional_with_hooks(
+            "missing_file.txt",
+            b"payload",
+            None,
+            hooks_write_fail,
+        );
+        assert!(res_write_fail.is_err());
+        assert!(
+            !dest_path.exists(),
+            "Destination must NOT exist after failed stage write!"
+        );
+
+        // 2. Fault inject sync failure
+        let hooks_sync_fail = ConditionalReplaceHooks {
+            fault_inject_stage_sync: true,
+            ..Default::default()
+        };
+        let res_sync_fail = cap.replace_file_bytes_conditional_with_hooks(
+            "missing_file.txt",
+            b"payload",
+            None,
+            hooks_sync_fail,
+        );
+        assert!(res_sync_fail.is_err());
+        assert!(
+            !dest_path.exists(),
+            "Destination must NOT exist after failed stage sync!"
+        );
+
+        // Verify that all temporary stage files were cleaned up
+        for entry in fs::read_dir(&temp_dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with(".aether-stage-"),
+                "Stage files must be cleaned up! Found: {}",
+                name
+            );
+        }
+
+        // 3. Normal clean write succeeds
+        let res_clean = cap.replace_file_bytes_conditional_with_hooks(
+            "missing_file.txt",
+            b"payload clean",
+            None,
+            ConditionalReplaceHooks::default(),
+        );
+        assert!(res_clean.is_ok());
+        assert_eq!(fs::read_to_string(&dest_path).unwrap(), "payload clean");
 
         let _ = fs::remove_dir_all(temp_dir);
     }

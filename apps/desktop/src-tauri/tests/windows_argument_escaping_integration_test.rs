@@ -1,8 +1,8 @@
-use aether_desktop_lib::commands::build::{parse_command_tokens, resolve_approved_tool_executable};
+use aether_desktop_lib::commands::build::ApprovedBuildProcess;
 use std::path::PathBuf;
 
-#[test]
-fn test_windows_process_argument_escaping_integration_test_binary() {
+#[tokio::test]
+async fn test_windows_process_argument_escaping_integration_test_binary() {
     let temp_dir = std::env::temp_dir().join(format!(
         "aether_bld_010_integ_{}",
         uuid::Uuid::new_v4().simple()
@@ -26,28 +26,39 @@ fn test_windows_process_argument_escaping_integration_test_binary() {
     let new_path_os = std::env::join_paths(new_paths).unwrap();
     std::env::set_var("PATH", &new_path_os);
 
-    // 1. Resolve through production approved-tool resolver
-    let resolved_tool = resolve_approved_tool_executable("test_arg_echo", &work_dir, true)
-        .expect("test_arg_echo must resolve from PATH");
-
-    // 2. Command containing Windows shell metacharacters (&, |, >, <, %TEMP%)
-    let command_str = r#"test_arg_echo --flag "injected & echo PWNED > hacked.txt | type hacked.txt < NUL %TEMP%""#;
-
-    // 3. Tokenize using production tokenizer
-    let tokens = parse_command_tokens(command_str);
-    assert_eq!(tokens[0], "test_arg_echo");
-    assert_eq!(tokens[1], "--flag");
-    assert_eq!(
-        tokens[2],
-        "injected & echo PWNED > hacked.txt | type hacked.txt < NUL %TEMP%"
+    // 1. Invariant: test_arg_echo MUST be rejected by default without explicit extra tools
+    let default_rejection =
+        ApprovedBuildProcess::prepare("test_arg_echo --flag", &work_dir, true, &[]);
+    assert!(
+        default_rejection.is_err(),
+        "test_arg_echo must not be in default production approved whitelist"
     );
 
-    // 4. Launch using production process execution pattern
-    let output = std::process::Command::new(&resolved_tool)
-        .args(&tokens[1..])
-        .current_dir(&work_dir)
-        .output()
-        .expect("Failed to execute test_arg_echo");
+    // 2. Command containing Windows shell metacharacters (&, |, >, <, %TEMP%), quotes, spaces, and backslashes
+    let command_str = r#"test_arg_echo --flag "injected & echo PWNED > hacked.txt | type hacked.txt < NUL %TEMP%" "argument with spaces and \"quotes\"" "C:\Windows\System32\drivers\etc\hosts""#;
+
+    // 3. Prepare using shared production process launcher
+    let prepared = ApprovedBuildProcess::prepare(command_str, &work_dir, true, &["test_arg_echo"])
+        .expect("ApprovedBuildProcess preparation must succeed");
+
+    assert_eq!(prepared.args.len(), 4);
+    assert_eq!(prepared.args[0], "--flag");
+    assert_eq!(
+        prepared.args[1],
+        "injected & echo PWNED > hacked.txt | type hacked.txt < NUL %TEMP%"
+    );
+    assert_eq!(prepared.args[2], "argument with spaces and \"quotes\"");
+    assert_eq!(prepared.args[3], r"C:\Windows\System32\drivers\etc\hosts");
+
+    // 4. Spawn using shared production process spawn implementation
+    let child = prepared
+        .spawn()
+        .expect("Failed to spawn prepared build process");
+
+    let output = child
+        .wait_with_output()
+        .await
+        .expect("Failed to await child execution");
 
     assert!(output.status.success());
 
@@ -56,8 +67,8 @@ fn test_windows_process_argument_escaping_integration_test_binary() {
     let lines: Vec<&str> = stdout_str.lines().map(|l| l.trim()).collect();
 
     assert!(
-        lines.contains(&"COUNT:2"),
-        "Expected COUNT:2, got:\n{}",
+        lines.contains(&"COUNT:4"),
+        "Expected COUNT:4, got:\n{}",
         stdout_str
     );
     assert!(
@@ -68,6 +79,16 @@ fn test_windows_process_argument_escaping_integration_test_binary() {
     assert!(
         lines.contains(&"ARG[1]:injected & echo PWNED > hacked.txt | type hacked.txt < NUL %TEMP%"),
         "Metacharacters must be preserved verbatim without shell evaluation! Got:\n{}",
+        stdout_str
+    );
+    assert!(
+        lines.contains(&"ARG[2]:argument with spaces and \"quotes\""),
+        "Spaces and quotes must be preserved verbatim! Got:\n{}",
+        stdout_str
+    );
+    assert!(
+        lines.contains(&r"ARG[3]:C:\Windows\System32\drivers\etc\hosts"),
+        "Backslashes must be preserved verbatim! Got:\n{}",
         stdout_str
     );
 

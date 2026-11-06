@@ -1,5 +1,7 @@
 use application_core::{AetherError, Result};
-use filesystem_engine::{sanitize_relative_path, FilesystemEngine, WorkspaceCapability};
+use filesystem_engine::{
+    sanitize_relative_path, ConditionalReplaceHooks, FilesystemEngine, WorkspaceCapability,
+};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -7,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointFileRecord {
@@ -111,6 +113,7 @@ pub struct CheckpointEngine {
     simulate_backup_failure: std::sync::atomic::AtomicBool,
     active_restore_paths: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
     pre_replace_hook: Arc<Mutex<Option<PreReplaceHook>>>,
+    post_hash_hook: Arc<Mutex<Option<PreReplaceHook>>>,
 }
 
 impl CheckpointEngine {
@@ -123,6 +126,7 @@ impl CheckpointEngine {
             simulate_backup_failure: std::sync::atomic::AtomicBool::new(false),
             active_restore_paths: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pre_replace_hook: Arc::new(Mutex::new(None)),
+            post_hash_hook: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -138,6 +142,15 @@ impl CheckpointEngine {
         F: Fn(&Path) + Send + Sync + 'static,
     {
         let mut guard = self.pre_replace_hook.lock();
+        *guard = hook.map(|h| Arc::new(h) as PreReplaceHook);
+    }
+
+    #[doc(hidden)]
+    pub fn set_post_hash_hook<F>(&self, hook: Option<F>)
+    where
+        F: Fn(&Path) + Send + Sync + 'static,
+    {
+        let mut guard = self.post_hash_hook.lock();
         *guard = hook.map(|h| Arc::new(h) as PreReplaceHook);
     }
 
@@ -768,7 +781,7 @@ impl CheckpointEngine {
 
         // 5. Execute file writes with immediate per-file state revalidation to close TOCTOU window
         let cap = WorkspaceCapability::open(&canonical_root)?;
-        let mut restored_files = Vec::new();
+        let mut restored_files: Vec<String> = Vec::new();
 
         for (record, blob_bytes) in prepared_records {
             let dest_path = canonical_root.join(&record.relative_path);
@@ -804,23 +817,107 @@ impl CheckpointEngine {
             let hook_opt = self.pre_replace_hook.lock().clone();
             let hook_ref = hook_opt.as_ref().map(|h| h.as_ref() as &dyn Fn(&Path));
 
-            // 3. Staged conditional atomic replacement with automatic rollback on detected modifications
-            cap.replace_file_bytes_conditional(
-                &record.relative_path,
-                &blob_bytes,
-                expected_hash,
-                hook_ref,
-            )?;
+            let post_hook_opt = self.post_hash_hook.lock().clone();
+            let post_hook_ref = post_hook_opt.as_ref().map(|h| h.as_ref() as &dyn Fn(&Path));
 
-            // Immediate post-write verification
-            let dest = canonical_root.join(&record.relative_path);
-            let written_bytes = std::fs::read(&dest).map_err(AetherError::Io)?;
-            let written_hash = Self::sha256_digest(&written_bytes);
-            if written_hash != record.sha256 {
-                return Err(AetherError::Internal(format!(
-                    "Post-restore hash mismatch for '{}'. Expected {}, found on disk {}",
-                    record.relative_path, record.sha256, written_hash
-                )));
+            let hooks = ConditionalReplaceHooks {
+                pre_replace_hook: hook_ref,
+                post_hash_hook: post_hook_ref,
+                ..Default::default()
+            };
+
+            // 3. Staged conditional atomic replacement with automatic rollback on detected modifications
+            let write_result = (|| -> Result<()> {
+                cap.replace_file_bytes_conditional_with_hooks(
+                    &record.relative_path,
+                    &blob_bytes,
+                    expected_hash,
+                    hooks,
+                )?;
+
+                // Immediate post-write verification
+                let dest = canonical_root.join(&record.relative_path);
+                let written_bytes = std::fs::read(&dest).map_err(AetherError::Io)?;
+                let written_hash = Self::sha256_digest(&written_bytes);
+                if written_hash != record.sha256 {
+                    return Err(AetherError::Internal(format!(
+                        "Post-restore hash mismatch for '{}'. Expected {}, found on disk {}",
+                        record.relative_path, record.sha256, written_hash
+                    )));
+                }
+                Ok(())
+            })();
+
+            if let Err(orig_err) = write_result {
+                // Compensating rollback: If files were already written prior to this failure,
+                // attempt automatic compensating rollback from the mandatory safety checkpoint.
+                if !restored_files.is_empty() {
+                    warn!(
+                        "Restore failed on '{}' after {} files were written: {}. Initiating compensating rollback from safety checkpoint '{}'...",
+                        record.relative_path,
+                        restored_files.len(),
+                        orig_err,
+                        backup_ckpt.checkpoint_id
+                    );
+
+                    let mut rollback_errors = Vec::new();
+                    let mut rolled_back_count = 0;
+                    let backup_blobs_dir = self
+                        .storage_dir
+                        .join(&backup_ckpt.checkpoint_id)
+                        .join("blobs");
+
+                    for rel_path in &restored_files {
+                        if let Some(backup_rec) = backup_ckpt
+                            .files
+                            .iter()
+                            .find(|f| &f.relative_path == rel_path)
+                        {
+                            let blob_file = backup_blobs_dir.join(&backup_rec.sha256);
+                            match std::fs::read(&blob_file) {
+                                Ok(orig_bytes) => {
+                                    if let Err(e) =
+                                        cap.write_file_bytes_atomic(rel_path, &orig_bytes)
+                                    {
+                                        rollback_errors.push(format!(
+                                            "Failed to rollback '{}': {}",
+                                            rel_path, e
+                                        ));
+                                    } else {
+                                        rolled_back_count += 1;
+                                    }
+                                }
+                                Err(e) => {
+                                    rollback_errors.push(format!(
+                                        "Failed to read backup blob for '{}': {}",
+                                        rel_path, e
+                                    ));
+                                }
+                            }
+                        } else if let Err(e) = cap.delete_file(rel_path) {
+                            rollback_errors.push(format!(
+                                "Failed to delete restored new file '{}': {}",
+                                rel_path, e
+                            ));
+                        } else {
+                            rolled_back_count += 1;
+                        }
+                    }
+
+                    if rollback_errors.is_empty() {
+                        return Err(AetherError::Internal(format!(
+                            "Restore aborted: {}. Compensating rollback succeeded: all {} previously modified files were rolled back to pre-restore safety checkpoint '{}'.",
+                            orig_err, rolled_back_count, backup_ckpt.checkpoint_id
+                        )));
+                    } else {
+                        return Err(AetherError::Internal(format!(
+                            "Restore aborted: {}. Compensating rollback partially failed: {}/{} files restored to safety checkpoint '{}' (Rollback errors: {:?}). Mandatory safety checkpoint '{}' is preserved in storage.",
+                            orig_err, rolled_back_count, restored_files.len(), backup_ckpt.checkpoint_id, rollback_errors, backup_ckpt.checkpoint_id
+                        )));
+                    }
+                } else {
+                    return Err(orig_err);
+                }
             }
 
             restored_files.push(record.relative_path.clone());
@@ -1948,6 +2045,165 @@ mod tests {
         // Clear hook
         engine.set_pre_replace_hook::<fn(&Path)>(None);
 
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_024_multi_file_restore_failure_triggers_compensating_rollback() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_024_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        // 1. Create 3 files in workspace and commit them to checkpoint
+        let f1 = workspace_dir.join("file1.txt");
+        let f2 = workspace_dir.join("file2.txt");
+        let f3 = workspace_dir.join("file3.txt");
+
+        std::fs::write(&f1, "file1 original base").unwrap();
+        std::fs::write(&f2, "file2 original base").unwrap();
+        std::fs::write(&f3, "file3 original base").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root("Multi-file test", "ws-multi", &workspace_dir, None)
+            .unwrap();
+
+        // 2. User edits all 3 files before restore
+        std::fs::write(&f1, "file1 user uncommitted edit").unwrap();
+        std::fs::write(&f2, "file2 user uncommitted edit").unwrap();
+        std::fs::write(&f3, "file3 user uncommitted edit").unwrap();
+
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-multi", &workspace_dir)
+            .unwrap();
+
+        // 3. Inject a failure on the 3rd file using pre_replace_hook:
+        // When processing file3.txt, mutate it on disk right before replacement, causing a TOCTOU race detection!
+        engine.set_pre_replace_hook(Some(|dest: &Path| {
+            if dest.file_name() == Some(std::ffi::OsStr::new("file3.txt")) {
+                std::fs::write(dest, "file3 adversarial mutation to cause failure").unwrap();
+            }
+        }));
+
+        let res = engine.restore_checkpoint_with_token(
+            &ckpt.checkpoint_id,
+            "ws-multi",
+            &workspace_dir,
+            &preview.preview_token,
+            true,
+            &[],
+        );
+
+        // 4. Verification:
+        // Must abort, and trigger compensating rollback for file1 and file2 back to the pre-restore safety snapshot!
+        assert!(
+            res.is_err(),
+            "Multi-file restore must abort when a file fails"
+        );
+        let err_msg = res.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("Compensating rollback succeeded")
+                || err_msg.contains("pre-restore safety checkpoint"),
+            "Error must detail compensating rollback. Got: {}",
+            err_msg
+        );
+
+        // Files 1 and 2 must be restored back to the user's uncommitted edit state captured in the safety checkpoint!
+        assert_eq!(
+            std::fs::read_to_string(&f1).unwrap(),
+            "file1 user uncommitted edit",
+            "file1 must be rolled back to pre-restore safety state!"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f2).unwrap(),
+            "file2 user uncommitted edit",
+            "file2 must be rolled back to pre-restore safety state!"
+        );
+
+        engine.set_pre_replace_hook::<fn(&Path)>(None);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_025_post_hash_modification_via_open_handle_triggers_rollback() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_025_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let live_file = workspace_dir.join("live_editor_file.txt");
+        std::fs::write(&live_file, "committed base 1.0").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let ckpt = engine
+            .create_checkpoint_with_root(
+                "Post-hash open handle test",
+                "ws-post-hash",
+                &workspace_dir,
+                None,
+            )
+            .unwrap();
+
+        // User uncommitted state
+        std::fs::write(&live_file, "uncommitted editor text 2.0").unwrap();
+
+        let preview = engine
+            .restore_preview_bound(&ckpt.checkpoint_id, "ws-post-hash", &workspace_dir)
+            .unwrap();
+
+        // Open handle and keep it open
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&live_file)
+            .unwrap();
+        let handle_cell = std::sync::Mutex::new(Some(handle));
+
+        // Inject post-hash hook: writes into open handle right after initial hash check
+        engine.set_post_hash_hook(Some(move |_dest: &Path| {
+            let mut lock = handle_cell.lock().unwrap();
+            if let Some(ref mut h) = *lock {
+                use std::io::{Seek, Write};
+                h.seek(std::io::SeekFrom::Start(0)).unwrap();
+                h.write_all(b"MUTATION THROUGH OPEN HANDLE POST HASH CHECK!")
+                    .unwrap();
+                h.set_len(b"MUTATION THROUGH OPEN HANDLE POST HASH CHECK!".len() as u64)
+                    .unwrap();
+                h.flush().unwrap();
+            }
+        }));
+
+        let res = engine.restore_checkpoint_with_token(
+            &ckpt.checkpoint_id,
+            "ws-post-hash",
+            &workspace_dir,
+            &preview.preview_token,
+            true,
+            &[],
+        );
+
+        assert!(
+            res.is_err(),
+            "Must abort when open handle mutates file post-hash check"
+        );
+        let err_msg = res.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("modified via open handle after hash verification"),
+            "Error must detail open handle modification. Got: {}",
+            err_msg
+        );
+
+        // Crucial invariant: concurrent edit from open handle is preserved at destination!
+        let content = std::fs::read_to_string(&live_file).unwrap();
+        assert_eq!(
+            content, "MUTATION THROUGH OPEN HANDLE POST HASH CHECK!",
+            "Open handle concurrent edit must be preserved intact on disk!"
+        );
+
+        engine.set_post_hash_hook::<fn(&Path)>(None);
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
