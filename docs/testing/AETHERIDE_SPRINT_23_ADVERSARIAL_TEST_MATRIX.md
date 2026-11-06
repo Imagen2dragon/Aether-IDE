@@ -61,6 +61,10 @@ This matrix establishes the comprehensive test results and security validations 
 | **CHK-033** | Checkpoints | Conflict rename failure preserves backup at original path and reports actual surviving path | `filesystem-engine/src/lib.rs` | `test_chk_033_conflict_rename_failure_preserves_and_reports_actual_backup_path` | **PASS** |
 | **CHK-034** | Checkpoints | Backup removal failure preserves backup file without deletion and reports actual path | `filesystem-engine/src/lib.rs` | `test_chk_034_backup_removal_failure_preserves_backup` | **PASS** |
 | **CHK-035** | Checkpoints | Pre-cleanup hook modification preserves conflict artifact | `filesystem-engine/src/lib.rs` | `test_chk_035_pre_cleanup_hook_modification_preserves_conflict` | **PASS** |
+| **CHK-036** | Checkpoints | External modification during conditional deletion staging is preserved intact on disk and reported as conflict | `checkpoint-engine/src/lib.rs` | `test_chk_036_external_modification_during_conditional_deletion_is_preserved` | **PASS** |
+| **CHK-037** | Checkpoints | Metadata inspection failure during rollback is not counted as successful deletion | `checkpoint-engine/src/lib.rs` | `test_chk_037_metadata_failure_not_counted_as_successful_deletion` | **PASS** |
+| **CHK-038** | Checkpoints | Preserved backup path is surfaced in restore report and verified to exist on disk | `checkpoint-engine/src/lib.rs` | `test_chk_038_preserved_backup_path_surfaced_in_restore_report` | **PASS** |
+| **CHK-039** | Checkpoints | Recovery report accurately distinguishes complete from partial compensation | `checkpoint-engine/src/lib.rs` | `test_chk_039_recovery_report_accurately_distinguishes_complete_from_partial_compensation` | **PASS** |
 | **BLD-011** | Build Security | Shared executable launch pipeline (`ApprovedBuildProcess`) executes complex arguments (&, \|, >, <, %TEMP%, spaces, quotes, backslashes) keeping test helper out of production whitelist | `apps/desktop/src-tauri/tests/windows_argument_escaping_integration_test.rs` | `test_windows_process_argument_escaping_integration_test_binary` | **PASS** |
 | **AI-001** | AI Streaming | Fake streaming fallback eliminated; unsupported providers fail closed | `model-gateway/src/lib.rs` | `test_fake_streaming_eliminated_unsupported_provider_fails_closed` | **PASS** |
 | **AI-002** | AI Streaming | Cancellation token halts stream immediately and drops HTTP connection | `model-gateway/src/lib.rs` | `test_cancellation_aborts_stream_immediately` | **PASS** |
@@ -110,6 +114,11 @@ Binary files (e.g. PNG files containing `0x89 0x50 0x4E 0x47` and arbitrary byte
 - External modification conflict preservation (`test_chk_030`) proves that files modified after restore commit are preserved without blind overwrite and reported as recovery conflicts.
 - Compensating rollback failure observability (`test_chk_031`) proves that rollback errors produce explicit recovery reports and preserve mandatory safety snapshots in storage.
 - Final backup read and cleanup verification (`test_chk_032` through `test_chk_035`) proves that unverified or failed backup reads preserve backup files, conflict rename failures preserve original backup files and accurately report surviving locations, and cleanup failures preserve backup files without silent deletion.
+- Capability-anchored conditional deletion and recovery reporting (`test_chk_036` through `test_chk_039`) proves that:
+  - Staged conditional deletion prevents concurrent modifications during rollback from being destroyed.
+  - Inaccessible files during metadata inspection are never counted as cleanly rolled back or assumed absent.
+  - Preserved backup paths are surfaced directly in the restore report (`preserved_backups`) and verified to exist on disk.
+  - Recovery reports accurately distinguish complete from partial compensation, explicitly enumerating compensated files, recovery conflicts, and preserved backup artifacts.
 
 ### 3.4 Model Gateway Streaming
 The previous default trait implementation of `ModelProvider::stream_completion` which silently called `complete()` and returned a single fake chunk was eliminated. Tests confirm:

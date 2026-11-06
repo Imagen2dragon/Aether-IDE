@@ -141,10 +141,14 @@ Before applying any file modifications during restore, `CheckpointEngine::restor
 ### 5.5 Multi-File Restoration Failure & Conflict-Aware Compensating Rollback
 Multi-file restore across a workspace directory is **NOT** an ACID filesystem transaction, because general-purpose operating system filesystems do not support atomic multi-file multi-directory commits without filesystem-level volume snapshots:
 1. **Immediate Commit Tracking:** The engine tracks each file in the committed set immediately after its staged replacement succeeds. If post-write verification, reading, or hashing subsequently fails, the current file is already tracked and cannot be omitted from compensating rollback.
-2. **Pre-Rollback State Validation (Conflict Awareness):** The engine rejects unconditional overwriting or deletion during compensation:
-   - Before compensating an existing file, disk content is verified against the restored bytes. If unmodified, the pre-restore content from the safety checkpoint is restored. If modified concurrently by an external process or user, the file is **preserved on disk without overwrite** and reported as a recovery conflict.
-   - Before deleting a newly created file, disk content is verified against the restored bytes. If unmodified, the file is safely deleted. If modified concurrently, the file is **preserved on disk without deletion** and reported as a recovery conflict.
-3. **Explicit Recovery Reporting:** The engine distinguishes cleanly compensated files from files requiring manual recovery. It never reports complete rollback when any file remains conflicted, inaccessible, or failed.
+2. **Capability-Anchored Conditional Rollback (Conflict Awareness):** The engine rejects unconditional overwriting or deletion during compensation:
+   - Before compensating an existing file, disk content is verified against the restored bytes. If unmodified, the pre-restore content from the safety checkpoint is restored using staged conditional replacement. If modified concurrently by an external process or user, the file is **preserved on disk without overwrite** and reported as a recovery conflict.
+   - Newly created files are conditionally deleted using capability-anchored staged deletion (`delete_file_conditional_with_hooks`). The file is moved to a private staging name (`.aether-del-stage-<uuid>`), verified against its expected hash, and unlinked only if verified. If concurrent processes modify the file or write to an open handle while staged, the file is safely rolled back to destination or conflict path, **preserved without deletion**, and tracked in recovery conflicts.
+   - File absence during rollback is verified strictly via capability `symlink_metadata`, distinguishing `NotFound` (confirmed absent) from `PermissionDenied` or other I/O errors. Inaccessible files are never assumed absent or counted as cleanly rolled back.
+3. **Explicit Recovery Reporting:** The engine distinguishes cleanly compensated files from files requiring manual recovery:
+   - `CheckpointRestoreReport` surfaces `restored_files`, `preserved_backups`, `compensated_files`, and `recovery_conflicts`.
+   - Desktop workbench UI directly surfaces surviving artifact and preserved backup paths to the user.
+   - The engine never reports complete rollback when any file remains conflicted, inaccessible, or failed.
 4. **Safety Snapshot Preservation:** Regardless of whether compensating rollback succeeds, partially succeeds, or fails, the mandatory safety checkpoint snapshot is permanently preserved in storage (`.aether/checkpoints/<id>`) for manual recovery.
 
 ---

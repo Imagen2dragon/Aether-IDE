@@ -1,5 +1,6 @@
 use application_core::{AetherError, Result};
 use cap_std::ambient_authority;
+pub use cap_std::fs::Metadata;
 use cap_std::fs::{Dir, OpenOptions};
 use std::fs;
 use std::io::{Read, Write};
@@ -215,6 +216,27 @@ pub struct ConditionalReplaceHooks<'a> {
     pub fault_inject_conflict_rename: bool,
     /// Injected fault: simulate failure during backup removal.
     pub fault_inject_backup_removal: bool,
+}
+
+/// Outcome of conditional file deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionalDeleteOutcome {
+    /// True if the file was verified and successfully unlinked.
+    pub was_deleted: bool,
+    /// If deletion could not proceed (e.g. concurrent modification detected, read failure,
+    /// or removal failure), this contains the surviving path of the preserved file.
+    pub surviving_path: Option<PathBuf>,
+}
+
+/// Optional hooks and fault-injection flags for conditional file deletion.
+#[derive(Default, Clone)]
+pub struct ConditionalDeleteHooks<'a> {
+    /// Injected after moving target to staging and before hash verification.
+    pub pre_delete_hook: Option<&'a (dyn Fn(&Path) + 'a)>,
+    /// Injected fault: simulate I/O error during deletion removal.
+    pub fault_inject_delete_removal: bool,
+    /// Injected fault: simulate failure during rollback rename.
+    pub fault_inject_rollback_failure: bool,
 }
 
 /// Capability-based workspace directory handle.
@@ -831,11 +853,180 @@ impl WorkspaceCapability {
         Ok(self.root_path.join(rel))
     }
 
+    /// Returns symlink metadata for a path anchored inside workspace capability.
+    pub fn symlink_metadata(&self, user_path: &str) -> Result<Metadata> {
+        let rel = sanitize_relative_path(user_path)?;
+        self.dir.symlink_metadata(&rel).map_err(AetherError::Io)
+    }
+
     /// Deletes a file entry inside workspace capability.
     /// If target is a symlink, removes the symlink entry itself without following to target.
     pub fn delete_file(&self, user_path: &str) -> Result<()> {
         let rel = sanitize_relative_path(user_path)?;
         self.dir.remove_file(&rel).map_err(AetherError::Io)
+    }
+
+    /// Conditionally deletes a file inside workspace capability using staged verification.
+    /// Safely moves the target file to staging, verifies its content digest matches `expected_hash`,
+    /// catches open-handle modifications via pre-delete hooks, and only unlinks if verified.
+    /// If the file was modified or cannot be verified, it is preserved without deletion.
+    pub fn delete_file_conditional_with_hooks(
+        &self,
+        user_path: &str,
+        expected_hash: &str,
+        hooks: ConditionalDeleteHooks,
+    ) -> Result<ConditionalDeleteOutcome> {
+        let rel = sanitize_relative_path(user_path)?;
+        let dest_abs = self.root_path.join(&rel);
+
+        // 1. Inspect metadata
+        let meta = match self.dir.symlink_metadata(&rel) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Confirmed absent!
+                return Ok(ConditionalDeleteOutcome {
+                    was_deleted: true,
+                    surviving_path: None,
+                });
+            }
+            Err(e) => return Err(AetherError::Io(e)),
+        };
+
+        if meta.is_symlink() || !meta.is_file() {
+            return Err(AetherError::PermissionDenied(format!(
+                "Cannot conditionally delete '{}': target is a symlink or directory",
+                user_path
+            )));
+        }
+
+        // 2. Atomic staged move: rename target to delete-stage
+        let stage_name = format!(".aether-del-stage-{}", uuid::Uuid::new_v4().simple());
+        let stage_rel = if let Some(parent) = rel.parent() {
+            parent.join(&stage_name)
+        } else {
+            PathBuf::from(&stage_name)
+        };
+
+        if let Err(e) = self.dir.rename(&rel, &self.dir, &stage_rel) {
+            return Err(AetherError::PermissionDenied(format!(
+                "Cannot conditionally delete '{}': failed to stage for verification ({})",
+                user_path, e
+            )));
+        }
+
+        // 3. Pre-delete hook (for deterministic test injection while file is staged)
+        if let Some(hook) = hooks.pre_delete_hook {
+            hook(&self.root_path.join(&stage_rel));
+        }
+
+        // 4. Verify captured stage file
+        let stage_check_result: std::io::Result<bool> = (|| {
+            let mut f = self.dir.open(&stage_rel)?;
+            let mut b = Vec::new();
+            f.read_to_end(&mut b)?;
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&b);
+            let h = format!("{:x}", hasher.finalize());
+            Ok(h != expected_hash)
+        })();
+
+        let is_modified_or_unverified = match stage_check_result {
+            Ok(is_modified) => is_modified,
+            Err(e) => {
+                warn!(
+                    "Stage read on '{}' failed ({}). Preserving file for data safety.",
+                    user_path, e
+                );
+                true // unverified state must be preserved
+            }
+        };
+
+        if is_modified_or_unverified {
+            // Concurrent modification detected! DO NOT DELETE!
+            // Roll back: restore to target destination (or conflict name if target was recreated)
+            let rb_res = if hooks.fault_inject_rollback_failure {
+                Err(std::io::Error::other("Injected deletion rollback failure"))
+            } else {
+                self.dir.rename(&stage_rel, &self.dir, &rel)
+            };
+
+            let surviving = match rb_res {
+                Ok(()) => {
+                    warn!(
+                        "Conditional deletion aborted for '{}': concurrent modification detected. Preserved at '{}'.",
+                        user_path, dest_abs.display()
+                    );
+                    dest_abs
+                }
+                Err(rb_err) => {
+                    let conflict_name = format!(
+                        "{}.aether-conflict-{}",
+                        user_path,
+                        uuid::Uuid::new_v4().simple()
+                    );
+                    let conflict_rel = PathBuf::from(&conflict_name);
+                    let surviving_path = match self.dir.rename(&stage_rel, &self.dir, &conflict_rel)
+                    {
+                        Ok(()) => self.root_path.join(&conflict_rel),
+                        Err(_) => self.root_path.join(&stage_rel),
+                    };
+                    warn!(
+                        "Conditional deletion rollback failed ({}) for '{}'. Preserved at '{}'.",
+                        rb_err,
+                        user_path,
+                        surviving_path.display()
+                    );
+                    surviving_path
+                }
+            };
+
+            return Ok(ConditionalDeleteOutcome {
+                was_deleted: false,
+                surviving_path: Some(surviving),
+            });
+        }
+
+        // 5. Cleanup: unlink verified stage file
+        let remove_res = if hooks.fault_inject_delete_removal {
+            Err(std::io::Error::other("Injected delete removal failure"))
+        } else {
+            self.dir.remove_file(&stage_rel)
+        };
+
+        match remove_res {
+            Ok(()) => Ok(ConditionalDeleteOutcome {
+                was_deleted: true,
+                surviving_path: None,
+            }),
+            Err(rm_err) => {
+                let surviving = self.root_path.join(&stage_rel);
+                warn!(
+                    "Stage cleanup failed ({}) for '{}'. Preserved at '{}'.",
+                    rm_err,
+                    user_path,
+                    surviving.display()
+                );
+                Ok(ConditionalDeleteOutcome {
+                    was_deleted: false,
+                    surviving_path: Some(surviving),
+                })
+            }
+        }
+    }
+
+    /// Conditionally deletes a file inside workspace capability using staged verification.
+    /// Backward-compatible wrapper around `delete_file_conditional_with_hooks`.
+    pub fn delete_file_conditional(
+        &self,
+        user_path: &str,
+        expected_hash: &str,
+    ) -> Result<ConditionalDeleteOutcome> {
+        self.delete_file_conditional_with_hooks(
+            user_path,
+            expected_hash,
+            ConditionalDeleteHooks::default(),
+        )
     }
 
     /// Deletes a directory and its contents recursively inside workspace capability.
@@ -1914,6 +2105,103 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&preserved_path).unwrap(),
             "external open handle wrote after verification!"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_delete_file_conditional_unmodified_succeeds() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_del_clean_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("clean.txt");
+        fs::write(&file_path, "clean to delete").unwrap();
+
+        let hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(b"clean to delete");
+            format!("{:x}", hasher.finalize())
+        };
+
+        let outcome = cap.delete_file_conditional("clean.txt", &hash).unwrap();
+        assert!(outcome.was_deleted);
+        assert!(outcome.surviving_path.is_none());
+        assert!(!file_path.exists());
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_delete_file_conditional_modified_rolls_back_and_preserves() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_del_mod_{}", uuid::Uuid::new_v4().simple()));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("concurrent.txt");
+        fs::write(&file_path, "original before concurrent edit").unwrap();
+
+        let stale_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+
+        let outcome = cap
+            .delete_file_conditional("concurrent.txt", stale_hash)
+            .unwrap();
+        assert!(!outcome.was_deleted, "Must not delete modified file!");
+        assert!(outcome.surviving_path.is_some());
+        assert!(
+            file_path.exists(),
+            "File must be rolled back and preserved on disk!"
+        );
+        assert_eq!(
+            fs::read_to_string(&file_path).unwrap(),
+            "original before concurrent edit"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_delete_file_conditional_pre_delete_hook_preserves_concurrent_edit() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_del_hook_{}", uuid::Uuid::new_v4().simple()));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("hook.txt");
+        fs::write(&file_path, "initial content").unwrap();
+
+        let initial_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(b"initial content");
+            format!("{:x}", hasher.finalize())
+        };
+
+        // Pre-delete hook mutates the staged file before verification
+        let pre_hook = |staged_path: &Path| {
+            fs::write(staged_path, "concurrent edit while in deletion staging!").unwrap();
+        };
+
+        let hooks = ConditionalDeleteHooks {
+            pre_delete_hook: Some(&pre_hook),
+            ..Default::default()
+        };
+
+        let outcome = cap
+            .delete_file_conditional_with_hooks("hook.txt", &initial_hash, hooks)
+            .unwrap();
+        assert!(!outcome.was_deleted, "Must NOT delete mutated file!");
+        assert!(outcome.surviving_path.is_some());
+        assert!(file_path.exists(), "Must be rolled back to target path!");
+        assert_eq!(
+            fs::read_to_string(&file_path).unwrap(),
+            "concurrent edit while in deletion staging!"
         );
 
         let _ = fs::remove_dir_all(temp_dir);
