@@ -269,6 +269,51 @@ To eliminate irreversible destruction of recoverable user data when external pro
    - Pre-existing backup files are never overwritten on collision.
    - The retry loop generates fresh collision-safe UUID backup names and verifies the read-back digest before constructing a fresh manifest. If interrupted or failed, the original corrupt manifest and all prior backups remain byte-for-byte intact.
 
+### 5.4 Sprint 23.2.12 Security Advancements: POSIX Fail-Closed Disposal, Windows Reparse-Point Defense & Verified Publication
+
+1. **POSIX Fail-Closed Quarantine Disposal:**
+   - On Linux and macOS (POSIX), kernel filesystem semantics permit directory entries to be unlinked while detached open writable file descriptors remain connected to the underlying inode. Any write through such an open descriptor after userland verification alters unreferenced blocks before the file descriptor closes.
+   - Renaming a quarantine file into a private staging name (`.aether-clean-stage-<uuid>`) within the pinned quarantine directory isolates directory path lookups, but does **not** revoke or invalidate pre-existing open file descriptors connected to that inode.
+   - Userland check-and-unlink sequences cannot guarantee atomic exclusive disposal on POSIX without mandatory OS-level file locking. Advisory locks (`flock`, `fcntl`) do not constrain uncooperative external processes holding writable descriptors.
+   - Therefore, AetherIDE strictly enforces **POSIX Fail-Closed Disposal**:
+     * In both single cleanup (`cleanup_quarantine`) and batch cleanup (`cleanup_all_quarantined`), automated physical unlinking is unsupported and refused on POSIX systems.
+     * The candidate artifact is safely rolled back into a verified conflict artifact (`<filename>.preserved-conflict.<uuid>`).
+     * The recovery manifest is updated to `QuarantineStatus::PreservedConflict` referencing the actual surviving artifact path on disk.
+     * An explicit `PermissionDenied` error is returned explaining that kernel semantics cannot guarantee exclusive stability against uncooperative open descriptors.
+     * User data is never destroyed under uncertain or unprovable exclusive stability.
+
+2. **Windows Reparse-Point & Object-Identity Defense (`remove_file_windows_exclusive`):**
+   - Path-based file opens can follow reparse points (symlinks, junctions, mount points) if opened without explicit kernel flags.
+   - To defend against symlink swapping or reparse point redirection during cleanup:
+     * `remove_file_windows_exclusive` specifies `custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)`, opening the reparse point object itself rather than following the redirection target.
+     * It requests `GENERIC_READ | GENERIC_WRITE | DELETE` access with exclusive sharing `share_mode(0)`. If any other process holds an open handle, open immediately fails.
+     * It queries `GetFileType` and strictly verifies `FILE_TYPE_DISK`. Named pipes, character devices, and remote objects are rejected immediately.
+     * It queries `GetFileInformationByHandle` and verifies `dwFileAttributes`:
+       - If `FILE_ATTRIBUTE_REPARSE_POINT` is set, exclusive deletion is rejected immediately to protect external link targets.
+       - If `FILE_ATTRIBUTE_DIRECTORY` is set, deletion is rejected immediately.
+     * The exclusive handle is held continuously across SHA-256 digest verification and `SetFileInformationByHandle(FileDispositionInfo, DeleteFile = 1)`.
+     * Dropping the handle commits atomic deletion at the kernel level without race.
+
+3. **Strict Metadata Error Classification:**
+   - Previous implementations relied on `.is_ok()` existence checks, which conflated `NotFound` (confirmed absence) with non-notfound errors (such as `PermissionDenied` or general I/O errors).
+   - AetherIDE implements `classify_dir_entry_existence`, returning an explicit three-state `ObjectExistence`:
+     * `ObjectExistence::Exists`: Metadata inspection succeeded (`Ok(metadata)`).
+     * `ObjectExistence::ConfirmedAbsent`: The filesystem returned `ErrorKind::NotFound`.
+     * `ObjectExistence::Uncertain(reason)`: Any other error (e.g., `PermissionDenied`, I/O failure).
+   - In all rollback and cleanup operations, non-absent and uncertain states are treated as potentially existing objects. Staged artifacts are never overwritten or deleted under uncertain metadata; instead, they are preserved as conflict artifacts.
+
+4. **Rollback Verified Actual Publication:**
+   - `rollback_cleanup_stage` never assumes that attempting a rename succeeded.
+   - It verifies destination absence prior to rename.
+   - If the original filename exists or is uncertain, it executes a publication retry loop (up to 5 attempts) generating collision-safe conflict filenames (`<filename>.preserved-conflict.<uuid>`).
+   - After rename, it verifies actual physical publication using `classify_dir_entry_existence`.
+   - If all safe publication attempts fail, the candidate is preserved at its staging name without overwrite, and the engine enters `RecoveryBlocked` to alert administrators.
+
+5. **Fail-Closed Manifest Persistence:**
+   - Removed all occurrences of ignored manifest persistence (`let _ = manifest.save_with_fault(...)`).
+   - If manifest persistence fails during single or batch cleanup, the operation halts immediately.
+   - On Windows, if a file was physically removed before manifest persistence failed, the engine records the exact inconsistency and enters `RecoveryBlocked`, ensuring startup reconciliation can safely recover state without silent data loss.
+
 ---
 
 ## 6. AI Gateway Streaming & Cancellation

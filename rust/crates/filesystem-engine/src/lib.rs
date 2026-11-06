@@ -33,6 +33,29 @@ pub fn is_cross_device_error(err: &std::io::Error) -> bool {
 }
 
 #[cfg(windows)]
+thread_local! {
+    static FAULT_INJECT_WINDOWS_REPARSE_POINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(windows)]
+pub fn set_fault_inject_windows_reparse_point(inject: bool) {
+    FAULT_INJECT_WINDOWS_REPARSE_POINT.with(|cell| cell.set(inject));
+}
+
+#[cfg(windows)]
+pub fn is_fault_inject_windows_reparse_point() -> bool {
+    FAULT_INJECT_WINDOWS_REPARSE_POINT.with(|cell| cell.get())
+}
+
+#[cfg(not(windows))]
+pub fn set_fault_inject_windows_reparse_point(_inject: bool) {}
+
+#[cfg(not(windows))]
+pub fn is_fault_inject_windows_reparse_point() -> bool {
+    false
+}
+
+#[cfg(windows)]
 pub fn remove_file_windows_exclusive(path: &Path, expected_hash: &str) -> Result<()> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
@@ -42,14 +65,73 @@ pub fn remove_file_windows_exclusive(path: &Path, expected_hash: &str) -> Result
     const DELETE: u32 = 0x00010000;
     const GENERIC_READ: u32 = 0x80000000;
     const GENERIC_WRITE: u32 = 0x40000000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
+    const FILE_TYPE_DISK: u32 = 0x0001;
 
+    // Open without following reparse points (symlinks, junctions, mount points),
+    // and with exclusive share_mode(0) (denies any concurrent read, write, or delete).
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
         .share_mode(0) // EXCLUSIVE: no sharing with other handles
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(AetherError::Io)?;
+
+    // Inspect opened handle to verify object identity before any read or delete operations
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct BY_HANDLE_FILE_INFORMATION {
+        dwFileAttributes: u32,
+        ftCreationTime: [u32; 2],
+        ftLastAccessTime: [u32; 2],
+        ftLastWriteTime: [u32; 2],
+        dwVolumeSerialNumber: u32,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+        nNumberOfLinks: u32,
+        nFileIndexHigh: u32,
+        nFileIndexLow: u32,
+    }
+    extern "system" {
+        fn GetFileType(hFile: *mut std::ffi::c_void) -> u32;
+        fn GetFileInformationByHandle(
+            hFile: *mut std::ffi::c_void,
+            lpFileInformation: *mut BY_HANDLE_FILE_INFORMATION,
+        ) -> i32;
+    }
+
+    let file_type = unsafe { GetFileType(file.as_raw_handle()) };
+    if file_type != FILE_TYPE_DISK {
+        return Err(AetherError::PermissionDenied(format!(
+            "Security rejection: Object '{}' is not a standard disk file (file type: 0x{:x}); refusing exclusive deletion",
+            path.display(),
+            file_type
+        )));
+    }
+
+    let mut by_handle_info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    let info_res =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), by_handle_info.as_mut_ptr()) };
+    if info_res == 0 {
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+    let file_info = unsafe { by_handle_info.assume_init() };
+
+    let is_reparse = (file_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    let is_dir = (file_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    let fault_reparse = is_fault_inject_windows_reparse_point();
+
+    if is_reparse || is_dir || fault_reparse {
+        return Err(AetherError::PermissionDenied(format!(
+            "Security rejection: Object '{}' is a reparse point or directory (attributes: 0x{:x}); refusing exclusive deletion to prevent target redirection",
+            path.display(),
+            file_info.dwFileAttributes
+        )));
+    }
 
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(AetherError::Io)?;
