@@ -797,6 +797,7 @@ dependencies = [
  "application-core",
  "cap-std",
  "serde",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
  "uuid",

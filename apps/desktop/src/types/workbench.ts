@@ -267,6 +267,10 @@ export interface CheckpointRestoreReport {
   restored_files: string[];
   errors: string[];
   success: boolean;
+  backup_checkpoint_id?: string;
+  preserved_backups?: string[];
+  compensated_files?: string[];
+  recovery_conflicts?: string[];
 }
 
 // Git Engine

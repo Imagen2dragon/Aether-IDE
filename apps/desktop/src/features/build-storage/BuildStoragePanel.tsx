@@ -165,7 +165,11 @@ export const BuildStoragePanel: React.FC<BuildStoragePanelProps> = ({ onBuildLog
       }
       const res = await TauriService.restoreCheckpoint(id, preview.preview_token, force, approvedConflicts);
       if (res.success) {
-        setCkptMsg(`Restored snapshot ${id} (${res.restored_count} files safely verified)`);
+        let msg = `Restored snapshot ${id} (${res.restored_count} files safely verified)`;
+        if (res.preserved_backups && res.preserved_backups.length > 0) {
+          msg += ` [Preserved backups: ${res.preserved_backups.join(", ")}]`;
+        }
+        setCkptMsg(msg);
       } else {
         setCkptMsg(`Restore completed with warnings: ${res.errors.join("; ")}`);
       }

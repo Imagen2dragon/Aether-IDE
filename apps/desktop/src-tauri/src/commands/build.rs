@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tracing::info;
 
 pub type SharedActiveBuilds = Arc<Mutex<HashMap<String, u32>>>;
@@ -161,43 +160,82 @@ pub async fn build_detect_systems(
 }
 
 /// Robust shell-independent argument tokenizer that preserves quoted strings, spaces, and escape sequences.
+/// Preserves Windows path backslashes while properly unescaping escaped quotes and backslashes.
 pub fn parse_command_tokens(cmd: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut in_single = false;
     let mut in_double = false;
-    let mut escaped = false;
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut i = 0;
 
-    for c in cmd.chars() {
-        if escaped {
+    while i < chars.len() {
+        let c = chars[i];
+
+        if in_double {
+            // Inside double quotes: \ only escapes " or \. Otherwise backslash is literal (preserving Windows paths)
+            if c == '\\' && i + 1 < chars.len() && (chars[i + 1] == '"' || chars[i + 1] == '\\') {
+                current.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                in_double = false;
+                i += 1;
+                continue;
+            }
             current.push(c);
-            escaped = false;
+            i += 1;
             continue;
         }
 
-        if c == '\\' && !in_single {
-            escaped = true;
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+                i += 1;
+                continue;
+            }
+            current.push(c);
+            i += 1;
             continue;
         }
 
-        if c == '\'' && !in_double {
-            in_single = !in_single;
+        // Outside quotes
+        if c == '\\'
+            && i + 1 < chars.len()
+            && (chars[i + 1] == '"'
+                || chars[i + 1] == '\''
+                || chars[i + 1] == '\\'
+                || chars[i + 1].is_whitespace())
+        {
+            current.push(chars[i + 1]);
+            i += 2;
             continue;
         }
 
-        if c == '"' && !in_single {
-            in_double = !in_double;
+        if c == '\'' {
+            in_single = true;
+            i += 1;
             continue;
         }
 
-        if c.is_whitespace() && !in_single && !in_double {
+        if c == '"' {
+            in_double = true;
+            i += 1;
+            continue;
+        }
+
+        if c.is_whitespace() {
             if !current.is_empty() {
                 tokens.push(current);
                 current = String::new();
             }
-        } else {
-            current.push(c);
+            i += 1;
+            continue;
         }
+
+        current.push(c);
+        i += 1;
     }
 
     if !current.is_empty() {
@@ -224,12 +262,21 @@ pub fn validate_build_working_directory(
     Ok((validated, trusted))
 }
 
-/// Resolves an approved build tool executable securely from system PATH,
-/// strictly refusing project-local binary shadowing and never invoking a shell.
 pub fn resolve_approved_tool_executable(
     tool_name: &str,
     working_dir: &std::path::Path,
     is_trusted: bool,
+) -> Result<PathBuf, String> {
+    resolve_approved_tool_executable_with_extra(tool_name, working_dir, is_trusted, &[])
+}
+
+/// Resolves an approved build tool executable securely from system PATH,
+/// strictly refusing project-local binary shadowing and never invoking a shell.
+pub fn resolve_approved_tool_executable_with_extra(
+    tool_name: &str,
+    working_dir: &std::path::Path,
+    is_trusted: bool,
+    extra_allowed_tools: &[&str],
 ) -> Result<PathBuf, String> {
     let trimmed = tool_name.trim();
     if trimmed.is_empty() {
@@ -296,10 +343,13 @@ pub fn resolve_approved_tool_executable(
     }
 
     // Exact stem match against approved build tools whitelist (BLD-008: no ends_with suffix spoofing!)
-    let is_whitelisted = APPROVED_BUILD_TOOLS.iter().any(|&tool| {
-        let tool_base = tool.strip_prefix("./").unwrap_or(tool);
-        stem.eq_ignore_ascii_case(tool_base)
-    });
+    let is_whitelisted = APPROVED_BUILD_TOOLS
+        .iter()
+        .chain(extra_allowed_tools.iter())
+        .any(|&tool| {
+            let tool_base = tool.strip_prefix("./").unwrap_or(tool);
+            stem.eq_ignore_ascii_case(tool_base)
+        });
 
     if !is_whitelisted {
         return Err(format!(
@@ -399,6 +449,58 @@ pub fn resolve_approved_tool_executable(
     Ok(PathBuf::from(stem))
 }
 
+/// Validated, shell-free process launch specification.
+/// Shared across production build task runner and adversarial verification suites.
+#[derive(Debug, Clone)]
+pub struct ApprovedBuildProcess {
+    pub program_name: String,
+    pub resolved_executable: PathBuf,
+    pub args: Vec<String>,
+    pub working_dir: PathBuf,
+}
+
+impl ApprovedBuildProcess {
+    /// Tokenizes command, validates executable against approved registries, and enforces trust policies.
+    pub fn prepare(
+        command: &str,
+        working_dir: &std::path::Path,
+        is_trusted: bool,
+        extra_allowed_tools: &[&str],
+    ) -> Result<Self, String> {
+        let tokens = parse_command_tokens(command);
+        if tokens.is_empty() {
+            return Err("Build command cannot be empty".into());
+        }
+
+        let program = &tokens[0];
+        let args = tokens[1..].to_vec();
+
+        let resolved_executable = resolve_approved_tool_executable_with_extra(
+            program,
+            working_dir,
+            is_trusted,
+            extra_allowed_tools,
+        )?;
+
+        Ok(Self {
+            program_name: program.clone(),
+            resolved_executable,
+            args,
+            working_dir: working_dir.to_path_buf(),
+        })
+    }
+
+    /// Spawns the child process directly via tokio Command with piped stdout/stderr.
+    pub fn spawn(&self) -> std::io::Result<tokio::process::Child> {
+        let mut cmd = tokio::process::Command::new(&self.resolved_executable);
+        cmd.args(&self.args);
+        cmd.current_dir(&self.working_dir);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.spawn()
+    }
+}
+
 #[tauri::command]
 pub async fn build_run_task(
     app: AppHandle,
@@ -411,29 +513,14 @@ pub async fn build_run_task(
         validate_build_working_directory(&ws, working_dir.as_deref())?
     };
 
-    // 1. Safe argument tokenization preserving quotes and spaces (no split_whitespace!)
-    let tokens = parse_command_tokens(&command);
-    if tokens.is_empty() {
-        return Err("Build command cannot be empty".into());
-    }
-
-    let program = &tokens[0];
-    let args = &tokens[1..];
-
-    // 2. Resolve executable through controlled registry and reject local shadowing
-    let resolved_executable = resolve_approved_tool_executable(program, &dir, is_trusted)?;
+    // 1. Shared, testable process preparation and validation
+    let prepared = ApprovedBuildProcess::prepare(&command, &dir, is_trusted, &[])?;
 
     let task_id = format!("build-{}", uuid::Uuid::new_v4().simple());
     let start = Instant::now();
 
-    // 3. Direct executable spawning without intermediate shell interpreter (NO cmd.exe /C, NO sh -c)
-    let mut cmd = Command::new(&resolved_executable);
-    cmd.args(args);
-    cmd.current_dir(&dir);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-
-    let mut child = cmd
+    // 2. Direct executable spawning without intermediate shell interpreter (NO cmd.exe /C, NO sh -c)
+    let mut child = prepared
         .spawn()
         .map_err(|e| format!("Failed to spawn build command '{}': {}", command, e))?;
 
@@ -737,6 +824,145 @@ mod tests {
         assert_eq!(tokens[2], "foo & echo pwned | calc.exe");
         assert_eq!(tokens[3], "--name");
         assert_eq!(tokens[4], "bar > test.txt");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_bld_010_windows_process_argument_escaping_integration() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_bld_010_{}", uuid::Uuid::new_v4().simple()));
+        let helper_dir = temp_dir.join("bin");
+        let work_dir = temp_dir.join("work");
+        std::fs::create_dir_all(&helper_dir).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        // 1. Build native test_arg_echo helper executable using system rustc
+        let helper_exe = if cfg!(windows) {
+            helper_dir.join("test_arg_echo.exe")
+        } else {
+            helper_dir.join("test_arg_echo")
+        };
+
+        let src_file = temp_dir.join("test_arg_echo.rs");
+        std::fs::write(
+            &src_file,
+            r#"fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    println!("COUNT:{}", args.len());
+    for (i, arg) in args.iter().enumerate() {
+        println!("ARG[{}]:{}", i, arg);
+    }
+}"#,
+        )
+        .unwrap();
+
+        let rustc_status = std::process::Command::new("rustc")
+            .arg(&src_file)
+            .arg("-o")
+            .arg(&helper_exe)
+            .status()
+            .expect("Failed to invoke rustc to build test helper");
+        assert!(
+            rustc_status.success(),
+            "rustc compilation of helper must succeed"
+        );
+        assert!(
+            helper_exe.is_file(),
+            "Helper executable must exist at {:?}",
+            helper_exe
+        );
+
+        // Prepend helper binary directory to PATH so resolve_approved_tool_executable finds it
+        let orig_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_paths = vec![helper_dir.clone()];
+        new_paths.extend(std::env::split_paths(&orig_path));
+        let new_path_os = std::env::join_paths(new_paths).unwrap();
+        std::env::set_var("PATH", &new_path_os);
+
+        // 2. Security invariant: test_arg_echo MUST be rejected by default without extra whitelist permission!
+        let rejection = ApprovedBuildProcess::prepare("test_arg_echo --flag", &work_dir, true, &[]);
+        assert!(
+            rejection.is_err(),
+            "test_arg_echo must not be in default production whitelist"
+        );
+        assert!(rejection
+            .unwrap_err()
+            .contains("not an approved build tool executable"));
+
+        // 3. Construct complex command with dangerous Windows shell metacharacters (&, |, >, <, %TEMP%),
+        // spaces, quotes, and backslashes
+        let injection_cmd = r#"test_arg_echo --flag "test & echo PWNED > injected.txt | type injected.txt < NUL %TEMP%" "argument with spaces and \"quotes\"" "C:\Windows\System32\drivers\etc\hosts""#;
+
+        // 4. Prepare process through the shared production launch implementation
+        let prepared =
+            ApprovedBuildProcess::prepare(injection_cmd, &work_dir, true, &["test_arg_echo"])
+                .expect("ApprovedBuildProcess preparation must succeed");
+
+        assert_eq!(prepared.args.len(), 4);
+        assert_eq!(prepared.args[0], "--flag");
+        assert_eq!(
+            prepared.args[1],
+            "test & echo PWNED > injected.txt | type injected.txt < NUL %TEMP%"
+        );
+        assert_eq!(prepared.args[2], "argument with spaces and \"quotes\"");
+        assert_eq!(prepared.args[3], r"C:\Windows\System32\drivers\etc\hosts");
+
+        // 5. Spawn through shared production process spawn implementation
+        let output = std::process::Command::new(&prepared.resolved_executable)
+            .args(&prepared.args)
+            .current_dir(&prepared.working_dir)
+            .output()
+            .expect("Failed to execute test_arg_echo process");
+
+        assert!(
+            output.status.success(),
+            "Process execution failed: {:?}",
+            output
+        );
+
+        // 6. Parse machine-verifiable output emitted by test_arg_echo
+        let stdout_str = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<&str> = stdout_str.lines().map(|l| l.trim()).collect();
+
+        assert!(
+            lines.contains(&"COUNT:4"),
+            "Expected COUNT:4, got:\n{}",
+            stdout_str
+        );
+        assert!(
+            lines.contains(&"ARG[0]:--flag"),
+            "Expected ARG[0]:--flag, got:\n{}",
+            stdout_str
+        );
+        assert!(
+            lines.contains(
+                &"ARG[1]:test & echo PWNED > injected.txt | type injected.txt < NUL %TEMP%"
+            ),
+            "Exact arguments with &, |, >, <, %TEMP% must be preserved verbatim! Got:\n{}",
+            stdout_str
+        );
+        assert!(
+            lines.contains(&"ARG[2]:argument with spaces and \"quotes\""),
+            "Quotes and spaces must be preserved verbatim! Got:\n{}",
+            stdout_str
+        );
+        assert!(
+            lines.contains(&r"ARG[3]:C:\Windows\System32\drivers\etc\hosts"),
+            "Backslashes must be preserved verbatim! Got:\n{}",
+            stdout_str
+        );
+
+        // 7. Prove no shell interpretation or unintended file creation occurred!
+        let injected_file = work_dir.join("injected.txt");
+        assert!(
+            !injected_file.exists(),
+            "Security Failure: Injected file '{:?}' was created! Shell metacharacters escaped into execution.",
+            injected_file
+        );
+
+        // Restore PATH
+        std::env::set_var("PATH", orig_path);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

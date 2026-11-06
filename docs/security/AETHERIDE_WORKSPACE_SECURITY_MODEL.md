@@ -94,16 +94,62 @@ To prevent a malicious repository from dropping a trojaned `npm.cmd` or `cargo.e
 ### 5.1 Raw Byte Preservation
 Checkpoints record raw binary bytes. Lossy conversions (`String::from_utf8_lossy`) are strictly eliminated. Binary files, compiled assets, images, and non-UTF-8 text files are preserved with exact byte integrity and verified via SHA-256 content hashes.
 
-### 5.2 Conflict Detection & One-Use Preview Tokens
-- Prior to restoring a checkpoint, `checkpoint_restore_preview` scans the workspace, calculates current disk hashes, and generates a cryptographically random, one-use `preview_token`.
+### 5.2 Conflict Detection & Cryptographic Single-Use Preview Tokens
+- Prior to restoring a checkpoint, `restore_preview_bound` scans the workspace, calculates current disk hashes, and generates a cryptographically random, single-use `preview_token` formatted as `prev-<uuid4>-<sha256>`. The token is generated via system CSPRNG (`uuid::Uuid::new_v4()`) and is strictly bound to `(token, checkpoint_id, workspace_id, canonical_root)`.
 - If any file was modified on disk since the checkpoint snapshot, a conflict is flagged.
-- By default, restoration aborts on unresolved conflicts (`PermissionDenied`) unless the user explicitly authorizes them via `force: true` or `approved_conflicts`.
+- By default, restoration aborts on unresolved conflicts (`PermissionDenied`) unless the user explicitly authorizes them via `force: true` or `explicit_overwrite_conflicts`.
+- Legacy un-tokenized restoration methods (`restore_checkpoint` and `restore_checkpoint_into`) are deprecated and strictly reject all invocations with `PermissionDenied`, eliminating any bypass of preview token validation.
 
-### 5.3 Post-Preview Race Detection
-During restoration, the engine re-hashes disk files and compares them against `preview.disk_hashes`. If a file was modified concurrently between preview generation and restore execution, the restore aborts immediately, preventing accidental loss of concurrent developer edits.
+### 5.3 Staged-Swap Conditional Replacement & TOCTOU Defense
+To close the Time-of-Check to Time-of-Use (TOCTOU) race condition window between preview generation and restoration across Windows, Linux, and macOS:
+1. **In-Memory Blob Preflight:** All checkpoint blobs are pre-verified and loaded into memory before touching disk, preventing partial restoration due to mid-flight blob corruption or missing files.
+2. **In-Process Path Synchronization:** `CheckpointEngine` synchronizes restoration across concurrent threads using an internal `active_restore_paths` set guarded by RAII `PathLockGuard`. Attempting to restore to a path currently undergoing an active restore immediately rejects the concurrent operation fail-closed.
+3. **Immediate Per-File Pre-Flight Revalidation:** Immediately before replacement, `CheckpointEngine::verify_file_disk_state` inspects the destination path with `symlink_metadata`:
+   - Distinguishes `ErrorKind::NotFound` from `ErrorKind::PermissionDenied` and other I/O errors fail-closed.
+   - Rejects the restoration if the file was modified, deleted, newly created, or replaced with a symlink or directory after preview generation.
+4. **Failure-Safe Missing-File Restoration:**
+   - Content is written to a temporary staged file (`.aether-stage.<uuid>`) and explicitly synced to durable storage (`sync_all()`).
+   - If writing or syncing fails, the temporary stage file is cleaned up immediately, guaranteeing that no partial, empty, or corrupted destination file is ever left at the target path.
+   - The verified file is published using an atomic exclusive operation (`hard_link`). If another process created a file at the target path concurrently, the operation rejects fail-closed with `AlreadyExists`, cleans the stage file, and leaves the existing file untouched.
+5. **Conditional Replacement with Staged-Swap, Post-Hash Recheck & Rollback:**
+   - **For Present Files:** Writes incoming data to `.aether-stage.<uuid>` and syncs it. Atomically renames the destination file to `.aether-backup.<uuid>`.
+   - **Initial Hash Verification:** Computes the SHA-256 hash of `.aether-backup` to ensure it matches the pre-flight expected hash.
+   - **Post-Hash Re-Verification (Open Handle Trap):** Re-checks the hash and metadata of `.aether-backup` immediately before committing the replacement. If a non-cooperating process holding an open file handle modified the file after the initial hash check, the mismatch is detected and restoration aborts.
+   - **Automatic Rollback:** On detected race or modification, the engine immediately rolls `.aether-backup` back to the destination path, preserving concurrent edits intact.
+   - **Trailing Modification & Integrity Guard:** After the stage file is committed to the target path, `.aether-backup` is re-inspected before removal:
+     - A failed or incomplete backup read is **never** interpreted as proof that the backup is unchanged. Any read failure causes the engine to preserve the backup unconditionally.
+     - If trailing modifications or unverified states are detected, the backup is preserved rather than unlinked.
+     - The engine attempts to rename the preserved backup to `.aether-conflict-<uuid>`. If rename fails, the file remains preserved at `.aether-backup-<uuid>`, and the engine reports the actual surviving path rather than a fictitious conflict path.
+     - Backup cleanup checks removal results. If removal fails, the surviving backup file path is returned in `ConditionalReplaceOutcome` for transparent tracking.
 
-### 5.4 Pre-Restore Safety Snapshots
-Before applying any file modifications during restore, Tauri command `checkpoint_restore` automatically creates an internal safety checkpoint snapshot of the current workspace state.
+#### 5.3.1 Observable & Recoverable Rollback Failures
+Every rollback operation is strictly checked (`perform_rollback`). Ignored rollback results (`let _ = rename(...)`) are eliminated:
+- If a rollback rename fails (e.g. destination file locked exclusively by another process or OS permissions altered):
+  - The backup file is **never deleted**. It is preserved intact at `.aether-backup-<uuid>`.
+  - The engine returns an explicit `AetherError::Internal` stating `RESTORE ROLLBACK FAILURE`, reporting the exact failure reason, and providing the full absolute path of the preserved backup file for manual recovery.
+  - The engine never reports that rollback succeeded when it failed.
+
+#### 5.3.2 Residual Threat Model & OS Platform Invariants
+Neither POSIX (`rename`) nor Windows Win32 (`MoveFileExW`) provides an atomic kernel-level syscall of the form `rename_if_source_hash_matches(from, to, expected_hash)`. Consequently:
+- **Threat Boundary:** On general-purpose operating systems without kernel volume snapshots (VSS, ZFS/Btrfs snapshot transactions), non-cooperating external processes holding pre-existing write handles write to the underlying file inode/object. The engine's two-phase recheck catches modifications before commit (rolling back intact) and guards backup cleanup after commit (preserving diverged backups or unverified states). If an external process writes to an open handle after post-verification and before unlink, OS-level handle behavior governs: on Windows, active file locks typically prevent unlink; on POSIX systems, the open handle writes to the unlinked inode. While this minimizes concurrent data loss risks, kernel volume snapshots remain necessary for absolute OS-level transaction atomicity.
+- **Rollback Guarantee:** If any error or digest mismatch occurs during the swap, the engine initiates synchronous atomic rollback from `.aether-backup` to restore the pre-existing disk state before surfacing an error to the user.
+- **Symlink Protection:** Directory and file traversals are guarded by `WorkspaceCapability` path verification, preventing symlink escapes or directory clobbering.
+
+### 5.4 Mandatory Pre-Restore Safety Snapshots
+Before applying any file modifications during restore, `CheckpointEngine::restore_checkpoint_with_token` automatically creates a mandatory safety checkpoint snapshot of the current workspace state. If snapshot generation fails for any reason (including actual OS filesystem permission errors or disk I/O failures), restoration immediately aborts fail-closed, leaving all workspace files completely untouched. Clean retry is supported once filesystem permissions or storage directories are corrected.
+
+### 5.5 Multi-File Restoration Failure & Conflict-Aware Compensating Rollback
+Multi-file restore across a workspace directory is **NOT** an ACID filesystem transaction, because general-purpose operating system filesystems do not support atomic multi-file multi-directory commits without filesystem-level volume snapshots:
+1. **Immediate Commit Tracking:** The engine tracks each file in the committed set immediately after its staged replacement succeeds. If post-write verification, reading, or hashing subsequently fails, the current file is already tracked and cannot be omitted from compensating rollback.
+2. **Capability-Anchored Conditional Rollback (Conflict Awareness):** The engine rejects unconditional overwriting or deletion during compensation:
+   - Before compensating an existing file, disk content is verified against the restored bytes. If unmodified, the pre-restore content from the safety checkpoint is restored using staged conditional replacement. If modified concurrently by an external process or user, the file is **preserved on disk without overwrite** and reported as a recovery conflict.
+   - Newly created files are conditionally deleted using capability-anchored staged deletion (`delete_file_conditional_with_hooks`). The file is moved to a private staging name (`.aether-del-stage-<uuid>`), verified against its expected hash, and unlinked only if verified. If concurrent processes modify the file or write to an open handle while staged, the file is safely rolled back to destination or conflict path, **preserved without deletion**, and tracked in recovery conflicts.
+   - File absence during rollback is verified strictly via capability `symlink_metadata`, distinguishing `NotFound` (confirmed absent) from `PermissionDenied` or other I/O errors. Inaccessible files are never assumed absent or counted as cleanly rolled back.
+3. **Explicit Recovery Reporting:** The engine distinguishes cleanly compensated files from files requiring manual recovery:
+   - `CheckpointRestoreReport` surfaces `restored_files`, `preserved_backups`, `compensated_files`, and `recovery_conflicts`.
+   - Desktop workbench UI directly surfaces surviving artifact and preserved backup paths to the user.
+   - The engine never reports complete rollback when any file remains conflicted, inaccessible, or failed.
+4. **Safety Snapshot Preservation:** Regardless of whether compensating rollback succeeds, partially succeeds, or fails, the mandatory safety checkpoint snapshot is permanently preserved in storage (`.aether/checkpoints/<id>`) for manual recovery.
 
 ---
 
@@ -115,6 +161,13 @@ The default trait method on `ModelProvider` fails closed (`Streaming is not supp
 
 ### 6.2 Connection Abort on Cancellation
 When a user clicks "Stop" or cancels an active stream (`ai_cancel_stream`):
-- The atomic cancellation token (`AtomicBool`) is flagged.
+- The atomic cancellation token (`CancellationToken`) is flagged.
 - The active streaming loop terminates immediately.
+- Stalled HTTP error body reads (`resp.text()`) and connection establishments are bound to cancellation via `tokio::select!`, preventing un-cancellable blocking on unresponsive upstreams.
 - The underlying `reqwest` HTTP response byte stream is dropped, terminating the TCP/TLS connection to the provider and saving user API tokens.
+
+### 6.3 Stream Registry Lifecycle & Monotonic Generation Tracking
+In desktop `ai_stream_prompt`, active streams are managed by `StreamRegistry`:
+- **Duplicate Request Rejection:** Active, non-cancelled requests strictly reject duplicate IDs fail-closed.
+- **Immediate Reuse via Generations:** When a user cancels a stream and immediately resubmits using the same `request_id`, `StreamRegistry::register` allocates a monotonically increasing `generation: u64` counter and issues a fresh, un-cancelled `CancellationToken`.
+- **Race-Free Cleanup:** When the previous asynchronous stream task terminates and invokes `cleanup(request_id, generation)`, it only removes the registry entry if its generation matches. Stale completions from earlier cancelled streams cannot prematurely delete or invalidate the active token of a newer generation.

@@ -465,7 +465,12 @@ impl ModelProvider for LocalOllamaProvider {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body: String = tokio::select! {
+                _ = cancel.cancelled() => {
+                    return Err(AetherError::ModelProvider("Request cancelled by user".into()));
+                }
+                res = resp.text() => res.unwrap_or_default(),
+            };
             return Err(AetherError::ModelProvider(format!(
                 "Ollama returned HTTP error {}: {}",
                 status, body
@@ -825,7 +830,12 @@ async fn stream_openai_compatible(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body: String = tokio::select! {
+            _ = cancel.cancelled() => {
+                return Err(AetherError::ModelProvider("Request cancelled by user".into()));
+            }
+            res = resp.text() => res.unwrap_or_default(),
+        };
         return Err(AetherError::ModelProvider(format!(
             "{} streaming error (HTTP {}): {}",
             provider_name, status, body
@@ -961,7 +971,12 @@ async fn stream_anthropic(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body: String = tokio::select! {
+            _ = cancel.cancelled() => {
+                return Err(AetherError::ModelProvider("Request cancelled by user".into()));
+            }
+            res = resp.text() => res.unwrap_or_default(),
+        };
         return Err(AetherError::ModelProvider(format!(
             "Anthropic streaming error (HTTP {}): {}",
             status, body
@@ -1109,7 +1124,12 @@ async fn stream_gemini(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body: String = tokio::select! {
+            _ = cancel.cancelled() => {
+                return Err(AetherError::ModelProvider("Request cancelled by user".into()));
+            }
+            res = resp.text() => res.unwrap_or_default(),
+        };
         return Err(AetherError::ModelProvider(format!(
             "Gemini streaming error (HTTP {}): {}",
             status, body
@@ -2134,5 +2154,211 @@ mod tests {
             "Cancellation must abort connection immediately, took {:?}",
             elapsed
         );
+    }
+
+    #[tokio::test]
+    async fn test_ai_009_cancellation_during_error_response_body_read() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server sends 500 error with announced content-length but stalls on body
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+                let header = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 1000\r\n\r\n";
+                let _ = socket.write_all(header.as_bytes()).await;
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        });
+
+        let provider =
+            OpenAiCompatibleProvider::new("test-openai", &format!("http://{}", addr), None);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel_clone.cancel();
+        });
+
+        let req = CompletionRequest {
+            prompt: "test".into(),
+            system: None,
+            model: None,
+            temperature: None,
+            max_tokens: None,
+        };
+
+        let start = std::time::Instant::now();
+        let res = provider
+            .stream_completion(&req, "req-err-stall", tx, cancel)
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(res.is_err(), "Stalled error body read must be cancelled");
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("Request cancelled by user"),
+            "Expected cancellation error, got: {}",
+            err
+        );
+        assert!(elapsed < std::time::Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn test_ai_010_provider_cancellation_anthropic() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                let _ = socket.write_all(header.as_bytes()).await;
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        });
+
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key-mock");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel_clone.cancel();
+        });
+
+        let req = CompletionRequest {
+            prompt: "test".into(),
+            system: None,
+            model: None,
+            temperature: None,
+            max_tokens: None,
+        };
+
+        let start = std::time::Instant::now();
+        let res = stream_anthropic(
+            &format!("http://{}", addr),
+            &req,
+            "req-anthropic-stall",
+            tx,
+            cancel,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("Request cancelled by user"));
+        assert!(elapsed < std::time::Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn test_ai_011_provider_cancellation_gemini() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                let _ = socket.write_all(header.as_bytes()).await;
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        });
+
+        std::env::set_var("GEMINI_API_KEY", "test-key-mock");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel_clone.cancel();
+        });
+
+        let req = CompletionRequest {
+            prompt: "test".into(),
+            system: None,
+            model: None,
+            temperature: None,
+            max_tokens: None,
+        };
+
+        let start = std::time::Instant::now();
+        let res = stream_gemini(
+            &format!("http://{}", addr),
+            &req,
+            "req-gemini-stall",
+            tx,
+            cancel,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("Request cancelled by user"));
+        assert!(elapsed < std::time::Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn test_ai_012_provider_cancellation_ollama() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n";
+                let _ = socket.write_all(header.as_bytes()).await;
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        });
+
+        let provider = LocalOllamaProvider::new(&format!("http://{}", addr));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel_clone.cancel();
+        });
+
+        let req = CompletionRequest {
+            prompt: "test".into(),
+            system: None,
+            model: None,
+            temperature: None,
+            max_tokens: None,
+        };
+
+        let start = std::time::Instant::now();
+        let res = provider
+            .stream_completion(&req, "req-ollama-stall", tx, cancel)
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("Request cancelled by user"));
+        assert!(elapsed < std::time::Duration::from_secs(2));
     }
 }
