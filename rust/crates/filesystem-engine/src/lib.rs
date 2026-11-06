@@ -7,6 +7,31 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
+/// Positively identifies an operating system cross-device link error (EXDEV on Unix, ERROR_NOT_SAME_DEVICE on Windows).
+/// Strictly excludes permission denied, sharing violations, not found, or generic I/O errors.
+pub fn is_cross_device_error(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::CrossesDevices {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        if let Some(code) = err.raw_os_error() {
+            if code == 18 {
+                return true;
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(code) = err.raw_os_error() {
+            if code == 17 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Sanitizes an untrusted user-provided relative path for capability operations.
 /// Strictly rejects path traversals (`..`), drive prefixes, absolute roots,
 /// Alternate Data Streams (`:`), Windows device names (CON, NUL, PRN, etc.),
@@ -1232,7 +1257,7 @@ impl WorkspaceCapability {
                 let stage_abs = self.root_path.join(&stage_rel);
                 match std::fs::rename(&stage_abs, &target) {
                     Ok(()) => target,
-                    Err(_) => {
+                    Err(e) if is_cross_device_error(&e) => {
                         std::fs::copy(&stage_abs, &target).map_err(AetherError::Io)?;
                         let copied_bytes = std::fs::read(&target).map_err(AetherError::Io)?;
                         use sha2::{Digest, Sha256};
@@ -1246,8 +1271,22 @@ impl WorkspaceCapability {
                                 user_path
                             )));
                         }
+                        // Re-verify source stability before removing stage file
+                        let source_bytes = self.dir.read(&stage_rel).map_err(AetherError::Io)?;
+                        let mut src_hasher = Sha256::new();
+                        src_hasher.update(&source_bytes);
+                        let src_hash = format!("{:x}", src_hasher.finalize());
+                        if src_hash != expected_hash {
+                            return Err(AetherError::PermissionDenied(format!(
+                                "Concurrent source modification detected during cross-device quarantine copy for '{}'. Staged source preserved without deletion.",
+                                user_path
+                            )));
+                        }
                         self.dir.remove_file(&stage_rel).map_err(AetherError::Io)?;
                         target
+                    }
+                    Err(e) => {
+                        return Err(AetherError::Io(e));
                     }
                 }
             } else {

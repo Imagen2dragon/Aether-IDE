@@ -15,3 +15,4 @@ chrono.workspace = true
 tracing.workspace = true
 sha2.workspace = true
 parking_lot.workspace = true
+cap-std.workspace = true

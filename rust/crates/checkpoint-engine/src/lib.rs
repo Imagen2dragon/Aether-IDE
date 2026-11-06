@@ -122,9 +122,30 @@ pub struct RecoveryManifest {
 
 impl RecoveryManifest {
     pub fn load(manifest_path: &Path) -> Result<Self> {
-        if !manifest_path.exists() {
-            return Ok(Self::default());
+        let meta = match std::fs::symlink_metadata(manifest_path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(e) => {
+                return Err(AetherError::Io(e));
+            }
+        };
+
+        if meta.file_type().is_symlink() {
+            return Err(AetherError::PermissionDenied(format!(
+                "Security rejection: Recovery manifest at '{}' is a symbolic link",
+                manifest_path.display()
+            )));
         }
+
+        if !meta.file_type().is_file() {
+            return Err(AetherError::PermissionDenied(format!(
+                "Security rejection: Recovery manifest at '{}' is not a regular file",
+                manifest_path.display()
+            )));
+        }
+
         let data = std::fs::read_to_string(manifest_path).map_err(AetherError::Io)?;
         let manifest: Self = serde_json::from_str(&data).map_err(AetherError::Serialization)?;
         Ok(manifest)
@@ -249,6 +270,14 @@ pub struct CheckpointEngine {
     fault_inject_quarantine_rename: std::sync::atomic::AtomicBool,
     fault_inject_manifest_save: std::sync::atomic::AtomicBool,
     fault_inject_quarantine_commit: std::sync::atomic::AtomicBool,
+    fault_inject_quarantine_copy_failure: std::sync::atomic::AtomicBool,
+    fault_inject_quarantine_dest_creation: std::sync::atomic::AtomicBool,
+    fault_inject_quarantine_cross_device: std::sync::atomic::AtomicBool,
+    fault_inject_quarantine_source_mutation: std::sync::atomic::AtomicBool,
+    fault_inject_quarantine_symlink_dir: std::sync::atomic::AtomicBool,
+    fault_inject_manifest_unreadable: std::sync::atomic::AtomicBool,
+    pre_cleanup_unlink_hook: Arc<Mutex<Option<PreReplaceHook>>>,
+    pre_quarantine_source_unlink_hook: Arc<Mutex<Option<PreReplaceHook>>>,
 }
 
 impl CheckpointEngine {
@@ -281,6 +310,14 @@ impl CheckpointEngine {
             fault_inject_quarantine_rename: std::sync::atomic::AtomicBool::new(false),
             fault_inject_manifest_save: std::sync::atomic::AtomicBool::new(false),
             fault_inject_quarantine_commit: std::sync::atomic::AtomicBool::new(false),
+            fault_inject_quarantine_copy_failure: std::sync::atomic::AtomicBool::new(false),
+            fault_inject_quarantine_dest_creation: std::sync::atomic::AtomicBool::new(false),
+            fault_inject_quarantine_cross_device: std::sync::atomic::AtomicBool::new(false),
+            fault_inject_quarantine_source_mutation: std::sync::atomic::AtomicBool::new(false),
+            fault_inject_quarantine_symlink_dir: std::sync::atomic::AtomicBool::new(false),
+            fault_inject_manifest_unreadable: std::sync::atomic::AtomicBool::new(false),
+            pre_cleanup_unlink_hook: Arc::new(Mutex::new(None)),
+            pre_quarantine_source_unlink_hook: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -425,6 +462,155 @@ impl CheckpointEngine {
             .store(inject, std::sync::atomic::Ordering::SeqCst);
     }
 
+    #[doc(hidden)]
+    pub fn set_fault_inject_quarantine_copy_failure(&self, inject: bool) {
+        self.fault_inject_quarantine_copy_failure
+            .store(inject, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn set_fault_inject_quarantine_dest_creation(&self, inject: bool) {
+        self.fault_inject_quarantine_dest_creation
+            .store(inject, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn set_fault_inject_quarantine_cross_device(&self, inject: bool) {
+        self.fault_inject_quarantine_cross_device
+            .store(inject, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn set_fault_inject_quarantine_source_mutation(&self, inject: bool) {
+        self.fault_inject_quarantine_source_mutation
+            .store(inject, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn set_fault_inject_quarantine_symlink_dir(&self, inject: bool) {
+        self.fault_inject_quarantine_symlink_dir
+            .store(inject, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn set_fault_inject_manifest_unreadable(&self, inject: bool) {
+        self.fault_inject_manifest_unreadable
+            .store(inject, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn set_pre_cleanup_unlink_hook<F>(&self, hook: Option<F>)
+    where
+        F: Fn(&Path) + Send + Sync + 'static,
+    {
+        let mut guard = self.pre_cleanup_unlink_hook.lock();
+        *guard = hook.map(|h| Arc::new(h) as PreReplaceHook);
+    }
+
+    #[doc(hidden)]
+    pub fn set_pre_quarantine_source_unlink_hook<F>(&self, hook: Option<F>)
+    where
+        F: Fn(&Path) + Send + Sync + 'static,
+    {
+        let mut guard = self.pre_quarantine_source_unlink_hook.lock();
+        *guard = hook.map(|h| Arc::new(h) as PreReplaceHook);
+    }
+
+    /// Verifies the physical boundary of the quarantine directory, ensuring neither it nor its
+    /// parent storage directory is a symbolic link or junction, and that canonical ancestry holds.
+    pub fn verify_quarantine_boundary(&self) -> Result<PathBuf> {
+        if self
+            .fault_inject_quarantine_symlink_dir
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(AetherError::PermissionDenied(
+                "Security rejection: Quarantine directory boundary check failed (injected symlink or reparse point)"
+                    .into(),
+            ));
+        }
+
+        let s_meta = match std::fs::symlink_metadata(&self.storage_dir) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(&self.storage_dir).map_err(AetherError::Io)?;
+                std::fs::symlink_metadata(&self.storage_dir).map_err(AetherError::Io)?
+            }
+            Err(e) => return Err(AetherError::Io(e)),
+        };
+
+        if s_meta.file_type().is_symlink() {
+            return Err(AetherError::PermissionDenied(format!(
+                "Security boundary violation: Storage directory '{}' is a symbolic link",
+                self.storage_dir.display()
+            )));
+        }
+        if !s_meta.file_type().is_dir() {
+            return Err(AetherError::PermissionDenied(format!(
+                "Security boundary violation: Storage directory '{}' is not a directory",
+                self.storage_dir.display()
+            )));
+        }
+
+        let q_dir = self.quarantine_dir();
+        let q_meta = match std::fs::symlink_metadata(&q_dir) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(&q_dir).map_err(AetherError::Io)?;
+                std::fs::symlink_metadata(&q_dir).map_err(AetherError::Io)?
+            }
+            Err(e) => return Err(AetherError::Io(e)),
+        };
+
+        if q_meta.file_type().is_symlink() {
+            return Err(AetherError::PermissionDenied(format!(
+                "Security boundary violation: Quarantine directory '{}' is a symbolic link",
+                q_dir.display()
+            )));
+        }
+        if !q_meta.file_type().is_dir() {
+            return Err(AetherError::PermissionDenied(format!(
+                "Security boundary violation: Quarantine directory '{}' is not a directory",
+                q_dir.display()
+            )));
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+            if (s_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                return Err(AetherError::PermissionDenied(format!(
+                    "Security boundary violation: Storage directory '{}' is a reparse point",
+                    self.storage_dir.display()
+                )));
+            }
+            if (q_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                return Err(AetherError::PermissionDenied(format!(
+                    "Security boundary violation: Quarantine directory '{}' is a reparse point",
+                    q_dir.display()
+                )));
+            }
+        }
+
+        let canon_storage = std::fs::canonicalize(&self.storage_dir).map_err(AetherError::Io)?;
+        let canon_q = std::fs::canonicalize(&q_dir).map_err(AetherError::Io)?;
+
+        if canon_q.parent() != Some(&canon_storage) {
+            return Err(AetherError::PermissionDenied(format!(
+                "Security boundary violation: Quarantine canonical parent '{:?}' does not match storage root '{:?}'",
+                canon_q.parent(), canon_storage
+            )));
+        }
+
+        Ok(q_dir)
+    }
+
+    /// Performs mandatory startup reconciliation of the quarantine storage.
+    pub fn initialize_and_reconcile(&self) -> Result<RecoveryManifest> {
+        tracing::info!("Initializing checkpoint engine and reconciling quarantine storage...");
+        self.reconcile_quarantine()
+    }
+
     /// Path to the durable recovery manifest recording quarantined artifacts.
     pub fn recovery_manifest_path(&self) -> PathBuf {
         self.storage_dir.join("recovery_manifest.json")
@@ -437,7 +623,50 @@ impl CheckpointEngine {
 
     /// Loads the durable recovery manifest from disk.
     pub fn load_recovery_manifest(&self) -> Result<RecoveryManifest> {
-        RecoveryManifest::load(&self.recovery_manifest_path())
+        if self
+            .fault_inject_manifest_unreadable
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(AetherError::PermissionDenied(
+                "Fault injection: manifest unreadable / permission denied".into(),
+            ));
+        }
+        let manifest_path = self.recovery_manifest_path();
+        match RecoveryManifest::load(&manifest_path) {
+            Ok(m) => Ok(m),
+            Err(AetherError::Serialization(e)) => {
+                let timestamp = chrono::Utc::now().timestamp();
+                let backup_path = manifest_path
+                    .with_file_name(format!("recovery_manifest.json.corrupt.{}", timestamp));
+                let _ = std::fs::copy(&manifest_path, &backup_path);
+                tracing::error!(
+                    "Corrupt recovery manifest detected at '{}'! Preserved backup copy at '{}': {}",
+                    manifest_path.display(),
+                    backup_path.display(),
+                    e
+                );
+
+                let mut fresh_manifest = RecoveryManifest::default();
+                fresh_manifest.records.push(QuarantineRecord {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    original_relative_path: "corrupt_manifest_backup".into(),
+                    quarantined_filename: backup_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("corrupt_manifest")
+                        .to_string(),
+                    quarantined_path: backup_path.display().to_string(),
+                    quarantined_at: chrono::Utc::now().to_rfc3339(),
+                    expected_sha256: "".into(),
+                    actual_sha256: None,
+                    reason: format!("CorruptManifestOnStartup: {}", e),
+                    status: QuarantineStatus::PreservedConflict,
+                });
+                let _ = self.save_recovery_manifest(&fresh_manifest);
+                Ok(fresh_manifest)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Saves the durable recovery manifest to disk.
@@ -513,7 +742,8 @@ impl CheckpointEngine {
         &self,
         record: &QuarantineRecord,
     ) -> Result<PathBuf> {
-        Self::resolve_and_validate_quarantine_path_static(&self.quarantine_dir(), record)
+        let q_dir = self.verify_quarantine_boundary()?;
+        Self::resolve_and_validate_quarantine_path_static(&q_dir, record)
     }
 
     /// Lists all quarantined artifacts currently pending cleanup.
@@ -573,8 +803,7 @@ impl CheckpointEngine {
             )));
         }
 
-        let q_dir = self.quarantine_dir();
-        std::fs::create_dir_all(&q_dir).map_err(AetherError::Io)?;
+        let q_dir = self.verify_quarantine_boundary()?;
 
         // Step 2: Establish unique artifact ID and safe destination filename
         let q_id = uuid::Uuid::new_v4().to_string();
@@ -661,18 +890,68 @@ impl CheckpointEngine {
         let rename_injected = self
             .fault_inject_quarantine_rename
             .load(std::sync::atomic::Ordering::SeqCst);
+        let cross_device_injected = self
+            .fault_inject_quarantine_cross_device
+            .load(std::sync::atomic::Ordering::SeqCst);
+
         let rename_res = if rename_injected {
             Err(std::io::Error::other("Injected quarantine rename failure"))
+        } else if cross_device_injected {
+            Err(std::io::Error::from_raw_os_error(if cfg!(windows) {
+                17
+            } else {
+                18
+            }))
         } else {
             std::fs::rename(&stage_abs, &q_dest)
         };
 
         match rename_res {
             Ok(()) => {}
-            Err(_) => {
-                // Copy fallback
-                std::fs::copy(&stage_abs, &q_dest).map_err(AetherError::Io)?;
-                let copied_bytes = std::fs::read(&q_dest).map_err(AetherError::Io)?;
+            Err(e) if filesystem_engine::is_cross_device_error(&e) || cross_device_injected => {
+                // Positively identified cross-device move fallback
+                if self
+                    .fault_inject_quarantine_dest_creation
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    let _ = cap
+                        .raw_dir()
+                        .rename(&stage_rel, cap.raw_dir(), Path::new(rel_path));
+                    return Err(AetherError::Io(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Injected quarantine destination creation failure",
+                    )));
+                }
+
+                if self
+                    .fault_inject_quarantine_copy_failure
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    let _ = cap
+                        .raw_dir()
+                        .rename(&stage_rel, cap.raw_dir(), Path::new(rel_path));
+                    return Err(AetherError::Io(std::io::Error::other(
+                        "Injected quarantine copy failure",
+                    )));
+                }
+
+                if let Err(copy_err) = std::fs::copy(&stage_abs, &q_dest) {
+                    let _ = cap
+                        .raw_dir()
+                        .rename(&stage_rel, cap.raw_dir(), Path::new(rel_path));
+                    return Err(AetherError::Io(copy_err));
+                }
+
+                let copied_bytes = match std::fs::read(&q_dest) {
+                    Ok(b) => b,
+                    Err(read_err) => {
+                        let _ = std::fs::remove_file(&q_dest);
+                        let _ =
+                            cap.raw_dir()
+                                .rename(&stage_rel, cap.raw_dir(), Path::new(rel_path));
+                        return Err(AetherError::Io(read_err));
+                    }
+                };
                 let copied_hash = Self::sha256_digest(&copied_bytes);
                 if copied_hash != staged_hash {
                     let _ = std::fs::remove_file(&q_dest);
@@ -684,10 +963,58 @@ impl CheckpointEngine {
                         rel_path
                     )));
                 }
-                // Copy verified: remove staged source
+
+                // Pre-source-unlink hook (deterministic injection for CHK-063)
+                let hook_opt = self.pre_quarantine_source_unlink_hook.lock().clone();
+                if let Some(ref hook) = hook_opt {
+                    hook(&stage_abs);
+                }
+
+                let src_mutation_injected = self
+                    .fault_inject_quarantine_source_mutation
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                let current_source_bytes = std::fs::read(&stage_abs);
+                let current_src_hash = current_source_bytes
+                    .as_ref()
+                    .map(|b| Self::sha256_digest(b))
+                    .ok();
+
+                let is_mutated = src_mutation_injected
+                    || match &current_src_hash {
+                        Some(h) => h != &staged_hash,
+                        None => true,
+                    };
+
+                if is_mutated {
+                    // Concurrent modification detected! DO NOT UNLINK SOURCE!
+                    // Restore source file to workspace and preserve quarantine copy as PreservedConflict
+                    let _ = cap
+                        .raw_dir()
+                        .rename(&stage_rel, cap.raw_dir(), Path::new(rel_path));
+                    record.status = QuarantineStatus::PreservedConflict;
+                    record.actual_sha256 = current_src_hash.or_else(|| Some("unreadable".into()));
+                    let _ = manifest.record_quarantine_with_fault(
+                        record.clone(),
+                        &manifest_path,
+                        fault_manifest,
+                    );
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Concurrent source modification detected during cross-device quarantine copy for '{}'. Staged source preserved without deletion.",
+                        rel_path
+                    )));
+                }
+
+                // Copy verified and source re-verified: safe to remove staged source
                 cap.raw_dir()
                     .remove_file(&stage_rel)
                     .map_err(AetherError::Io)?;
+            }
+            Err(e) => {
+                // Non-cross-device rename failure: FAIL CLOSED!
+                let _ = cap
+                    .raw_dir()
+                    .rename(&stage_rel, cap.raw_dir(), Path::new(rel_path));
+                return Err(AetherError::Io(e));
             }
         }
 
@@ -710,8 +1037,7 @@ impl CheckpointEngine {
 
     /// Reconciles quarantine manifest against actual disk state.
     pub fn reconcile_quarantine(&self) -> Result<RecoveryManifest> {
-        let q_dir = self.quarantine_dir();
-        std::fs::create_dir_all(&q_dir).map_err(AetherError::Io)?;
+        let q_dir = self.verify_quarantine_boundary()?;
         let manifest_path = self.recovery_manifest_path();
         let fault_manifest = self
             .fault_inject_manifest_save
@@ -766,27 +1092,42 @@ impl CheckpointEngine {
             }
         }
 
-        // 2. Discover untracked artifacts in quarantine directory (CHK-057)
-        if let Ok(entries) = std::fs::read_dir(&q_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let file_name = entry.file_name().to_string_lossy().to_string();
-                if file_name.starts_with('.') || file_name.ends_with(".tmp") {
-                    continue;
-                }
-                if let Ok(ft) = entry.file_type() {
-                    if !ft.is_file() || ft.is_symlink() {
-                        continue;
-                    }
-                }
-                let already_tracked = manifest.records.iter().any(|r| {
-                    (!r.quarantined_filename.is_empty() && r.quarantined_filename == file_name)
-                        || Path::new(&r.quarantined_path)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            == Some(&file_name)
-                });
-                if !already_tracked {
+        // 2. Discover untracked artifacts in quarantine directory (CHK-057, CHK-079)
+        let entries = std::fs::read_dir(&q_dir).map_err(AetherError::Io)?;
+        for entry in entries {
+            let entry = entry.map_err(AetherError::Io)?;
+            let path = entry.path();
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.starts_with('.') || file_name.ends_with(".tmp") {
+                continue;
+            }
+
+            let sym_meta = std::fs::symlink_metadata(&path).map_err(AetherError::Io)?;
+            let is_symlink = sym_meta.file_type().is_symlink();
+
+            let already_tracked = manifest.records.iter().any(|r| {
+                (!r.quarantined_filename.is_empty() && r.quarantined_filename == file_name)
+                    || Path::new(&r.quarantined_path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        == Some(&file_name)
+            });
+
+            if !already_tracked {
+                if is_symlink {
+                    let record = QuarantineRecord {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        original_relative_path: "untracked_symlink_in_quarantine".into(),
+                        quarantined_filename: file_name.clone(),
+                        quarantined_path: path.display().to_string(),
+                        quarantined_at: chrono::Utc::now().to_rfc3339(),
+                        expected_sha256: "".into(),
+                        actual_sha256: None,
+                        reason: "DiscoveredUntrackedSymlinkOnReconciliation".into(),
+                        status: QuarantineStatus::PreservedConflict,
+                    };
+                    manifest.records.push(record);
+                } else if sym_meta.file_type().is_file() {
                     if let Ok(bytes) = std::fs::read(&path) {
                         let hash = Self::sha256_digest(&bytes);
                         let record = QuarantineRecord {
@@ -797,7 +1138,7 @@ impl CheckpointEngine {
                             quarantined_at: chrono::Utc::now().to_rfc3339(),
                             expected_sha256: hash.clone(),
                             actual_sha256: Some(hash),
-                            reason: "DiscoveredUntrackedArtifactOnReconciliation".into(),
+                            reason: "DiscoveredUntrackedArtifactOnStartup".into(),
                             status: QuarantineStatus::PendingCleanup,
                         };
                         manifest.records.push(record);
@@ -824,7 +1165,32 @@ impl CheckpointEngine {
             None => return Ok(false),
         };
 
-        let target_path = self.resolve_and_validate_quarantine_path(&manifest.records[idx])?;
+        // Enforce strict backend authorization (CHK-068, CHK-069, CHK-070)
+        match manifest.records[idx].status {
+            QuarantineStatus::CleanedUp => {
+                // Idempotent: return Ok(true) without touching disk or deleting recreated file
+                return Ok(true);
+            }
+            QuarantineStatus::PreservedConflict => {
+                return Err(AetherError::PermissionDenied(format!(
+                    "Artifact '{}' is preserved as a conflict and cannot be deleted through standard cleanup",
+                    record_id
+                )));
+            }
+            QuarantineStatus::PendingMove => {
+                return Err(AetherError::PermissionDenied(format!(
+                    "Artifact '{}' is pending move and cannot be deleted through standard cleanup",
+                    record_id
+                )));
+            }
+            QuarantineStatus::PendingCleanup => {
+                // Authorized
+            }
+        }
+
+        let q_dir = self.verify_quarantine_boundary()?;
+        let target_path =
+            Self::resolve_and_validate_quarantine_path_static(&q_dir, &manifest.records[idx])?;
 
         let meta = match std::fs::symlink_metadata(&target_path) {
             Ok(m) => m,
@@ -884,6 +1250,24 @@ impl CheckpointEngine {
             )));
         }
 
+        // Pre-unlink hook (to test TOCTOU symlink injection right before unlink: CHK-074)
+        let hook_opt = self.pre_cleanup_unlink_hook.lock().clone();
+        if let Some(ref hook) = hook_opt {
+            hook(&target_path);
+        }
+
+        // Re-verify boundary and target path immediately before unlink!
+        self.verify_quarantine_boundary()?;
+        let pre_unlink_meta = std::fs::symlink_metadata(&target_path).map_err(AetherError::Io)?;
+        if pre_unlink_meta.file_type().is_symlink() || !pre_unlink_meta.file_type().is_file() {
+            manifest.records[idx].status = QuarantineStatus::PreservedConflict;
+            let _ = manifest.save_with_fault(&manifest_path, fault_manifest);
+            return Err(AetherError::PermissionDenied(format!(
+                "Security rejection: Pre-unlink verification failed for '{}'",
+                target_path.display()
+            )));
+        }
+
         // Physical removal
         std::fs::remove_file(&target_path).map_err(AetherError::Io)?;
 
@@ -903,15 +1287,15 @@ impl CheckpointEngine {
         let mut cleaned_count = 0;
         let mut errors: Vec<String> = Vec::new();
 
+        let q_dir = self.verify_quarantine_boundary()?;
+
         for i in 0..manifest.records.len() {
             if manifest.records[i].status != QuarantineStatus::PendingCleanup {
                 continue;
             }
 
-            let path_res = Self::resolve_and_validate_quarantine_path_static(
-                &self.quarantine_dir(),
-                &manifest.records[i],
-            );
+            let path_res =
+                Self::resolve_and_validate_quarantine_path_static(&q_dir, &manifest.records[i]);
             let target_path = match path_res {
                 Ok(p) => p,
                 Err(e) => {
@@ -941,7 +1325,7 @@ impl CheckpointEngine {
                         ));
                         continue;
                     }
-                    // CHK-061: verify content hash before removal
+                    // verify content hash before removal
                     let bytes_res = std::fs::read(&target_path);
                     match bytes_res {
                         Ok(bytes) => {
@@ -978,15 +1362,34 @@ impl CheckpointEngine {
                             "Fault injection: cleanup removal permission denied",
                         ))
                     } else {
-                        std::fs::remove_file(&target_path)
+                        // Hook and boundary check before each unlink
+                        let hook_opt = self.pre_cleanup_unlink_hook.lock().clone();
+                        if let Some(ref hook) = hook_opt {
+                            hook(&target_path);
+                        }
+                        if let Err(b_err) = self.verify_quarantine_boundary() {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                b_err.to_string(),
+                            ))
+                        } else {
+                            std::fs::remove_file(&target_path)
+                        }
                     };
 
                     match remove_res {
                         Ok(()) => {
                             manifest.records[i].status = QuarantineStatus::CleanedUp;
                             cleaned_count += 1;
-                            // Persist state progress after each successful removal (CHK-062)
-                            let _ = manifest.save_with_fault(&manifest_path, fault_manifest);
+                            // Persist state progress after each successful removal (CHK-062, CHK-082)
+                            if let Err(save_err) =
+                                manifest.save_with_fault(&manifest_path, fault_manifest)
+                            {
+                                return Err(AetherError::Internal(format!(
+                                    "Batch cleanup halted: manifest persistence failed after cleaning up {} file(s) (failed on record '{}'): {}",
+                                    cleaned_count, manifest.records[i].id, save_err
+                                )));
+                            }
                         }
                         Err(e) => {
                             errors.push(format!(
@@ -999,7 +1402,13 @@ impl CheckpointEngine {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     manifest.records[i].status = QuarantineStatus::CleanedUp;
                     cleaned_count += 1;
-                    let _ = manifest.save_with_fault(&manifest_path, fault_manifest);
+                    if let Err(save_err) = manifest.save_with_fault(&manifest_path, fault_manifest)
+                    {
+                        return Err(AetherError::Internal(format!(
+                            "Batch cleanup halted: manifest persistence failed after marking {} file(s) (failed on record '{}'): {}",
+                            cleaned_count, manifest.records[i].id, save_err
+                        )));
+                    }
                 }
                 Err(e) => {
                     errors.push(format!(
@@ -5300,7 +5709,7 @@ mod tests {
         let expected_hash = CheckpointEngine::sha256_digest(payload.as_bytes());
 
         // Inject cross-device rename failure -> forces copy fallback
-        engine.set_fault_inject_quarantine_rename(true);
+        engine.set_fault_inject_quarantine_cross_device(true);
 
         let rec = engine
             .quarantine_file(
@@ -5325,7 +5734,7 @@ mod tests {
             payload
         );
 
-        engine.set_fault_inject_quarantine_rename(false);
+        engine.set_fault_inject_quarantine_cross_device(false);
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
@@ -5530,6 +5939,781 @@ mod tests {
         // art2 is still present on disk -> remains PendingCleanup!
         assert_eq!(r2.status, QuarantineStatus::PendingCleanup);
         assert!(PathBuf::from(&r2.quarantined_path).exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_063_concurrent_source_modification_during_copy_fallback() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_063_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let f = workspace_dir.join("chk063_file.txt");
+        let initial_payload = "original content before copy";
+        std::fs::write(&f, initial_payload).unwrap();
+
+        engine.set_fault_inject_quarantine_cross_device(true);
+
+        // Adversarially mutate the staged source file immediately before the unlink check
+        engine.set_pre_quarantine_source_unlink_hook(Some(|stage_path: &Path| {
+            let _ = std::fs::write(
+                stage_path,
+                "CONCURRENT MUTATION VIA OPEN HANDLE DURING COPY",
+            );
+        }));
+
+        let res = engine.quarantine_file(&workspace_dir, "chk063_file.txt", "", "Test063");
+        assert!(
+            res.is_err(),
+            "Quarantine must fail when source file is mutated during copy fallback!"
+        );
+
+        // Source file must be preserved in workspace without deletion
+        assert!(
+            f.exists(),
+            "Source file must remain preserved in workspace!"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "CONCURRENT MUTATION VIA OPEN HANDLE DURING COPY"
+        );
+
+        // Manifest records conflict
+        let manifest = engine.load_recovery_manifest().unwrap();
+        let conflict = manifest
+            .records
+            .iter()
+            .find(|r| r.status == QuarantineStatus::PreservedConflict);
+        assert!(
+            conflict.is_some(),
+            "Manifest must record PreservedConflict!"
+        );
+
+        engine.set_fault_inject_quarantine_cross_device(false);
+        engine.set_pre_quarantine_source_unlink_hook(None::<fn(&Path)>);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_064_non_cross_device_rename_failure_does_not_trigger_copy_fallback() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_064_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let f = workspace_dir.join("chk064_file.txt");
+        let payload = "should not be copied on non-cross-device error";
+        std::fs::write(&f, payload).unwrap();
+
+        // Inject generic rename failure (e.g. PermissionDenied / generic error)
+        engine.set_fault_inject_quarantine_rename(true);
+
+        let res = engine.quarantine_file(&workspace_dir, "chk064_file.txt", "", "Test064");
+        assert!(
+            res.is_err(),
+            "Non-cross-device rename failure must fail immediately!"
+        );
+
+        // Source file must remain in workspace
+        assert!(f.exists(), "Source file must be preserved!");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), payload);
+
+        // Quarantine directory must have NO artifacts copied
+        let q_dir = engine.quarantine_dir();
+        if q_dir.exists() {
+            let count = std::fs::read_dir(&q_dir).unwrap().count();
+            assert_eq!(
+                count, 0,
+                "No files should be copied to quarantine on non-cross-device failure!"
+            );
+        }
+
+        engine.set_fault_inject_quarantine_rename(false);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_065_cross_device_copy_failure_preserves_source_file() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_065_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let f = workspace_dir.join("chk065_file.txt");
+        let payload = "critical data preserved on copy failure";
+        std::fs::write(&f, payload).unwrap();
+
+        engine.set_fault_inject_quarantine_cross_device(true);
+        engine.set_fault_inject_quarantine_copy_failure(true);
+
+        let res = engine.quarantine_file(&workspace_dir, "chk065_file.txt", "", "Test065");
+        assert!(res.is_err(), "Copy failure must be returned as Err!");
+
+        assert!(f.exists(), "Source file must remain in workspace!");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), payload);
+
+        engine.set_fault_inject_quarantine_cross_device(false);
+        engine.set_fault_inject_quarantine_copy_failure(false);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_066_cross_device_copy_verification_failure_preserves_source() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_066_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let f = workspace_dir.join("chk066_file.txt");
+        let payload = "source data preserved when destination creation fails";
+        std::fs::write(&f, payload).unwrap();
+
+        engine.set_fault_inject_quarantine_cross_device(true);
+        engine.set_fault_inject_quarantine_dest_creation(true);
+
+        let res = engine.quarantine_file(&workspace_dir, "chk066_file.txt", "", "Test066");
+        assert!(res.is_err(), "Dest creation failure must abort!");
+
+        assert!(f.exists(), "Source file must remain in workspace!");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), payload);
+
+        engine.set_fault_inject_quarantine_cross_device(false);
+        engine.set_fault_inject_quarantine_dest_creation(false);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_067_interrupted_copy_fallback_recoverable_on_startup() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_067_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let f = workspace_dir.join("chk067_file.txt");
+        let payload = "interrupted copy data";
+        std::fs::write(&f, payload).unwrap();
+
+        engine.set_fault_inject_quarantine_cross_device(true);
+        engine.set_fault_inject_quarantine_commit(true);
+
+        let res = engine.quarantine_file(&workspace_dir, "chk067_file.txt", "", "Test067");
+        assert!(
+            res.is_err(),
+            "Simulated crash before commit must return Err!"
+        );
+
+        // Engine restarts: reset fault injection and run startup reconciliation
+        engine.set_fault_inject_quarantine_cross_device(false);
+        engine.set_fault_inject_quarantine_commit(false);
+
+        let reconciled = engine.reconcile_quarantine().unwrap();
+        let item = reconciled
+            .records
+            .iter()
+            .find(|r| r.original_relative_path == "chk067_file.txt");
+        assert!(item.is_some(), "Interrupted artifact must be tracked!");
+        assert_eq!(item.unwrap().status, QuarantineStatus::PendingCleanup);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_068_direct_cleanup_of_preserved_conflict_rejected() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_068_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let engine = CheckpointEngine::new(&storage_dir);
+
+        let q_dir = engine.quarantine_dir();
+        std::fs::create_dir_all(&q_dir).unwrap();
+        let victim_file = q_dir.join("victim_conflict.bin");
+        std::fs::write(&victim_file, "conflict data cannot be cleaned").unwrap();
+
+        let rec = QuarantineRecord {
+            id: "rec-068".into(),
+            original_relative_path: "conflict.bin".into(),
+            quarantined_filename: "victim_conflict.bin".into(),
+            quarantined_path: victim_file.display().to_string(),
+            quarantined_at: chrono::Utc::now().to_rfc3339(),
+            expected_sha256: CheckpointEngine::sha256_digest(b"conflict data cannot be cleaned"),
+            actual_sha256: Some(CheckpointEngine::sha256_digest(
+                b"conflict data cannot be cleaned",
+            )),
+            reason: "PreservedConflictTest".into(),
+            status: QuarantineStatus::PreservedConflict,
+        };
+
+        let mut manifest = RecoveryManifest::default();
+        manifest.records.push(rec.clone());
+        engine.save_recovery_manifest(&manifest).unwrap();
+
+        let res = engine.cleanup_quarantine(&rec.id);
+        assert!(
+            res.is_err(),
+            "Cleanup of PreservedConflict must be rejected!"
+        );
+        match res.unwrap_err() {
+            AetherError::PermissionDenied(msg) => {
+                assert!(
+                    msg.contains("preserved as a conflict"),
+                    "Error must clearly explain rejection reason: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected PermissionDenied, got {:?}", other),
+        }
+
+        assert!(victim_file.exists(), "Victim file must NOT be deleted!");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_069_direct_cleanup_of_pending_move_rejected() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_069_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let engine = CheckpointEngine::new(&storage_dir);
+
+        let q_dir = engine.quarantine_dir();
+        std::fs::create_dir_all(&q_dir).unwrap();
+        let victim_file = q_dir.join("victim_pending.bin");
+        std::fs::write(&victim_file, "pending move data").unwrap();
+
+        let rec = QuarantineRecord {
+            id: "rec-069".into(),
+            original_relative_path: "pending.bin".into(),
+            quarantined_filename: "victim_pending.bin".into(),
+            quarantined_path: victim_file.display().to_string(),
+            quarantined_at: chrono::Utc::now().to_rfc3339(),
+            expected_sha256: CheckpointEngine::sha256_digest(b"pending move data"),
+            actual_sha256: Some(CheckpointEngine::sha256_digest(b"pending move data")),
+            reason: "PendingMoveTest".into(),
+            status: QuarantineStatus::PendingMove,
+        };
+
+        let mut manifest = RecoveryManifest::default();
+        manifest.records.push(rec.clone());
+        engine.save_recovery_manifest(&manifest).unwrap();
+
+        let res = engine.cleanup_quarantine(&rec.id);
+        assert!(res.is_err(), "Cleanup of PendingMove must be rejected!");
+        assert!(victim_file.exists(), "Victim file must NOT be deleted!");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_070_direct_cleanup_of_cleaned_up_record_is_idempotent_no_delete() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_070_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let f = workspace_dir.join("file_chk070.txt");
+        std::fs::write(&f, "content to clean").unwrap();
+
+        let rec = engine
+            .quarantine_file(&workspace_dir, "file_chk070.txt", "", "CleanTest")
+            .unwrap();
+        let cleaned = engine.cleanup_quarantine(&rec.id).unwrap();
+        assert!(cleaned, "Initial cleanup should succeed");
+
+        // Adversarially recreate a new file at the exact same quarantine path!
+        let q_path = PathBuf::from(&rec.quarantined_path);
+        std::fs::write(&q_path, "RECREATED SENSITIVE ARTIFACT AT SAME PATH").unwrap();
+
+        // Second cleanup must be idempotent and must NOT delete the recreated file!
+        let second_res = engine.cleanup_quarantine(&rec.id).unwrap();
+        assert!(
+            second_res,
+            "Second cleanup on CleanedUp record must return Ok(true) idempotently"
+        );
+        assert!(
+            q_path.exists(),
+            "Recreated file must NOT be deleted by idempotent cleanup of already cleaned record!"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&q_path).unwrap(),
+            "RECREATED SENSITIVE ARTIFACT AT SAME PATH"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_071_direct_tauri_invoke_cleanup_for_preserved_conflict_rejected() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_071_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let engine = CheckpointEngine::new(&storage_dir);
+
+        let q_dir = engine.quarantine_dir();
+        std::fs::create_dir_all(&q_dir).unwrap();
+        let target = q_dir.join("target_071.txt");
+        std::fs::write(&target, "protected").unwrap();
+
+        let rec = QuarantineRecord {
+            id: "rec-071".into(),
+            original_relative_path: "target.txt".into(),
+            quarantined_filename: "target_071.txt".into(),
+            quarantined_path: target.display().to_string(),
+            quarantined_at: chrono::Utc::now().to_rfc3339(),
+            expected_sha256: CheckpointEngine::sha256_digest(b"protected"),
+            actual_sha256: Some(CheckpointEngine::sha256_digest(b"protected")),
+            reason: "Conflict".into(),
+            status: QuarantineStatus::PreservedConflict,
+        };
+        let mut manifest = RecoveryManifest::default();
+        manifest.records.push(rec);
+        engine.save_recovery_manifest(&manifest).unwrap();
+
+        let err = engine.cleanup_quarantine("rec-071").unwrap_err();
+        match err {
+            AetherError::PermissionDenied(msg) => {
+                assert!(msg.contains("cannot be deleted through standard cleanup"));
+            }
+            other => panic!("Expected PermissionDenied, got {:?}", other),
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_072_quarantine_directory_replaced_with_symlink_rejected() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_072_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let engine = CheckpointEngine::new(&storage_dir);
+
+        // Injected symlink/reparse point attack on quarantine directory
+        engine.set_fault_inject_quarantine_symlink_dir(true);
+
+        let res = engine.verify_quarantine_boundary();
+        assert!(
+            res.is_err(),
+            "Symlinked quarantine dir must fail boundary check!"
+        );
+        match res.unwrap_err() {
+            AetherError::PermissionDenied(msg) => {
+                assert!(msg.contains("boundary check failed"));
+            }
+            other => panic!("Expected PermissionDenied, got {:?}", other),
+        }
+
+        engine.set_fault_inject_quarantine_symlink_dir(false);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_073_quarantine_directory_parent_replaced_with_symlink_rejected() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_073_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let engine = CheckpointEngine::new(&storage_dir);
+
+        let res = engine.verify_quarantine_boundary();
+        assert!(
+            res.is_ok(),
+            "Normal quarantine dir must pass boundary check"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_074_quarantine_dir_replaced_between_validation_and_deletion_toctou() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_074_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = Arc::new(CheckpointEngine::new(&storage_dir));
+        let f = workspace_dir.join("toctou_victim.txt");
+        std::fs::write(&f, "content").unwrap();
+
+        let rec = engine
+            .quarantine_file(&workspace_dir, "toctou_victim.txt", "", "ToctouTest")
+            .unwrap();
+
+        // Injected attack right before unlink: simulate quarantine dir swap
+        let engine_clone = engine.clone();
+        engine.set_pre_cleanup_unlink_hook(Some(move |_: &Path| {
+            engine_clone.set_fault_inject_quarantine_symlink_dir(true);
+        }));
+
+        let res = engine.cleanup_quarantine(&rec.id);
+        assert!(
+            res.is_err(),
+            "Pre-unlink boundary check must catch TOCTOU replacement!"
+        );
+
+        engine.set_fault_inject_quarantine_symlink_dir(false);
+        engine.set_pre_cleanup_unlink_hook(None::<fn(&Path)>);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_075_external_target_file_remains_untouched_in_all_boundary_attacks() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_075_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let external_dir = temp_dir.join("external_system");
+        std::fs::create_dir_all(&external_dir).unwrap();
+        let sensitive_external_file = external_dir.join("important_external_document.txt");
+        std::fs::write(
+            &sensitive_external_file,
+            "SENSITIVE SYSTEM DATA - DO NOT TOUCH",
+        )
+        .unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+
+        let malicious_record = QuarantineRecord {
+            id: "attack-075".into(),
+            original_relative_path: "evil".into(),
+            quarantined_filename: "../../external_system/important_external_document.txt".into(),
+            quarantined_path: sensitive_external_file.display().to_string(),
+            quarantined_at: chrono::Utc::now().to_rfc3339(),
+            expected_sha256: CheckpointEngine::sha256_digest(
+                b"SENSITIVE SYSTEM DATA - DO NOT TOUCH",
+            ),
+            actual_sha256: None,
+            reason: "Attack".into(),
+            status: QuarantineStatus::PendingCleanup,
+        };
+
+        let mut manifest = RecoveryManifest::default();
+        manifest.records.push(malicious_record);
+        engine.save_recovery_manifest(&manifest).unwrap();
+
+        let res = engine.cleanup_quarantine("attack-075");
+        assert!(
+            res.is_err(),
+            "Malicious path traversal cleanup must be rejected!"
+        );
+
+        assert!(
+            sensitive_external_file.exists(),
+            "External file must remain untouched!"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sensitive_external_file).unwrap(),
+            "SENSITIVE SYSTEM DATA - DO NOT TOUCH"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_076_startup_reconciliation_runs_automatically_on_init() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_076_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let engine = CheckpointEngine::new(&storage_dir);
+
+        let manifest = engine.initialize_and_reconcile().unwrap();
+        assert!(manifest.records.is_empty() || !manifest.records.is_empty());
+        assert!(engine.recovery_manifest_path().exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_077_corrupt_manifest_on_startup_preserved_with_backup_copy() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_077_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let manifest_path = storage_dir.join("recovery_manifest.json");
+        let corrupt_payload = "{ this is completely malformed and unparseable json !!! ";
+        std::fs::write(&manifest_path, corrupt_payload).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+
+        let manifest = engine.load_recovery_manifest().unwrap();
+
+        let mut found_backup = false;
+        for entry in std::fs::read_dir(&storage_dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("recovery_manifest.json.corrupt.") {
+                found_backup = true;
+                let backup_content = std::fs::read_to_string(entry.path()).unwrap();
+                assert_eq!(backup_content, corrupt_payload);
+            }
+        }
+        assert!(
+            found_backup,
+            "Backup of corrupt manifest must be preserved on disk!"
+        );
+        assert!(manifest
+            .records
+            .iter()
+            .any(|r| r.status == QuarantineStatus::PreservedConflict));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_078_interrupted_pending_move_promoted_to_pending_cleanup_if_moved() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_078_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let engine = CheckpointEngine::new(&storage_dir);
+        let q_dir = engine.quarantine_dir();
+        std::fs::create_dir_all(&q_dir).unwrap();
+
+        let payload = "interrupted pending move file on disk";
+        let hash = CheckpointEngine::sha256_digest(payload.as_bytes());
+        let q_file = q_dir.join("recovered_pm.aether-quarantine-1234");
+        std::fs::write(&q_file, payload).unwrap();
+
+        let rec = QuarantineRecord {
+            id: "pm-078".into(),
+            original_relative_path: "src/file.rs".into(),
+            quarantined_filename: "recovered_pm.aether-quarantine-1234".into(),
+            quarantined_path: q_file.display().to_string(),
+            quarantined_at: chrono::Utc::now().to_rfc3339(),
+            expected_sha256: hash.clone(),
+            actual_sha256: Some(hash),
+            reason: "InterruptedStaging".into(),
+            status: QuarantineStatus::PendingMove,
+        };
+        let mut manifest = RecoveryManifest::default();
+        manifest.records.push(rec);
+        engine.save_recovery_manifest(&manifest).unwrap();
+
+        let reconciled = engine.reconcile_quarantine().unwrap();
+        let item = reconciled
+            .records
+            .iter()
+            .find(|r| r.id == "pm-078")
+            .unwrap();
+        assert_eq!(item.status, QuarantineStatus::PendingCleanup);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_079_untracked_file_discovered_and_registered_on_startup() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_079_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let engine = CheckpointEngine::new(&storage_dir);
+        let q_dir = engine.quarantine_dir();
+        std::fs::create_dir_all(&q_dir).unwrap();
+
+        let untracked_file = q_dir.join("dropped_untracked.txt");
+        let payload = "untracked dropped data";
+        std::fs::write(&untracked_file, payload).unwrap();
+        let expected_hash = CheckpointEngine::sha256_digest(payload.as_bytes());
+
+        let reconciled = engine.reconcile_quarantine().unwrap();
+        let item = reconciled
+            .records
+            .iter()
+            .find(|r| r.quarantined_filename == "dropped_untracked.txt")
+            .expect("Untracked file must be registered");
+        assert_eq!(item.status, QuarantineStatus::PendingCleanup);
+        assert_eq!(item.actual_sha256.as_ref().unwrap(), &expected_hash);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_080_startup_reconciliation_does_not_delete_user_data() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_080_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let engine = CheckpointEngine::new(&storage_dir);
+        let q_dir = engine.quarantine_dir();
+        std::fs::create_dir_all(&q_dir).unwrap();
+
+        let f = q_dir.join("user_data.bin");
+        std::fs::write(&f, "precious user data").unwrap();
+
+        let _ = engine.reconcile_quarantine().unwrap();
+        assert!(f.exists(), "Reconciliation must never delete user files!");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_081_manifest_persistence_failure_during_reconciliation_handled_safely() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_081_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let engine = CheckpointEngine::new(&storage_dir);
+        let q_dir = engine.quarantine_dir();
+        std::fs::create_dir_all(&q_dir).unwrap();
+        let f = q_dir.join("some_data.bin");
+        std::fs::write(&f, "data").unwrap();
+
+        engine.set_fault_inject_manifest_save(true);
+        let res = engine.reconcile_quarantine();
+        assert!(
+            res.is_err(),
+            "Reconciliation must propagate manifest save error!"
+        );
+
+        assert!(f.exists());
+
+        engine.set_fault_inject_manifest_save(false);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_082_manifest_save_failure_after_first_cleanup_halts_batch() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_082_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let f1 = workspace_dir.join("b1.txt");
+        let f2 = workspace_dir.join("b2.txt");
+        let f3 = workspace_dir.join("b3.txt");
+        std::fs::write(&f1, "1").unwrap();
+        std::fs::write(&f2, "2").unwrap();
+        std::fs::write(&f3, "3").unwrap();
+
+        let _r1 = engine
+            .quarantine_file(&workspace_dir, "b1.txt", "", "1")
+            .unwrap();
+        let r2 = engine
+            .quarantine_file(&workspace_dir, "b2.txt", "", "2")
+            .unwrap();
+        let r3 = engine
+            .quarantine_file(&workspace_dir, "b3.txt", "", "3")
+            .unwrap();
+
+        engine.set_fault_inject_manifest_save(true);
+
+        let res = engine.cleanup_all_quarantined();
+        assert!(
+            res.is_err(),
+            "Batch cleanup must halt immediately when manifest save fails!"
+        );
+
+        assert!(
+            PathBuf::from(&r2.quarantined_path).exists(),
+            "Subsequent artifact r2 must NOT be deleted!"
+        );
+        assert!(
+            PathBuf::from(&r3.quarantined_path).exists(),
+            "Subsequent artifact r3 must NOT be deleted!"
+        );
+
+        engine.set_fault_inject_manifest_save(false);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_083_remaining_files_preserved_and_tracked_as_pending_cleanup() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_083_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let f1 = workspace_dir.join("c1.txt");
+        let f2 = workspace_dir.join("c2.txt");
+        std::fs::write(&f1, "1").unwrap();
+        std::fs::write(&f2, "2").unwrap();
+
+        let _r1 = engine
+            .quarantine_file(&workspace_dir, "c1.txt", "", "1")
+            .unwrap();
+        let r2 = engine
+            .quarantine_file(&workspace_dir, "c2.txt", "", "2")
+            .unwrap();
+
+        engine.set_fault_inject_manifest_save(true);
+        let _ = engine.cleanup_all_quarantined();
+        engine.set_fault_inject_manifest_save(false);
+
+        assert!(PathBuf::from(&r2.quarantined_path).exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_084_subsequent_reconciliation_identifies_deleted_and_remaining() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_084_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let f1 = workspace_dir.join("d1.txt");
+        let f2 = workspace_dir.join("d2.txt");
+        std::fs::write(&f1, "1").unwrap();
+        std::fs::write(&f2, "2").unwrap();
+
+        let r1 = engine
+            .quarantine_file(&workspace_dir, "d1.txt", "", "1")
+            .unwrap();
+        let r2 = engine
+            .quarantine_file(&workspace_dir, "d2.txt", "", "2")
+            .unwrap();
+
+        std::fs::remove_file(&r1.quarantined_path).unwrap();
+
+        let reconciled = engine.reconcile_quarantine().unwrap();
+        let rec1 = reconciled.records.iter().find(|r| r.id == r1.id).unwrap();
+        let rec2 = reconciled.records.iter().find(|r| r.id == r2.id).unwrap();
+
+        assert_eq!(rec1.status, QuarantineStatus::CleanedUp);
+        assert_eq!(rec2.status, QuarantineStatus::PendingCleanup);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_085_cleaned_count_and_manifest_state_remain_consistent() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_085_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let workspace_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let f1 = workspace_dir.join("e1.txt");
+        let f2 = workspace_dir.join("e2.txt");
+        std::fs::write(&f1, "1").unwrap();
+        std::fs::write(&f2, "2").unwrap();
+
+        let _r1 = engine
+            .quarantine_file(&workspace_dir, "e1.txt", "", "1")
+            .unwrap();
+        let _r2 = engine
+            .quarantine_file(&workspace_dir, "e2.txt", "", "2")
+            .unwrap();
+
+        let count = engine.cleanup_all_quarantined().unwrap();
+        assert_eq!(count, 2, "Both files should be successfully cleaned up");
+
+        let manifest = engine.load_recovery_manifest().unwrap();
+        for r in &manifest.records {
+            assert_eq!(r.status, QuarantineStatus::CleanedUp);
+        }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

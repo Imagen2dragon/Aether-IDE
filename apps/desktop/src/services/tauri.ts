@@ -21,6 +21,7 @@ import type {
   ProposalReviewPreview,
   ProviderStatus,
   QuarantineRecord,
+  RecoveryManifest,
   StorageAnalysisReport,
   StorageCleanupReport,
   StructuredProposal,
@@ -326,6 +327,10 @@ export class TauriService {
 
   static async cleanupQuarantineRecord(id: string): Promise<boolean> {
     return invoke("checkpoint_cleanup_quarantine", { id });
+  }
+
+  static async reconcileQuarantine(): Promise<RecoveryManifest> {
+    return invoke("checkpoint_reconcile_quarantine");
   }
 
   // --- Git Engine ---

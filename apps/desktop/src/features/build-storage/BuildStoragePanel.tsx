@@ -699,23 +699,58 @@ export const BuildStoragePanel: React.FC<BuildStoragePanelProps> = ({ onBuildLog
                   <HardDrive size={13} />
                   <span>Durable Quarantine & Recovery Storage</span>
                 </div>
-                <button
-                  onClick={loadQuarantineRecords}
-                  style={{
-                    background: "none",
-                    border: "none",
-                    color: "var(--text-muted)",
-                    cursor: "pointer",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 4,
-                    fontSize: 10,
-                  }}
-                  title="Refresh Quarantine Records"
-                >
-                  <RefreshCw size={10} />
-                  <span>Refresh</span>
-                </button>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <button
+                    onClick={async () => {
+                      try {
+                        const manifest = await TauriService.reconcileQuarantine();
+                        setQuarantineRecords(manifest.records);
+                        setQuarantineActionMsg({
+                          id: "reconcile",
+                          success: true,
+                          msg: `Reconciliation complete (${manifest.records.length} tracked items).`,
+                        });
+                      } catch (err: any) {
+                        setQuarantineActionMsg({
+                          id: "reconcile",
+                          success: false,
+                          msg: `Reconciliation error: ${err}`,
+                        });
+                      }
+                    }}
+                    style={{
+                      background: "none",
+                      border: "none",
+                      color: "var(--accent-cyan)",
+                      cursor: "pointer",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 4,
+                      fontSize: 10,
+                    }}
+                    title="Reconcile Quarantine Records"
+                  >
+                    <RefreshCw size={10} />
+                    <span>Reconcile</span>
+                  </button>
+                  <button
+                    onClick={loadQuarantineRecords}
+                    style={{
+                      background: "none",
+                      border: "none",
+                      color: "var(--text-muted)",
+                      cursor: "pointer",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 4,
+                      fontSize: 10,
+                    }}
+                    title="Refresh Quarantine Records"
+                  >
+                    <RefreshCw size={10} />
+                    <span>Refresh</span>
+                  </button>
+                </div>
               </div>
 
               {quarantineActionMsg && (

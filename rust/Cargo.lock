@@ -476,6 +476,7 @@ name = "checkpoint-engine"
 version = "0.1.0"
 dependencies = [
  "application-core",
+ "cap-std",
  "chrono",
  "database-engine",
  "filesystem-engine",

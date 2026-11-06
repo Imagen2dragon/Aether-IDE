@@ -130,3 +130,14 @@ pub async fn checkpoint_cleanup_quarantine(app: AppHandle, id: String) -> Result
         .cleanup_quarantine(&id)
         .map_err(|e| format!("Failed to cleanup quarantine record: {}", e))
 }
+
+#[tauri::command]
+pub async fn checkpoint_reconcile_quarantine(
+    app: AppHandle,
+) -> Result<checkpoint_engine::RecoveryManifest, String> {
+    let engine_arc = app.state::<SharedCheckpointEngine>();
+    let engine = engine_arc.lock();
+    engine
+        .reconcile_quarantine()
+        .map_err(|e| format!("Failed to reconcile quarantine: {}", e))
+}
