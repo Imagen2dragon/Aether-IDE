@@ -6385,9 +6385,17 @@ mod tests {
         assert_eq!(engine.list_quarantined_artifacts().unwrap().len(), 2);
 
         // Clean up artifact 1
-        let cleaned1 = engine.cleanup_quarantine(&rec1.id).unwrap();
-        assert!(cleaned1);
-        assert!(!PathBuf::from(&rec1.quarantined_path).exists());
+        #[cfg(windows)]
+        {
+            let cleaned1 = engine.cleanup_quarantine(&rec1.id).unwrap();
+            assert!(cleaned1);
+            assert!(!PathBuf::from(&rec1.quarantined_path).exists());
+        }
+        #[cfg(not(windows))]
+        {
+            let res1 = engine.cleanup_quarantine(&rec1.id);
+            assert!(res1.is_err(), "POSIX cleanup must fail closed");
+        }
 
         // Simulate application crash/interruption: process exits without cleaning artifact 2.
         // On next application startup, a new CheckpointEngine is initialized at the same storage_dir:
@@ -7180,8 +7188,24 @@ mod tests {
         let rec = engine
             .quarantine_file(&workspace_dir, "file_chk070.txt", "", "CleanTest")
             .unwrap();
-        let cleaned = engine.cleanup_quarantine(&rec.id).unwrap();
-        assert!(cleaned, "Initial cleanup should succeed");
+
+        #[cfg(windows)]
+        {
+            let cleaned = engine.cleanup_quarantine(&rec.id).unwrap();
+            assert!(cleaned, "Initial cleanup should succeed on Windows");
+        }
+        #[cfg(not(windows))]
+        {
+            // On POSIX cleanup fails closed; set record status to CleanedUp to verify idempotency contract
+            let mut manifest = engine.load_recovery_manifest().unwrap();
+            let idx = manifest
+                .records
+                .iter()
+                .position(|r| r.id == rec.id)
+                .unwrap();
+            manifest.records[idx].status = QuarantineStatus::CleanedUp;
+            engine.save_recovery_manifest(&manifest).unwrap();
+        }
 
         // Adversarially recreate a new file at the exact same quarantine path!
         let q_path = PathBuf::from(&rec.quarantined_path);
@@ -7659,12 +7683,24 @@ mod tests {
             .quarantine_file(&workspace_dir, "e2.txt", "", "2")
             .unwrap();
 
-        let count = engine.cleanup_all_quarantined().unwrap();
-        assert_eq!(count, 2, "Both files should be successfully cleaned up");
+        #[cfg(windows)]
+        {
+            let count = engine.cleanup_all_quarantined().unwrap();
+            assert_eq!(count, 2, "Both files should be successfully cleaned up");
 
-        let manifest = engine.load_recovery_manifest().unwrap();
-        for r in &manifest.records {
-            assert_eq!(r.status, QuarantineStatus::CleanedUp);
+            let manifest = engine.load_recovery_manifest().unwrap();
+            for r in &manifest.records {
+                assert_eq!(r.status, QuarantineStatus::CleanedUp);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let res = engine.cleanup_all_quarantined();
+            assert!(res.is_err(), "POSIX batch cleanup must fail closed");
+            let manifest = engine.load_recovery_manifest().unwrap();
+            for r in &manifest.records {
+                assert_eq!(r.status, QuarantineStatus::PreservedConflict);
+            }
         }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -8046,11 +8082,22 @@ mod tests {
             .find(|r| r.original_relative_path == "batch_095_2.txt")
             .unwrap();
 
-        assert_eq!(
-            rec1.status,
-            QuarantineStatus::CleanedUp,
-            "Unmodified file should be cleaned up"
-        );
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                rec1.status,
+                QuarantineStatus::CleanedUp,
+                "Unmodified file should be cleaned up on Windows"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                rec1.status,
+                QuarantineStatus::PreservedConflict,
+                "Unmodified file must fail closed and be preserved on POSIX"
+            );
+        }
         assert_eq!(
             rec2.status,
             QuarantineStatus::PreservedConflict,
