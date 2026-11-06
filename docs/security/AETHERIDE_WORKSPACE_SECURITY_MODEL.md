@@ -314,6 +314,45 @@ To eliminate irreversible destruction of recoverable user data when external pro
    - If manifest persistence fails during single or batch cleanup, the operation halts immediately.
    - On Windows, if a file was physically removed before manifest persistence failed, the engine records the exact inconsistency and enters `RecoveryBlocked`, ensuring startup reconciliation can safely recover state without silent data loss.
 
+### 5.5 Sprint 23.2.13 Security Advancements: Atomic No-Overwrite Rollback, Windows Staged-Object Identity & Fail-Closed Persistence
+
+1. **Atomic No-Overwrite Publication via Hard Link (`publish_no_overwrite`):**
+   - Ordinary POSIX/Windows `rename()` atomically replaces any existing destination file. Relying on an existence check followed by `rename()` creates a TOCTOU race: an external actor can recreate the destination file between the check and rename, causing the rollback to silently overwrite the newly created file.
+   - AetherIDE replaces rename-based rollback with an atomic no-overwrite publication primitive using `q_cap_dir.hard_link(...)`:
+     * Before attempting publication, destination absence is verified via `classify_dir_entry_existence`.
+     * `q_cap_dir.hard_link(clean_stage_name, q_cap_dir, destination_name)` is invoked. Under NTFS and standard POSIX filesystems, hard link creation is atomic and strictly fails with `ErrorKind::AlreadyExists` if the destination path already exists.
+     * If the destination was recreated concurrently, the hard link fails atomically without touching or overwriting the destination file.
+     * The engine falls through to conflict publication, generating a collision-safe unique filename (`<filename>.preserved-conflict.<uuid>`).
+     * Only after `hard_link` succeeds and post-publication existence is verified on disk does the engine remove `clean_stage_name`.
+
+2. **Resilience to Staging Link Removal Failure:**
+   - If the publication hard link succeeds and post-publication existence is confirmed, the artifact is safely and durably published at its destination.
+   - If removing the staging link (`clean_stage_name`) subsequently fails (due to permissions or transient filesystem lock), the operation **does not** discard or invalidate the published file.
+   - `StageRollbackResult` records `is_conflict` accurately, sets `surviving_filename` to the published destination, and includes a structured warning detailing the staging link cleanup error. Data is preserved without silent loss or false error reports.
+
+3. **Staging Name Retention & Fail-Closed RecoveryBlocked Gating:**
+   - If all publication attempts (original destination and 5 conflict attempts) fail, the staged candidate is preserved on disk at `clean_stage_name`.
+   - The engine immediately activates `RecoveryBlocked`, recording the exact failure reason and staging filename.
+   - The recovery manifest references the actual staging path, guaranteeing startup reconciliation can locate and recover the artifact.
+
+4. **Windows Staged-Object Identity Binding (`FileObjectIdentity`):**
+   - In NTFS and ReFS, an object's file system identity is uniquely determined by `(dwVolumeSerialNumber, nFileIndexHigh, nFileIndexLow)`.
+   - In `CheckpointEngine`, immediately following the rename of a quarantine file to its private staging name (`clean_stage_name`), `filesystem_engine::query_file_object_identity` captures this identity.
+   - In `remove_file_windows_exclusive`:
+     * Opens the file with `custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)` and `share_mode(0)` (exclusive sharing).
+     * Calls `GetFileType` and confirms `FILE_TYPE_DISK`.
+     * Calls `GetFileInformationByHandle` and validates `actual_identity == expected_identity`.
+     * Rejects any identity mismatch fail-closed, ensuring that if an external actor replaced or substituted the staged file (even with identical content bytes or an identical reparse point), deletion is aborted and the staged file is preserved.
+     * Verifies content SHA-256 digest through the same open exclusive handle.
+     * Applies `FileDispositionInfo (DeleteFile = 1)` only after identity and digest verification both succeed.
+
+5. **Universal Fail-Closed Manifest Persistence (`persist_manifest_or_block_recovery`):**
+   - Eliminates all unhandled or ignored manifest saves, including the previous unhandled save on missing entries in batch cleanup.
+   - Every single-cleanup and batch-cleanup manifest update routes through `persist_manifest_or_block_recovery`:
+     * If saving fails, `RecoveryBlocked` is activated with structured context: affected record ID, surviving artifact path (or `"(physically removed)"` / `"(already absent)"`), and the underlying I/O error.
+     * In batch cleanup (`cleanup_all_quarantined`), any persistence error immediately halts processing; subsequent items are not touched.
+     * The IDE refuses all further destructive or state-changing checkpoint operations until a successful startup reconciliation (`reconcile_quarantine`) re-synchronizes the manifest with disk state.
+
 ---
 
 ## 6. AI Gateway Streaming & Cancellation

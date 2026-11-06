@@ -32,9 +32,17 @@ pub fn is_cross_device_error(err: &std::io::Error) -> bool {
     false
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileObjectIdentity {
+    pub volume_serial_number: u32,
+    pub file_index_high: u32,
+    pub file_index_low: u32,
+}
+
 #[cfg(windows)]
 thread_local! {
     static FAULT_INJECT_WINDOWS_REPARSE_POINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAULT_INJECT_WINDOWS_IDENTITY_MISMATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(windows)]
@@ -47,6 +55,16 @@ pub fn is_fault_inject_windows_reparse_point() -> bool {
     FAULT_INJECT_WINDOWS_REPARSE_POINT.with(|cell| cell.get())
 }
 
+#[cfg(windows)]
+pub fn set_fault_inject_windows_identity_mismatch(inject: bool) {
+    FAULT_INJECT_WINDOWS_IDENTITY_MISMATCH.with(|cell| cell.set(inject));
+}
+
+#[cfg(windows)]
+pub fn is_fault_inject_windows_identity_mismatch() -> bool {
+    FAULT_INJECT_WINDOWS_IDENTITY_MISMATCH.with(|cell| cell.get())
+}
+
 #[cfg(not(windows))]
 pub fn set_fault_inject_windows_reparse_point(_inject: bool) {}
 
@@ -55,8 +73,100 @@ pub fn is_fault_inject_windows_reparse_point() -> bool {
     false
 }
 
+#[cfg(not(windows))]
+pub fn set_fault_inject_windows_identity_mismatch(_inject: bool) {}
+
+#[cfg(not(windows))]
+pub fn is_fault_inject_windows_identity_mismatch() -> bool {
+    false
+}
+
 #[cfg(windows)]
-pub fn remove_file_windows_exclusive(path: &Path, expected_hash: &str) -> Result<()> {
+pub fn query_file_object_identity(path: &Path) -> Result<FileObjectIdentity> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
+    const FILE_TYPE_DISK: u32 = 0x0001;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(AetherError::Io)?;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct BY_HANDLE_FILE_INFORMATION {
+        dwFileAttributes: u32,
+        ftCreationTime: [u32; 2],
+        ftLastAccessTime: [u32; 2],
+        ftLastWriteTime: [u32; 2],
+        dwVolumeSerialNumber: u32,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+        nNumberOfLinks: u32,
+        nFileIndexHigh: u32,
+        nFileIndexLow: u32,
+    }
+    extern "system" {
+        fn GetFileType(hFile: *mut std::ffi::c_void) -> u32;
+        fn GetFileInformationByHandle(
+            hFile: *mut std::ffi::c_void,
+            lpFileInformation: *mut BY_HANDLE_FILE_INFORMATION,
+        ) -> i32;
+    }
+
+    let file_type = unsafe { GetFileType(file.as_raw_handle()) };
+    if file_type != FILE_TYPE_DISK {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is not a standard disk file (file type: 0x{:x})",
+            path.display(),
+            file_type
+        )));
+    }
+
+    let mut by_handle_info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    let info_res =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), by_handle_info.as_mut_ptr()) };
+    if info_res == 0 {
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+    let file_info = unsafe { by_handle_info.assume_init() };
+
+    let is_reparse = (file_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    let is_dir = (file_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    if is_reparse || is_dir {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is a reparse point or directory (attributes: 0x{:x}); refusing identity query",
+            path.display(),
+            file_info.dwFileAttributes
+        )));
+    }
+
+    Ok(FileObjectIdentity {
+        volume_serial_number: file_info.dwVolumeSerialNumber,
+        file_index_high: file_info.nFileIndexHigh,
+        file_index_low: file_info.nFileIndexLow,
+    })
+}
+
+#[cfg(not(windows))]
+pub fn query_file_object_identity(_path: &Path) -> Result<FileObjectIdentity> {
+    Ok(FileObjectIdentity {
+        volume_serial_number: 0,
+        file_index_high: 0,
+        file_index_low: 0,
+    })
+}
+
+#[cfg(windows)]
+pub fn remove_file_windows_exclusive(
+    path: &Path,
+    expected_hash: &str,
+    expected_identity: Option<FileObjectIdentity>,
+) -> Result<()> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
     use std::os::windows::fs::OpenOptionsExt;
@@ -133,6 +243,31 @@ pub fn remove_file_windows_exclusive(path: &Path, expected_hash: &str) -> Result
         )));
     }
 
+    let actual_identity = FileObjectIdentity {
+        volume_serial_number: file_info.dwVolumeSerialNumber,
+        file_index_high: file_info.nFileIndexHigh,
+        file_index_low: file_info.nFileIndexLow,
+    };
+
+    let fault_identity = is_fault_inject_windows_identity_mismatch();
+    if fault_identity {
+        return Err(AetherError::PermissionDenied(format!(
+            "Security rejection: Injected file identity mismatch for '{}'",
+            path.display()
+        )));
+    }
+
+    if let Some(expected) = expected_identity {
+        if actual_identity != expected {
+            return Err(AetherError::PermissionDenied(format!(
+                "Security rejection: Opened file identity for '{}' does not match the authorized staged object identity (expected {:?}, found {:?}). Staged candidate preserved without deletion.",
+                path.display(),
+                expected,
+                actual_identity
+            )));
+        }
+    }
+
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(AetherError::Io)?;
     let mut hasher = Sha256::new();
@@ -176,6 +311,17 @@ pub fn remove_file_windows_exclusive(path: &Path, expected_hash: &str) -> Result
 
     drop(file);
     Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn remove_file_windows_exclusive(
+    _path: &Path,
+    _expected_hash: &str,
+    _expected_identity: Option<FileObjectIdentity>,
+) -> Result<()> {
+    Err(AetherError::PermissionDenied(
+        "Windows exclusive deletion is unsupported on non-Windows platforms".into(),
+    ))
 }
 
 /// Sanitizes an untrusted user-provided relative path for capability operations.
@@ -1456,7 +1602,7 @@ impl WorkspaceCapability {
                             // 3. If hash matches, set FileDispositionInfo (DeleteFile = 1) on the handle.
                             // 4. Closing the handle unlinks the file atomically at kernel level without race.
                             if let Err(err) =
-                                remove_file_windows_exclusive(&stage_abs, expected_hash)
+                                remove_file_windows_exclusive(&stage_abs, expected_hash, None)
                             {
                                 return Err(AetherError::PermissionDenied(format!(
                                     "Exclusive source stability could not be verified for '{}' ({}). Staged source preserved at '{}' and quarantine copy preserved at '{}'.",
