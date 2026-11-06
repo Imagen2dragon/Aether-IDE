@@ -2507,12 +2507,13 @@ mod tests {
         let cap = WorkspaceCapability::open(&temp_dir).unwrap();
 
         let file_path = temp_dir.join("prod_retained.txt");
-        fs::write(&file_path, "initial production state").unwrap();
+        let initial_payload = vec![0x58u8; 1024 * 1024]; // 1MB payload to ensure reliable window
+        fs::write(&file_path, &initial_payload).unwrap();
 
         let initial_hash = {
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
-            hasher.update(b"initial production state");
+            hasher.update(&initial_payload);
             format!("{:x}", hasher.finalize())
         };
 
@@ -2523,24 +2524,33 @@ mod tests {
             .open(&file_path)
             .unwrap();
 
+        let path_clone = file_path.clone();
+        let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ready_clone = ready.clone();
         let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let r_flag = running.clone();
+
         let writer_thread = std::thread::spawn(move || {
             use std::io::{Seek, SeekFrom, Write};
-            let mut counter = 0u64;
-            while r_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                counter += 1;
-                let msg = format!(
-                    "mutation via retained handle during prod delete! iteration {}",
-                    counter
-                );
-                let _ = retained_handle.seek(SeekFrom::Start(0));
-                let _ = retained_handle.write_all(msg.as_bytes());
-                let _ = retained_handle.set_len(msg.len() as u64);
-                let _ = retained_handle.flush();
-                std::thread::yield_now();
+            ready_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Spin until staging rename moves prod_retained.txt away
+            while r_flag.load(std::sync::atomic::Ordering::Relaxed) && path_clone.exists() {
+                std::hint::spin_loop();
             }
+            if path_clone.exists() {
+                return;
+            }
+            // Staging rename completed: write immediately through retained handle
+            let msg = b"mutation via retained handle during prod delete!";
+            let _ = retained_handle.seek(SeekFrom::Start(0));
+            let _ = retained_handle.write_all(msg);
+            let _ = retained_handle.flush();
         });
+
+        // Ensure writer thread is active and spinning before initiating deletion
+        while !ready.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
 
         // Call ordinary production wrapper with DEFAULT hooks (no post_hash_hook!)
         let outcome = cap
@@ -2557,8 +2567,8 @@ mod tests {
         assert!(outcome.surviving_path.is_some());
         let surviving = outcome.surviving_path.unwrap();
         assert!(surviving.exists(), "Surviving file must exist on disk!");
-        let content = fs::read_to_string(&surviving).unwrap();
-        assert!(content.contains("mutation via retained handle during prod delete!"));
+        let content = fs::read(&surviving).unwrap();
+        assert!(content.starts_with(b"mutation via retained handle during prod delete!"));
 
         let _ = fs::remove_dir_all(temp_dir);
     }

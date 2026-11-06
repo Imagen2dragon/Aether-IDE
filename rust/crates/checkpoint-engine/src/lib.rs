@@ -3863,12 +3863,13 @@ mod tests {
 
         let cap = filesystem_engine::WorkspaceCapability::open(&workspace_dir).unwrap();
         let f_prod = workspace_dir.join("prod_file.txt");
-        std::fs::write(&f_prod, "initial payload for chk047").unwrap();
+        let initial_payload = vec![0x58u8; 1024 * 1024]; // 1MB payload to ensure reliable window
+        std::fs::write(&f_prod, &initial_payload).unwrap();
 
         let initial_hash = {
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
-            hasher.update(b"initial payload for chk047");
+            hasher.update(&initial_payload);
             format!("{:x}", hasher.finalize())
         };
 
@@ -3878,24 +3879,33 @@ mod tests {
             .open(&f_prod)
             .unwrap();
 
+        let path_clone = f_prod.clone();
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ready_clone = ready.clone();
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let r_flag = running.clone();
+
         let writer_thread = std::thread::spawn(move || {
             use std::io::{Seek, SeekFrom, Write};
-            let mut counter = 0u64;
-            while r_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                counter += 1;
-                let msg = format!(
-                    "mutation via retained handle in chk047! iteration {}",
-                    counter
-                );
-                let _ = retained_handle.seek(SeekFrom::Start(0));
-                let _ = retained_handle.write_all(msg.as_bytes());
-                let _ = retained_handle.set_len(msg.len() as u64);
-                let _ = retained_handle.flush();
-                std::thread::yield_now();
+            ready_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Spin until staging rename moves prod_file.txt away
+            while r_flag.load(std::sync::atomic::Ordering::Relaxed) && path_clone.exists() {
+                std::hint::spin_loop();
             }
+            if path_clone.exists() {
+                return;
+            }
+            // Staging rename completed: write immediately through retained handle
+            let msg = b"mutation via retained handle in chk047!";
+            let _ = retained_handle.seek(SeekFrom::Start(0));
+            let _ = retained_handle.write_all(msg);
+            let _ = retained_handle.flush();
         });
+
+        // Ensure writer thread is active and spinning before initiating deletion
+        while !ready.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
 
         // Delete using production wrapper with DEFAULT hooks
         let outcome = cap
@@ -3909,8 +3919,8 @@ mod tests {
         assert!(outcome.surviving_path.is_some());
         let surviving = outcome.surviving_path.unwrap();
         assert!(surviving.exists());
-        let content = std::fs::read_to_string(&surviving).unwrap();
-        assert!(content.contains("mutation via retained handle in chk047!"));
+        let content = std::fs::read(&surviving).unwrap();
+        assert!(content.starts_with(b"mutation via retained handle in chk047!"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
