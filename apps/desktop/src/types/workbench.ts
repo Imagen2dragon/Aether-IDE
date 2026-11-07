@@ -287,6 +287,8 @@ export interface QuarantineRecord {
   original_relative_path: string;
   quarantined_filename: string;
   quarantined_path: string;
+  retained_staging_filename?: string;
+  retained_staging_path?: string;
   quarantined_at: string;
   expected_sha256: string;
   actual_sha256?: string;

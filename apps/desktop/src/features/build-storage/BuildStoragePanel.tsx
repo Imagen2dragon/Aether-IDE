@@ -831,6 +831,11 @@ export const BuildStoragePanel: React.FC<BuildStoragePanelProps> = ({ onBuildLog
                             <div style={{ fontSize: 9, color: "var(--text-dim)", wordBreak: "break-all" }}>
                               Storage: {rec.quarantined_filename || rec.quarantined_path}
                             </div>
+                            {rec.retained_staging_filename && (
+                              <div style={{ fontSize: 9, color: "#f59e0b", wordBreak: "break-all" }}>
+                                Retained Staging Link: {rec.retained_staging_filename}
+                              </div>
+                            )}
                           </div>
                           <span
                             style={{

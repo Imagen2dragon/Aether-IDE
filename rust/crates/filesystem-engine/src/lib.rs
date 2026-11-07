@@ -34,9 +34,9 @@ pub fn is_cross_device_error(err: &std::io::Error) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileObjectIdentity {
-    pub volume_serial_number: u32,
-    pub file_index_high: u32,
-    pub file_index_low: u32,
+    pub volume_serial_number: u64,
+    pub file_index_high: u64,
+    pub file_index_low: u64,
 }
 
 #[cfg(windows)]
@@ -146,13 +146,37 @@ pub fn query_file_object_identity(path: &Path) -> Result<FileObjectIdentity> {
     }
 
     Ok(FileObjectIdentity {
-        volume_serial_number: file_info.dwVolumeSerialNumber,
-        file_index_high: file_info.nFileIndexHigh,
-        file_index_low: file_info.nFileIndexLow,
+        volume_serial_number: file_info.dwVolumeSerialNumber as u64,
+        file_index_high: file_info.nFileIndexHigh as u64,
+        file_index_low: file_info.nFileIndexLow as u64,
     })
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+pub fn query_file_object_identity(path: &Path) -> Result<FileObjectIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).map_err(AetherError::Io)?;
+    if meta.file_type().is_symlink() {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is a symlink; refusing identity query",
+            path.display()
+        )));
+    }
+    if meta.is_dir() {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is a directory; refusing identity query",
+            path.display()
+        )));
+    }
+    let ino = meta.ino();
+    Ok(FileObjectIdentity {
+        volume_serial_number: meta.dev(),
+        file_index_high: (ino >> 32) as u64,
+        file_index_low: (ino & 0xFFFFFFFF) as u64,
+    })
+}
+
+#[cfg(not(any(windows, unix)))]
 pub fn query_file_object_identity(_path: &Path) -> Result<FileObjectIdentity> {
     Ok(FileObjectIdentity {
         volume_serial_number: 0,
@@ -244,9 +268,9 @@ pub fn remove_file_windows_exclusive(
     }
 
     let actual_identity = FileObjectIdentity {
-        volume_serial_number: file_info.dwVolumeSerialNumber,
-        file_index_high: file_info.nFileIndexHigh,
-        file_index_low: file_info.nFileIndexLow,
+        volume_serial_number: file_info.dwVolumeSerialNumber as u64,
+        file_index_high: file_info.nFileIndexHigh as u64,
+        file_index_low: file_info.nFileIndexLow as u64,
     };
 
     let fault_identity = is_fault_inject_windows_identity_mismatch();

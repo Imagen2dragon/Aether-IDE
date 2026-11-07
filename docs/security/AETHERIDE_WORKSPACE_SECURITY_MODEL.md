@@ -353,6 +353,37 @@ To eliminate irreversible destruction of recoverable user data when external pro
      * In batch cleanup (`cleanup_all_quarantined`), any persistence error immediately halts processing; subsequent items are not touched.
      * The IDE refuses all further destructive or state-changing checkpoint operations until a successful startup reconciliation (`reconcile_quarantine`) re-synchronizes the manifest with disk state.
 
+### 5.6 Sprint 23.2.14 Security Advancements: Race-Free Windows Identity Binding, Recoverable Hard-Link Rollback & Durable Staging Reconciliation
+
+1. **Object Identity Binding to the Original Authorized Target (`FileObjectIdentity`):**
+   - Previous implementations captured object identity only *after* staging the file into its isolated `.aether-clean-stage-*` name. If an adversary replaced the quarantine entry prior to or during staging, the newly created replacement identity would be adopted as authoritative.
+   - In Sprint 23.2.14, `CheckpointEngine` establishes the physical file object identity (`FileObjectIdentity { volume_serial_number, file_index_high, file_index_low }`) at **Step 0** directly on the authorized original quarantine entry (`target_path`) before staging:
+     * Cross-platform support: Windows queries `GetFileInformationByHandle` (`dwVolumeSerialNumber`, `nFileIndexHigh`, `nFileIndexLow`); Unix queries `st_dev` and `st_ino`. Reparse points, symlinks, and directories are strictly rejected.
+     * Immediately following the atomic rename to `.aether-clean-stage-*`, the staged entry's object identity is queried and strictly compared against the original pre-staging identity.
+     * Any drift, mismatch, reparse point substitution, or query failure immediately halts disposal, executes atomic no-overwrite rollback to preserve both objects, updates the manifest to `PreservedConflict`, and returns `PermissionDenied` fail-closed.
+     * The original identity is passed directly to `remove_file_windows_exclusive`, ensuring that the kernel-level exclusive handle is verified against the original authorized artifact before deletion disposition is committed.
+
+2. **Race-Free Hard-Link Rollback Publication Recoverability:**
+   - When rolling back a staged artifact (`rollback_cleanup_stage`), creating a hard link at the target destination (`publish_no_overwrite`) establishes a new directory entry pointing to the underlying inode/file index.
+   - Merely verifying that the destination name exists on disk after `hard_link` does **not** prove that the destination name refers to the staged object, because an external process could have created a different file at that path immediately following a link race or collision.
+   - In Sprint 23.2.14, `publish_no_overwrite` establishes the staged file's object identity prior to linking and verifies that the created destination shares the **identical physical object identity** before considering publication verified:
+     * Post-link destination identity is verified against the staged candidate's identity.
+     * Before removing the staging link, the staging link's identity is re-verified.
+     * If destination object identity does not match, or if verification fails, the staging link is strictly preserved on disk. The engine never unlinks the only known recoverable name of an authorized artifact.
+     * The structured rollback result returns `RollbackPublicationStatus`:
+       - `PublishedVerified`: Destination verified matching identity; staging link cleanly unlinked.
+       - `PublishedWithRetainedStaging`: Destination verified; staging link retained on disk due to removal error.
+       - `PublicationConflict`: Published as collision-safe unique conflict file.
+       - `PublicationUncertainBlocked`: Neither original nor conflict destination could be proven recoverable; staging file retained and `RecoveryBlocked` activated.
+
+3. **Durable Manifest Representation of Retained Staging Artifacts:**
+   - Any staging link retained on disk during rollback is explicitly tracked in the durable recovery manifest via `retained_staging_filename: Option<String>` and `retained_staging_path: Option<String>` on `QuarantineRecord`.
+   - The UI displays explicit badges for retained staging links, preventing untracked disk accumulation.
+   - Startup reconciliation (`reconcile_quarantine`) scans quarantine storage for any `.aether-clean-stage-*` files:
+     * If referenced in an existing record's `retained_staging_filename`, reconciliation validates existence and preserves the conflict state.
+     * If unreferenced/untracked staging files exist on disk, reconciliation automatically adopts them into the durable manifest as `QuarantineStatus::PreservedConflict`, calculating SHA-256 digests and surfacing them for manual inspection.
+     * An engine in `RecoveryBlocked` can only be unblocked once reconciliation successfully proves all artifacts are tracked and consistent.
+
 ---
 
 ## 6. AI Gateway Streaming & Cancellation
