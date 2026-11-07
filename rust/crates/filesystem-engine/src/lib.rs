@@ -39,10 +39,51 @@ pub struct FileObjectIdentity {
     pub file_index_low: u64,
 }
 
+pub type WindowsPreExclusiveOpenHook = std::sync::Arc<dyn Fn(&std::path::Path) + Send + Sync>;
+pub type WindowsPostExclusiveOpenHook =
+    std::sync::Arc<dyn Fn(&std::path::Path, &std::path::Path) + Send + Sync>;
+
 #[cfg(windows)]
 thread_local! {
     static FAULT_INJECT_WINDOWS_REPARSE_POINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAULT_INJECT_WINDOWS_IDENTITY_MISMATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAULT_INJECT_WINDOWS_DEST_IDENTITY_QUERY_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static HOOK_WINDOWS_PRE_EXCLUSIVE_OPEN: std::cell::RefCell<Option<WindowsPreExclusiveOpenHook>> = const { std::cell::RefCell::new(None) };
+    static HOOK_WINDOWS_POST_EXCLUSIVE_OPEN: std::cell::RefCell<Option<WindowsPostExclusiveOpenHook>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(windows)]
+pub fn set_hook_windows_pre_exclusive_open(hook: Option<WindowsPreExclusiveOpenHook>) {
+    HOOK_WINDOWS_PRE_EXCLUSIVE_OPEN.with(|cell| {
+        *cell.borrow_mut() = hook;
+    });
+}
+
+#[cfg(windows)]
+pub fn get_hook_windows_pre_exclusive_open() -> Option<WindowsPreExclusiveOpenHook> {
+    HOOK_WINDOWS_PRE_EXCLUSIVE_OPEN.with(|cell| cell.borrow().clone())
+}
+
+#[cfg(windows)]
+pub fn set_hook_windows_post_exclusive_open(hook: Option<WindowsPostExclusiveOpenHook>) {
+    HOOK_WINDOWS_POST_EXCLUSIVE_OPEN.with(|cell| {
+        *cell.borrow_mut() = hook;
+    });
+}
+
+#[cfg(windows)]
+pub fn get_hook_windows_post_exclusive_open() -> Option<WindowsPostExclusiveOpenHook> {
+    HOOK_WINDOWS_POST_EXCLUSIVE_OPEN.with(|cell| cell.borrow().clone())
+}
+
+#[cfg(windows)]
+pub fn set_fault_inject_windows_dest_identity_query_failure(inject: bool) {
+    FAULT_INJECT_WINDOWS_DEST_IDENTITY_QUERY_FAILURE.with(|cell| cell.set(inject));
+}
+
+#[cfg(windows)]
+pub fn is_fault_inject_windows_dest_identity_query_failure() -> bool {
+    FAULT_INJECT_WINDOWS_DEST_IDENTITY_QUERY_FAILURE.with(|cell| cell.get())
 }
 
 #[cfg(windows)]
@@ -63,6 +104,30 @@ pub fn set_fault_inject_windows_identity_mismatch(inject: bool) {
 #[cfg(windows)]
 pub fn is_fault_inject_windows_identity_mismatch() -> bool {
     FAULT_INJECT_WINDOWS_IDENTITY_MISMATCH.with(|cell| cell.get())
+}
+
+#[cfg(not(windows))]
+pub fn set_hook_windows_pre_exclusive_open(_hook: Option<WindowsPreExclusiveOpenHook>) {}
+
+#[cfg(not(windows))]
+pub fn get_hook_windows_pre_exclusive_open() -> Option<WindowsPreExclusiveOpenHook> {
+    None
+}
+
+#[cfg(not(windows))]
+pub fn set_hook_windows_post_exclusive_open(_hook: Option<WindowsPostExclusiveOpenHook>) {}
+
+#[cfg(not(windows))]
+pub fn get_hook_windows_post_exclusive_open() -> Option<WindowsPostExclusiveOpenHook> {
+    None
+}
+
+#[cfg(not(windows))]
+pub fn set_fault_inject_windows_dest_identity_query_failure(_inject: bool) {}
+
+#[cfg(not(windows))]
+pub fn is_fault_inject_windows_dest_identity_query_failure() -> bool {
+    false
 }
 
 #[cfg(not(windows))]
@@ -190,6 +255,7 @@ pub fn remove_file_windows_exclusive(
     path: &Path,
     expected_hash: &str,
     expected_identity: Option<FileObjectIdentity>,
+    destination_path: Option<&Path>,
 ) -> Result<()> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
@@ -198,19 +264,24 @@ pub fn remove_file_windows_exclusive(
 
     const DELETE: u32 = 0x00010000;
     const GENERIC_READ: u32 = 0x80000000;
-    const GENERIC_WRITE: u32 = 0x40000000;
+    const FILE_SHARE_READ: u32 = 0x00000001;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
     const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
     const FILE_TYPE_DISK: u32 = 0x0001;
 
+    // Hook executed immediately before exclusive open (CHK-209, CHK-211)
+    if let Some(ref hook) = get_hook_windows_pre_exclusive_open() {
+        hook(path);
+    }
+
     // Open without following reparse points (symlinks, junctions, mount points),
-    // and with exclusive share_mode(0) (denies any concurrent read, write, or delete).
+    // and with FILE_SHARE_READ (denies any concurrent write or delete, while allowing read-only inspection
+    // such as query_file_object_identity on hard links pointing to the same file object).
     let mut file = std::fs::OpenOptions::new()
         .read(true)
-        .write(true)
-        .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
-        .share_mode(0) // EXCLUSIVE: no sharing with other handles
+        .access_mode(GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(AetherError::Io)?;
@@ -305,6 +376,44 @@ pub fn remove_file_windows_exclusive(
         )));
     }
 
+    // While exclusive handle on staging file remains open, query and verify destination identity (Sprint 23.2.16 P1)
+    if let Some(dest) = destination_path {
+        // Hook while exclusive handle is held, before destination verification (CHK-210)
+        if let Some(ref hook) = get_hook_windows_post_exclusive_open() {
+            hook(path, dest);
+        }
+
+        // Check fault injection for destination identity query failure (CHK-213)
+        if is_fault_inject_windows_dest_identity_query_failure() {
+            return Err(AetherError::Io(std::io::Error::other(
+                "Injected destination identity query failure while exclusive handle held",
+            )));
+        }
+
+        let dest_identity = query_file_object_identity(dest)?;
+
+        if dest_identity != actual_identity {
+            return Err(AetherError::PermissionDenied(format!(
+                "Security rejection: Destination '{}' identity ({:?}) does not match authorized object identity ({:?}) while exclusive handle held on staging path '{}'",
+                dest.display(),
+                dest_identity,
+                actual_identity,
+                path.display()
+            )));
+        }
+
+        if let Some(expected) = expected_identity {
+            if dest_identity != expected {
+                return Err(AetherError::PermissionDenied(format!(
+                    "Security rejection: Destination '{}' identity ({:?}) does not match expected identity ({:?})",
+                    dest.display(),
+                    dest_identity,
+                    expected
+                )));
+            }
+        }
+    }
+
     #[repr(C)]
     #[allow(non_snake_case)]
     struct FILE_DISPOSITION_INFO {
@@ -342,6 +451,7 @@ pub fn remove_file_windows_exclusive(
     _path: &Path,
     _expected_hash: &str,
     _expected_identity: Option<FileObjectIdentity>,
+    _destination_path: Option<&Path>,
 ) -> Result<()> {
     Err(AetherError::PermissionDenied(
         "Windows exclusive deletion is unsupported on non-Windows platforms".into(),
@@ -1626,7 +1736,7 @@ impl WorkspaceCapability {
                             // 3. If hash matches, set FileDispositionInfo (DeleteFile = 1) on the handle.
                             // 4. Closing the handle unlinks the file atomically at kernel level without race.
                             if let Err(err) =
-                                remove_file_windows_exclusive(&stage_abs, expected_hash, None)
+                                remove_file_windows_exclusive(&stage_abs, expected_hash, None, None)
                             {
                                 return Err(AetherError::PermissionDenied(format!(
                                     "Exclusive source stability could not be verified for '{}' ({}). Staged source preserved at '{}' and quarantine copy preserved at '{}'.",

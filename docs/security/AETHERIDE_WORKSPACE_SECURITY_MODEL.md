@@ -415,6 +415,31 @@ To eliminate irreversible destruction of recoverable user data when external pro
    - Clean reconciliation runs (where all artifacts are inspectable and verified) clear `RecoveryBlocked` and return the engine to normal operation.
    - Reconciliation is idempotent: repeated runs do not duplicate records for existing tracked or untracked artifacts.
 
+### 5.8 Sprint 23.2.16 Security Advancements: Handle-Bound Destination Verification, Race-Safe Suspicious Artifact Preservation & Exact Adversarial Hook Isolation
+
+1. **Windows Handle-Bound Destination Identity Verification (CHK-209 to CHK-214):**
+   - In previous iterations, `publish_no_overwrite` verified the destination identity, but subsequently called `remove_file_windows_exclusive` on the staging path without holding a handle binding the destination. A concurrent actor could replace the destination after the pathname identity check and before staging removal.
+   - In Sprint 23.2.16, `remove_file_windows_exclusive(path, expected_hash, expected_identity, destination_path)` was enhanced to bind destination verification directly to the staging handle:
+     * Staging object is opened with `FILE_FLAG_OPEN_REPARSE_POINT`, `GENERIC_READ | DELETE`, and `share_mode(FILE_SHARE_READ)` (strictly denying concurrent writers and deleters while permitting read-only inspection of hard links).
+     * The open staging handle's object identity and content hash are verified against the authorized original.
+     * **While that handle remains open**, `query_file_object_identity(dest)` inspects the destination path and asserts that its volume serial and file index match the open staging handle's identity.
+     * If destination verification fails or cannot be queried, deletion disposition (`FileDispositionInfo (DeleteFile = 1)`) is never set, the staging link is preserved, and `RecoveryBlocked` is activated fail-closed.
+     * POSIX fail-closed staging link retention remains intact.
+
+2. **Race-Safe Suspicious Artifact Preservation (CHK-215 to CHK-219):**
+   - In `rollback_cleanup_stage()`, when a candidate file in staging does not match the authorized original identity (`cand_identity != expected_id`):
+     * The engine avoids overwrite-capable operations (`rename()`).
+     * It strictly checks if a conflict filename is ConfirmedAbsent and attempts atomic no-overwrite publication via hard link.
+     * If conflict destination collides or safe publication cannot be proven, the suspicious artifact is retained at its existing staging name within quarantine (`clean_stage_name`).
+     * The recovery manifest durable record records `retained_staging_filename` and `retained_staging_path`, transitioning status to `PreservedConflict`.
+     * The surviving object's identity and SHA-256 digest are read and verified directly from disk after preservation (never relying on stale pre-preservation reads).
+     * If reading the surviving object fails, the digest is explicitly recorded as unreadable (`actual_sha256 = None`), and `RecoveryBlocked` is activated.
+     * Startup reconciliation safely discovers, audits, and preserves retained suspicious artifacts without deletion or duplicate record generation.
+
+3. **Thread-Safe Adversarial Test Isolation:**
+   - In `filesystem-engine`, test hooks (`HOOK_WINDOWS_PRE_EXCLUSIVE_OPEN`, `HOOK_WINDOWS_POST_EXCLUSIVE_OPEN`) and fault injection flags (`FAULT_INJECT_WINDOWS_DEST_IDENTITY_QUERY_FAILURE`) are declared using `thread_local!`.
+   - This ensures multi-threaded cargo unit tests execute in complete isolation without hook crosstalk or test pollution.
+
 ---
 
 ## 6. AI Gateway Streaming & Cancellation

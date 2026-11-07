@@ -339,6 +339,9 @@ pub struct CheckpointEngine {
     post_stage_rename_hook: Arc<Mutex<Option<PreReplaceHook>>>,
     post_rollback_hard_link_hook: Arc<Mutex<Option<PreReplaceHook>>>,
     pre_staging_link_removal_hook: Arc<Mutex<Option<PreReplaceHook>>>,
+    post_final_pathname_checks_hook: Arc<Mutex<Option<PreReplaceHook>>>,
+    post_candidate_inspection_hook: Arc<Mutex<Option<PreReplaceHook>>>,
+    fault_inject_conflict_digest_read_failure: std::sync::atomic::AtomicBool,
 }
 
 impl CheckpointEngine {
@@ -418,6 +421,9 @@ impl CheckpointEngine {
             post_stage_rename_hook: Arc::new(Mutex::new(None)),
             post_rollback_hard_link_hook: Arc::new(Mutex::new(None)),
             pre_staging_link_removal_hook: Arc::new(Mutex::new(None)),
+            post_final_pathname_checks_hook: Arc::new(Mutex::new(None)),
+            post_candidate_inspection_hook: Arc::new(Mutex::new(None)),
+            fault_inject_conflict_digest_read_failure: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -740,6 +746,55 @@ impl CheckpointEngine {
     {
         let mut guard = self.pre_staging_link_removal_hook.lock();
         *guard = hook.map(|h| Arc::new(h) as PreReplaceHook);
+    }
+
+    #[doc(hidden)]
+    pub fn set_post_final_pathname_checks_hook<F>(&self, hook: Option<F>)
+    where
+        F: Fn(&Path) + Send + Sync + 'static,
+    {
+        let mut guard = self.post_final_pathname_checks_hook.lock();
+        *guard = hook.map(|h| Arc::new(h) as PreReplaceHook);
+    }
+
+    #[doc(hidden)]
+    pub fn set_post_candidate_inspection_hook<F>(&self, hook: Option<F>)
+    where
+        F: Fn(&Path) + Send + Sync + 'static,
+    {
+        let mut guard = self.post_candidate_inspection_hook.lock();
+        *guard = hook.map(|h| Arc::new(h) as PreReplaceHook);
+    }
+
+    #[doc(hidden)]
+    pub fn set_fault_inject_conflict_digest_read_failure(&self, inject: bool) {
+        self.fault_inject_conflict_digest_read_failure
+            .store(inject, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn set_hook_windows_pre_exclusive_open<F>(&self, hook: Option<F>)
+    where
+        F: Fn(&Path) + Send + Sync + 'static,
+    {
+        filesystem_engine::set_hook_windows_pre_exclusive_open(
+            hook.map(|h| Arc::new(h) as Arc<dyn Fn(&Path) + Send + Sync>),
+        );
+    }
+
+    #[doc(hidden)]
+    pub fn set_hook_windows_post_exclusive_open<F>(&self, hook: Option<F>)
+    where
+        F: Fn(&Path, &Path) + Send + Sync + 'static,
+    {
+        filesystem_engine::set_hook_windows_post_exclusive_open(
+            hook.map(|h| Arc::new(h) as Arc<dyn Fn(&Path, &Path) + Send + Sync>),
+        );
+    }
+
+    #[doc(hidden)]
+    pub fn set_fault_inject_windows_dest_identity_query_failure(&self, inject: bool) {
+        filesystem_engine::set_fault_inject_windows_dest_identity_query_failure(inject);
     }
 
     #[doc(hidden)]
@@ -1377,6 +1432,7 @@ impl CheckpointEngine {
                         &stage_abs,
                         &staged_hash,
                         staged_identity,
+                        None,
                     )
                     .is_ok();
 
@@ -2026,6 +2082,12 @@ impl CheckpointEngine {
             });
         }
 
+        // Hook after final pathname checks but before Windows exclusive handle is acquired (CHK-209)
+        let post_pathname_hook = self.post_final_pathname_checks_hook.lock().clone();
+        if let Some(ref hook) = post_pathname_hook {
+            hook(&dest_abs);
+        }
+
         // 9. Publication confirmed! Safely attempt removal of the staging link
         let (staging_removed, removal_warning) = {
             #[cfg(windows)]
@@ -2050,6 +2112,7 @@ impl CheckpointEngine {
                         &stage_abs,
                         &hash_for_removal,
                         Some(target_expected_id),
+                        Some(&dest_abs),
                     ) {
                         Ok(()) => (true, None),
                         Err(e) => (
@@ -2078,34 +2141,35 @@ impl CheckpointEngine {
             }
         };
 
+        #[cfg(windows)]
+        if !staging_removed {
+            self.set_recovery_blocked(Some(format!(
+                "Staging link removal failed or destination identity mismatch for '{}': {:?}; candidate preserved at staging name '{}'. Recovery blocked.",
+                clean_stage_name, removal_warning, clean_stage_name
+            )));
+            return Some(StageRollbackResult {
+                surviving_filename: clean_stage_name.to_string(),
+                retained_staging_filename: Some(clean_stage_name.to_string()),
+                status: RollbackPublicationStatus::PublicationUncertainBlocked,
+                is_conflict: true,
+                error: removal_warning,
+            });
+        }
+
         // 10. Verify destination existence and identity on disk after removal attempt
         let post_dest_identity = filesystem_engine::query_file_object_identity(&dest_abs).ok();
         if post_dest_identity != Some(target_expected_id) {
-            if !staging_removed {
-                self.set_recovery_blocked(Some(format!(
-                    "Destination '{}' missing or identity mismatch after staging removal attempt; preserved at staging name '{}'",
-                    destination_name, clean_stage_name
-                )));
-                return Some(StageRollbackResult {
-                    surviving_filename: clean_stage_name.to_string(),
-                    retained_staging_filename: Some(clean_stage_name.to_string()),
-                    status: RollbackPublicationStatus::PublicationUncertainBlocked,
-                    is_conflict: true,
-                    error: Some("Destination missing or identity mismatch; candidate preserved at staging name and RecoveryBlocked activated".into()),
-                });
-            } else {
-                self.set_recovery_blocked(Some(format!(
-                    "Critical: Destination '{}' missing or identity mismatch ({:?} != {:?}) and staging link was removed",
-                    destination_name, post_dest_identity, Some(target_expected_id)
-                )));
-                return Some(StageRollbackResult {
-                    surviving_filename: destination_name.to_string(),
-                    retained_staging_filename: None,
-                    status: RollbackPublicationStatus::PublicationUncertainBlocked,
-                    is_conflict: true,
-                    error: Some("Critical: destination identity lost after staging removal; RecoveryBlocked activated".into()),
-                });
-            }
+            self.set_recovery_blocked(Some(format!(
+                "Destination '{}' missing or identity mismatch after publication; preserved at staging name '{}'",
+                destination_name, clean_stage_name
+            )));
+            return Some(StageRollbackResult {
+                surviving_filename: clean_stage_name.to_string(),
+                retained_staging_filename: Some(clean_stage_name.to_string()),
+                status: RollbackPublicationStatus::PublicationUncertainBlocked,
+                is_conflict: true,
+                error: Some("Destination missing or identity mismatch; candidate preserved at staging name and RecoveryBlocked activated".into()),
+            });
         }
 
         if staging_removed {
@@ -2189,37 +2253,104 @@ impl CheckpointEngine {
 
         // Step 2: Verify candidate still matches the originally authorized identity
         if cand_identity != expected_id {
-            // Candidate was replaced before rollback! (CHK-195..202)
-            let actual_bytes = q_cap_dir.read(clean_stage_name).ok();
-            let actual_hash = actual_bytes.as_ref().map(|b| Self::sha256_digest(b));
+            // Hook for testing replacement between identity inspection and conflict preservation (CHK-215)
+            let inspect_hook = self.post_candidate_inspection_hook.lock().clone();
+            if let Some(ref hook) = inspect_hook {
+                hook(&stage_abs);
+            }
 
+            // Generate conflict name
             let conflict_name = format!(
                 "{}.suspicious-replacement.{}",
                 original_filename,
                 uuid::Uuid::new_v4().simple()
             );
-            let final_surviving_name = if q_cap_dir
-                .rename(clean_stage_name, q_cap_dir, &conflict_name)
-                .is_ok()
-            {
-                conflict_name
+            let conflict_abs = q_dir.join(&conflict_name);
+
+            // Avoid overwrite-capable conflict publication:
+            // 1. Verify conflict destination is confirmed absent
+            let conflict_existence = classify_dir_entry_existence(q_cap_dir, &conflict_name);
+            let conflict_collision = conflict_existence != ObjectExistence::ConfirmedAbsent
+                || self
+                    .fault_inject_rollback_conflict_collision
+                    .load(std::sync::atomic::Ordering::SeqCst);
+
+            let conflict_pub_failed = conflict_collision
+                || self
+                    .fault_inject_rollback_conflict_publication_failure
+                    .load(std::sync::atomic::Ordering::SeqCst);
+
+            // Prefer retaining the suspicious artifact at its existing staging name when safe publication cannot be proven
+            let (final_surviving_name, retained_staging_name) = if !conflict_pub_failed {
+                // Attempt atomic no-overwrite publication via hard link
+                match q_cap_dir.hard_link(clean_stage_name, q_cap_dir, &conflict_name) {
+                    Ok(()) => {
+                        #[cfg(windows)]
+                        let staging_unlinked = filesystem_engine::remove_file_windows_exclusive(
+                            &stage_abs,
+                            "",
+                            None,
+                            Some(&conflict_abs),
+                        )
+                        .is_ok();
+                        #[cfg(not(windows))]
+                        let staging_unlinked = false; // Retain staging link on POSIX
+
+                        if staging_unlinked {
+                            (conflict_name, None)
+                        } else {
+                            (conflict_name, Some(clean_stage_name.to_string()))
+                        }
+                    }
+                    Err(_) => {
+                        // Hard link failed (or collision): retain at existing staging name!
+                        (
+                            clean_stage_name.to_string(),
+                            Some(clean_stage_name.to_string()),
+                        )
+                    }
+                }
             } else {
-                clean_stage_name.to_string()
+                // Collision or safe publication cannot be proven: retain at existing staging name!
+                (
+                    clean_stage_name.to_string(),
+                    Some(clean_stage_name.to_string()),
+                )
+            };
+
+            // Post-preservation verification:
+            // Query surviving artifact directly at its final location (never rely on prior read)!
+            let surviving_abs = q_dir.join(&final_surviving_name);
+            let surviving_id = filesystem_engine::query_file_object_identity(&surviving_abs).ok();
+
+            // Fault injection for read failure during digest calculation (CHK-217)
+            let fault_digest_read = self
+                .fault_inject_conflict_digest_read_failure
+                .load(std::sync::atomic::Ordering::SeqCst);
+
+            let actual_hash = if fault_digest_read {
+                None
+            } else {
+                match std::fs::read(&surviving_abs) {
+                    Ok(bytes) => Some(Self::sha256_digest(&bytes)),
+                    Err(_) => None,
+                }
             };
 
             self.set_recovery_blocked(Some(format!(
-                "Fatal: Staged candidate '{}' identity mismatch against authorized original ({:?} != {:?}). Replacement preserved as conflict '{}'. Original object lost; RecoveryBlocked activated.",
-                clean_stage_name, cand_identity, expected_id, final_surviving_name
+                "Fatal: Staged candidate '{}' identity mismatch against authorized original ({:?} != {:?}). Replacement preserved as conflict '{}' (retained staging: {:?}, surviving ID: {:?}, actual hash: {:?}). Original object lost; RecoveryBlocked activated.",
+                clean_stage_name, cand_identity, expected_id, final_surviving_name, retained_staging_name, surviving_id, actual_hash
             )));
 
             return StageRollbackResult {
                 surviving_filename: final_surviving_name,
-                retained_staging_filename: None,
+                retained_staging_filename: retained_staging_name,
                 status: RollbackPublicationStatus::PublicationConflict,
                 is_conflict: true,
                 error: Some(format!(
-                    "Staged candidate identity mismatch against authorized original; preserved as suspicious replacement (actual hash: {:?}). RecoveryBlocked activated.",
-                    actual_hash
+                    "Staged candidate identity mismatch against authorized original; preserved as suspicious replacement (surviving ID: {:?}, actual hash: {:?}). RecoveryBlocked activated.",
+                    surviving_id,
+                    actual_hash.as_deref().unwrap_or("UNREADABLE")
                 )),
             };
         }
@@ -2330,8 +2461,24 @@ impl CheckpointEngine {
             record.status = QuarantineStatus::PreservedConflict;
         }
         let surviving_path = q_dir.join(&rolled.surviving_filename);
-        if let Ok(bytes) = std::fs::read(&surviving_path) {
-            record.actual_sha256 = Some(Self::sha256_digest(&bytes));
+        if rolled
+            .error
+            .as_deref()
+            .map(|e| e.contains("UNREADABLE"))
+            .unwrap_or(false)
+        {
+            record.actual_sha256 = None;
+            record.reason = "SurvivingArtifactUnreadable: digest calculation failed".to_string();
+        } else {
+            match std::fs::read(&surviving_path) {
+                Ok(bytes) => {
+                    record.actual_sha256 = Some(Self::sha256_digest(&bytes));
+                }
+                Err(e) => {
+                    record.actual_sha256 = None; // Never retain stale digest!
+                    record.reason = format!("SurvivingArtifactReadFailure: {}", e);
+                }
+            }
         }
     }
 
@@ -2807,6 +2954,7 @@ impl CheckpointEngine {
                 &stage_abs,
                 &approved_hash,
                 original_identity,
+                None,
             ) {
                 let rolled = self.rollback_cleanup_stage(
                     &q_cap_dir,
@@ -3475,6 +3623,7 @@ impl CheckpointEngine {
                     &stage_abs,
                     &approved_hash,
                     original_identity,
+                    None,
                 ) {
                     let rolled = self.rollback_cleanup_stage(
                         &q_cap_dir,
@@ -9753,7 +9902,8 @@ mod tests {
 
         #[cfg(windows)]
         {
-            let res = filesystem_engine::remove_file_windows_exclusive(&test_file, &hash, None);
+            let res =
+                filesystem_engine::remove_file_windows_exclusive(&test_file, &hash, None, None);
             assert!(
                 res.is_ok(),
                 "Exclusive removal must succeed for unmodified unheld file"
@@ -10703,7 +10853,8 @@ mod tests {
         #[cfg(windows)]
         {
             if std::os::windows::fs::symlink_file(&outside_file, &test_file).is_ok() {
-                let res = filesystem_engine::remove_file_windows_exclusive(&test_file, "", None);
+                let res =
+                    filesystem_engine::remove_file_windows_exclusive(&test_file, "", None, None);
                 assert!(
                     res.is_err(),
                     "Symlink must be rejected by remove_file_windows_exclusive"
@@ -10737,7 +10888,7 @@ mod tests {
         #[cfg(windows)]
         {
             filesystem_engine::set_fault_inject_windows_reparse_point(true);
-            let res = filesystem_engine::remove_file_windows_exclusive(&test_file, "", None);
+            let res = filesystem_engine::remove_file_windows_exclusive(&test_file, "", None, None);
             filesystem_engine::set_fault_inject_windows_reparse_point(false);
 
             assert!(
@@ -10766,7 +10917,8 @@ mod tests {
         {
             let link_file = temp_dir.join("link_135.txt");
             if std::os::windows::fs::symlink_file(&external_file, &link_file).is_ok() {
-                let _ = filesystem_engine::remove_file_windows_exclusive(&link_file, "", None);
+                let _ =
+                    filesystem_engine::remove_file_windows_exclusive(&link_file, "", None, None);
                 assert!(
                     external_file.exists(),
                     "External file must never be deleted"
@@ -10795,7 +10947,7 @@ mod tests {
 
         #[cfg(windows)]
         {
-            let res = filesystem_engine::remove_file_windows_exclusive(&dir_target, "", None);
+            let res = filesystem_engine::remove_file_windows_exclusive(&dir_target, "", None, None);
             assert!(
                 res.is_err(),
                 "Directory must be rejected by attributes check"
@@ -10822,7 +10974,8 @@ mod tests {
 
         #[cfg(windows)]
         {
-            let res = filesystem_engine::remove_file_windows_exclusive(&test_file, &hash, None);
+            let res =
+                filesystem_engine::remove_file_windows_exclusive(&test_file, &hash, None, None);
             assert!(
                 res.is_ok(),
                 "Exclusive removal must succeed for unheld file"
@@ -11709,8 +11862,12 @@ mod tests {
         {
             let hash = CheckpointEngine::sha256_digest(payload.as_bytes());
             let identity = filesystem_engine::query_file_object_identity(&test_file).unwrap();
-            let res =
-                filesystem_engine::remove_file_windows_exclusive(&test_file, &hash, Some(identity));
+            let res = filesystem_engine::remove_file_windows_exclusive(
+                &test_file,
+                &hash,
+                Some(identity),
+                None,
+            );
             assert!(
                 res.is_ok(),
                 "Exclusive removal must succeed when identity and hash match"
@@ -11741,8 +11898,12 @@ mod tests {
             let hash = CheckpointEngine::sha256_digest(payload.as_bytes());
             let identity_2 = filesystem_engine::query_file_object_identity(&f2).unwrap();
             // Attempt to delete f1 with f2's identity
-            let res =
-                filesystem_engine::remove_file_windows_exclusive(&f1, &hash, Some(identity_2));
+            let res = filesystem_engine::remove_file_windows_exclusive(
+                &f1,
+                &hash,
+                Some(identity_2),
+                None,
+            );
             assert!(
                 res.is_err(),
                 "Identity mismatch must reject exclusive deletion"
@@ -11771,8 +11932,12 @@ mod tests {
             let hash = CheckpointEngine::sha256_digest(payload.as_bytes());
             let identity = filesystem_engine::query_file_object_identity(&test_file).unwrap();
             filesystem_engine::set_fault_inject_windows_identity_mismatch(true);
-            let res =
-                filesystem_engine::remove_file_windows_exclusive(&test_file, &hash, Some(identity));
+            let res = filesystem_engine::remove_file_windows_exclusive(
+                &test_file,
+                &hash,
+                Some(identity),
+                None,
+            );
             filesystem_engine::set_fault_inject_windows_identity_mismatch(false);
 
             assert!(
@@ -11801,7 +11966,7 @@ mod tests {
         {
             let link = temp_dir.join("link_163.txt");
             if std::os::windows::fs::symlink_file(&outside, &link).is_ok() {
-                let res = filesystem_engine::remove_file_windows_exclusive(&link, "", None);
+                let res = filesystem_engine::remove_file_windows_exclusive(&link, "", None, None);
                 assert!(res.is_err(), "Reparse point must be rejected");
                 assert!(outside.exists(), "Outside target must never be deleted");
             }
@@ -11824,7 +11989,7 @@ mod tests {
 
         #[cfg(windows)]
         {
-            let res = filesystem_engine::remove_file_windows_exclusive(&dir, "", None);
+            let res = filesystem_engine::remove_file_windows_exclusive(&dir, "", None, None);
             assert!(res.is_err(), "Directory must be rejected");
             assert!(dir.exists());
         }
@@ -11851,6 +12016,7 @@ mod tests {
                 &test_file,
                 "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
                 Some(identity),
+                None,
             );
             assert!(
                 res.is_err(),
@@ -11887,7 +12053,8 @@ mod tests {
                 .unwrap();
 
             let hash = CheckpointEngine::sha256_digest(payload.as_bytes());
-            let res = filesystem_engine::remove_file_windows_exclusive(&test_file, &hash, None);
+            let res =
+                filesystem_engine::remove_file_windows_exclusive(&test_file, &hash, None, None);
             drop(held);
 
             assert!(
@@ -12777,7 +12944,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_chk_188_replace_destination_after_final_identity_check_preserves_staging_link() {
+    fn test_chk_188_replace_destination_before_pathname_recheck_preserves_staging_link() {
         let temp_dir =
             std::env::temp_dir().join(format!("aether_chk_188_{}", uuid::Uuid::new_v4().simple()));
         let storage_dir = temp_dir.join(".aether").join("checkpoints");
@@ -12796,7 +12963,7 @@ mod tests {
         let stage_id = filesystem_engine::query_file_object_identity(&stage_abs).ok();
         let stage_hash = CheckpointEngine::sha256_digest(original_data);
 
-        // Replace destination after final identity check but immediately before staging removal
+        // Replace destination before final pathname re-check; candidate preserved at staging name without removal
         engine.set_pre_staging_link_removal_hook(Some(move |dest_path: &Path| {
             let _ = std::fs::remove_file(dest_path);
             std::fs::write(dest_path, "ADVERSARIAL_REPLACEMENT_DESTINATION_188").unwrap();
@@ -12830,8 +12997,7 @@ mod tests {
     }
 
     #[test]
-    fn test_chk_189_replace_staging_entry_after_final_identity_check_never_deletes_replacement_as_side_effect(
-    ) {
+    fn test_chk_189_replace_staging_entry_before_pathname_recheck_never_deletes_replacement() {
         let temp_dir =
             std::env::temp_dir().join(format!("aether_chk_189_{}", uuid::Uuid::new_v4().simple()));
         let storage_dir = temp_dir.join(".aether").join("checkpoints");
@@ -13656,6 +13822,641 @@ mod tests {
         }
 
         engine.set_fault_inject_reconciliation_tracked_read_failure(false);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // =========================================================================
+    // SPRINT 23.2.16 ADVERSARIAL TESTS (CHK-209 to CHK-219)
+    // =========================================================================
+
+    #[test]
+    fn test_chk_209_replace_destination_after_pathname_checks_before_exclusive_open_preserves_staging(
+    ) {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_209_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let engine = Arc::new(CheckpointEngine::new(&storage_dir));
+        let q_dir = engine.quarantine_dir();
+        std::fs::create_dir_all(&q_dir).unwrap();
+        let q_cap_dir =
+            cap_std::fs::Dir::open_ambient_dir(&q_dir, cap_std::ambient_authority()).unwrap();
+
+        let stage_name = ".aether-clean-stage-chk209";
+        let original_data = b"AUTHORITATIVE PAYLOAD CHK 209";
+        q_cap_dir.write(stage_name, original_data).unwrap();
+        let stage_abs = q_dir.join(stage_name);
+        let stage_id = filesystem_engine::query_file_object_identity(&stage_abs).ok();
+        let stage_hash = CheckpointEngine::sha256_digest(original_data);
+
+        // Adversarial hook executes AFTER final pathname re-check and BEFORE Windows exclusive handle acquisition
+        engine.set_post_final_pathname_checks_hook(Some(move |dest_path: &Path| {
+            let _ = std::fs::remove_file(dest_path);
+            std::fs::write(dest_path, "ADVERSARIAL_POST_PATHNAME_USURPER_209").unwrap();
+        }));
+
+        let rolled = engine.rollback_cleanup_stage(
+            &q_cap_dir,
+            stage_name,
+            "dest_209.txt",
+            stage_id,
+            Some(&stage_hash),
+        );
+
+        // Staging link must NOT be removed!
+        assert!(
+            stage_abs.exists(),
+            "Original staging link must be preserved when destination replaced before exclusive handle!"
+        );
+        assert_eq!(std::fs::read(&stage_abs).unwrap(), original_data);
+        assert_eq!(
+            rolled.status,
+            RollbackPublicationStatus::PublicationUncertainBlocked
+        );
+        assert!(
+            engine.is_recovery_blocked(),
+            "RecoveryBlocked must be active!"
+        );
+
+        engine.set_post_final_pathname_checks_hook(None::<fn(&Path)>);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_210_replace_destination_while_exclusive_handle_held_preserves_staging_without_loss()
+    {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_210_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let engine = Arc::new(CheckpointEngine::new(&storage_dir));
+        let q_dir = engine.quarantine_dir();
+        std::fs::create_dir_all(&q_dir).unwrap();
+        let q_cap_dir =
+            cap_std::fs::Dir::open_ambient_dir(&q_dir, cap_std::ambient_authority()).unwrap();
+
+        let stage_name = ".aether-clean-stage-chk210";
+        let original_data = b"CRITICAL AUTHORIZED DATA 210";
+        q_cap_dir.write(stage_name, original_data).unwrap();
+        let stage_abs = q_dir.join(stage_name);
+        let stage_id = filesystem_engine::query_file_object_identity(&stage_abs).ok();
+        let stage_hash = CheckpointEngine::sha256_digest(original_data);
+
+        // On Windows: hook runs while exclusive handle on stage_abs is held with share_mode(0),
+        // BEFORE SetFileInformationByHandle applies deletion disposition!
+        #[cfg(windows)]
+        engine.set_hook_windows_post_exclusive_open(Some(move |_stage: &Path, dest: &Path| {
+            let _ = std::fs::remove_file(dest);
+            std::fs::write(dest, "CONCURRENT_DESTINATION_REPLACEMENT_210").unwrap();
+        }));
+
+        let rolled = engine.rollback_cleanup_stage(
+            &q_cap_dir,
+            stage_name,
+            "dest_210.txt",
+            stage_id,
+            Some(&stage_hash),
+        );
+
+        // Staging link MUST NOT be unlinked! Original content is 100% preserved.
+        assert!(
+            stage_abs.exists(),
+            "Original staging object must not be lost when destination is replaced under exclusive handle lock!"
+        );
+        assert_eq!(std::fs::read(&stage_abs).unwrap(), original_data);
+
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                rolled.status,
+                RollbackPublicationStatus::PublicationUncertainBlocked
+            );
+            assert!(
+                engine.is_recovery_blocked(),
+                "RecoveryBlocked must be engaged when destination mismatch is detected under handle lock!"
+            );
+            engine.set_hook_windows_post_exclusive_open(None::<fn(&Path, &Path)>);
+        }
+        #[cfg(not(windows))]
+        {
+            // On POSIX, retained staging link policy guarantees recoverability
+            assert_eq!(
+                rolled.status,
+                RollbackPublicationStatus::PublishedWithRetainedStaging
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_211_replace_staging_before_exclusive_open_different_identity_rejected() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_211_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let stage_file = temp_dir.join("stage_211.bin");
+        let dest_file = temp_dir.join("dest_211.bin");
+        let payload = "IDENTICAL_BYTES_ACROSS_CHK_211";
+        std::fs::write(&stage_file, payload).unwrap();
+        std::fs::write(&dest_file, payload).unwrap();
+
+        #[cfg(windows)]
+        {
+            let hash = CheckpointEngine::sha256_digest(payload.as_bytes());
+            let original_identity =
+                filesystem_engine::query_file_object_identity(&stage_file).unwrap();
+
+            // Hook replaces staging file with an identical-byte replacement before exclusive open
+            filesystem_engine::set_hook_windows_pre_exclusive_open(Some(Arc::new(
+                move |path: &Path| {
+                    let temp_new = path.with_extension("tmp_new");
+                    std::fs::write(&temp_new, payload).unwrap();
+                    let _ = std::fs::remove_file(path);
+                    std::fs::rename(&temp_new, path).unwrap();
+                },
+            )));
+
+            let res = filesystem_engine::remove_file_windows_exclusive(
+                &stage_file,
+                &hash,
+                Some(original_identity),
+                Some(&dest_file),
+            );
+
+            filesystem_engine::set_hook_windows_pre_exclusive_open(None);
+
+            assert!(
+                res.is_err(),
+                "Staging replacement with different identity must be rejected!"
+            );
+            assert!(
+                stage_file.exists(),
+                "Staging replacement file must not be deleted as side effect!"
+            );
+            assert_eq!(std::fs::read_to_string(&stage_file).unwrap(), payload);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (&stage_file, &dest_file, payload);
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_212_destination_and_staging_verified_identical_under_exclusive_handle() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_212_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let stage_file = temp_dir.join("stage_212.bin");
+        let dest_file = temp_dir.join("dest_212.bin");
+        let payload = "verified identical under handle lock 212";
+        std::fs::write(&stage_file, payload).unwrap();
+        std::fs::hard_link(&stage_file, &dest_file).unwrap();
+
+        #[cfg(windows)]
+        {
+            let hash = CheckpointEngine::sha256_digest(payload.as_bytes());
+            let identity = filesystem_engine::query_file_object_identity(&stage_file).unwrap();
+            let res = filesystem_engine::remove_file_windows_exclusive(
+                &stage_file,
+                &hash,
+                Some(identity),
+                Some(&dest_file),
+            );
+            assert!(
+                res.is_ok(),
+                "Handle-bound destination verification must succeed when both names refer to authorized object"
+            );
+            assert!(!stage_file.exists(), "Staging link should be unlinked");
+            assert!(dest_file.exists(), "Destination link must survive intact");
+            assert_eq!(std::fs::read_to_string(&dest_file).unwrap(), payload);
+        }
+        #[cfg(not(windows))]
+        {
+            let stage_id = filesystem_engine::query_file_object_identity(&stage_file).unwrap();
+            let dest_id = filesystem_engine::query_file_object_identity(&dest_file).unwrap();
+            assert_eq!(
+                stage_id, dest_id,
+                "Hard link names refer to identical object identity"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_213_destination_identity_query_failure_under_exclusive_handle_activates_recovery_blocked(
+    ) {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_213_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let engine = Arc::new(CheckpointEngine::new(&storage_dir));
+        let q_dir = engine.quarantine_dir();
+        std::fs::create_dir_all(&q_dir).unwrap();
+        let q_cap_dir =
+            cap_std::fs::Dir::open_ambient_dir(&q_dir, cap_std::ambient_authority()).unwrap();
+
+        let stage_name = ".aether-clean-stage-chk213";
+        let original_data = b"DATA 213";
+        q_cap_dir.write(stage_name, original_data).unwrap();
+        let stage_abs = q_dir.join(stage_name);
+        let stage_id = filesystem_engine::query_file_object_identity(&stage_abs).ok();
+        let stage_hash = CheckpointEngine::sha256_digest(original_data);
+
+        #[cfg(windows)]
+        engine.set_fault_inject_windows_dest_identity_query_failure(true);
+
+        let rolled = engine.rollback_cleanup_stage(
+            &q_cap_dir,
+            stage_name,
+            "dest_213.txt",
+            stage_id,
+            Some(&stage_hash),
+        );
+
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                rolled.status,
+                RollbackPublicationStatus::PublicationUncertainBlocked
+            );
+            assert!(stage_abs.exists(), "Staging link preserved");
+            assert!(
+                engine.is_recovery_blocked(),
+                "RecoveryBlocked engaged on destination identity query error!"
+            );
+            engine.set_fault_inject_windows_dest_identity_query_failure(false);
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                rolled.status,
+                RollbackPublicationStatus::PublishedWithRetainedStaging
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_214_no_success_status_returned_when_destination_identity_cannot_be_proven() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_214_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let q_dir = engine.quarantine_dir();
+        std::fs::create_dir_all(&q_dir).unwrap();
+        let q_cap_dir =
+            cap_std::fs::Dir::open_ambient_dir(&q_dir, cap_std::ambient_authority()).unwrap();
+
+        let stage_name = ".aether-clean-stage-chk214";
+        q_cap_dir.write(stage_name, b"payload 214").unwrap();
+        let stage_id = filesystem_engine::query_file_object_identity(&q_dir.join(stage_name)).ok();
+        let stage_hash = CheckpointEngine::sha256_digest(b"payload 214");
+
+        // When publication fails and destination cannot be proven
+        engine.set_fault_inject_rollback_both_publication_failures(true);
+
+        let rolled = engine.rollback_cleanup_stage(
+            &q_cap_dir,
+            stage_name,
+            "dest_214.txt",
+            stage_id,
+            Some(&stage_hash),
+        );
+
+        assert_ne!(
+            rolled.status,
+            RollbackPublicationStatus::PublishedVerified,
+            "Never return PublishedVerified when destination identity is unproven"
+        );
+        assert_eq!(
+            rolled.status,
+            RollbackPublicationStatus::PublicationUncertainBlocked
+        );
+        assert!(engine.is_recovery_blocked());
+
+        engine.set_fault_inject_rollback_both_publication_failures(false);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_215_replacement_between_identity_inspection_and_conflict_preservation() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_215_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let engine = Arc::new(CheckpointEngine::new(&storage_dir));
+        let q_dir = engine.quarantine_dir();
+        std::fs::create_dir_all(&q_dir).unwrap();
+        let q_cap_dir =
+            cap_std::fs::Dir::open_ambient_dir(&q_dir, cap_std::ambient_authority()).unwrap();
+
+        let stage_name = ".aether-clean-stage-chk215";
+        q_cap_dir.write(stage_name, b"INITIAL_DATA_215").unwrap();
+        let _stage_abs = q_dir.join(stage_name);
+
+        // Expected identity is an artificial different identity so Step 2 mismatch triggers
+        let expected_id = filesystem_engine::FileObjectIdentity {
+            volume_serial_number: 9999,
+            file_index_high: 9999,
+            file_index_low: 9999,
+        };
+
+        let replaced_content = b"TAMPERED_BETWEEN_INSPECTION_AND_PRESERVATION_215";
+        engine.set_post_candidate_inspection_hook(Some(move |path: &Path| {
+            std::fs::write(path, replaced_content).unwrap();
+        }));
+
+        let rolled = engine.rollback_cleanup_stage(
+            &q_cap_dir,
+            stage_name,
+            "file_215.txt",
+            Some(expected_id),
+            None,
+        );
+
+        assert!(rolled.is_conflict);
+        assert_eq!(
+            rolled.status,
+            RollbackPublicationStatus::PublicationConflict
+        );
+        assert!(engine.is_recovery_blocked());
+
+        let surviving_abs = q_dir.join(&rolled.surviving_filename);
+        assert!(surviving_abs.exists());
+        assert_eq!(std::fs::read(&surviving_abs).unwrap(), replaced_content);
+
+        let mut record = QuarantineRecord {
+            id: "rec_215".into(),
+            original_relative_path: "file_215.txt".into(),
+            quarantined_filename: "old_quarantine_215".into(),
+            quarantined_path: "old_path_215".into(),
+            quarantined_at: "now".into(),
+            expected_sha256: "exp".into(),
+            actual_sha256: Some("STALE_DIGEST_MUST_BE_OVERWRITTEN".into()),
+            reason: "test".into(),
+            status: QuarantineStatus::PendingCleanup,
+            retained_staging_filename: None,
+            retained_staging_path: None,
+        };
+
+        CheckpointEngine::apply_rollback_result_to_record(&mut record, &rolled, &q_dir);
+        assert_eq!(
+            record.actual_sha256.as_deref(),
+            Some(CheckpointEngine::sha256_digest(replaced_content).as_str()),
+            "Surviving digest must accurately reflect actual surviving file on disk, not stale read"
+        );
+
+        engine.set_post_candidate_inspection_hook(None::<fn(&Path)>);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_216_conflict_destination_collision_retains_staging_artifact() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_216_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let q_dir = engine.quarantine_dir();
+        std::fs::create_dir_all(&q_dir).unwrap();
+        let q_cap_dir =
+            cap_std::fs::Dir::open_ambient_dir(&q_dir, cap_std::ambient_authority()).unwrap();
+
+        let stage_name = ".aether-clean-stage-chk216";
+        let staging_data = b"SUSPICIOUS_CANDIDATE_216";
+        q_cap_dir.write(stage_name, staging_data).unwrap();
+
+        let expected_id = filesystem_engine::FileObjectIdentity {
+            volume_serial_number: 8888,
+            file_index_high: 8888,
+            file_index_low: 8888,
+        };
+
+        // Inject conflict collision
+        engine.set_fault_inject_rollback_conflict_collision(true);
+
+        let rolled = engine.rollback_cleanup_stage(
+            &q_cap_dir,
+            stage_name,
+            "file_216.txt",
+            Some(expected_id),
+            None,
+        );
+
+        // Conflict publication cannot overwrite or proceed safely; candidate must be retained at staging name
+        assert_eq!(rolled.surviving_filename, stage_name);
+        assert_eq!(
+            rolled.retained_staging_filename,
+            Some(stage_name.to_string())
+        );
+        assert!(engine.is_recovery_blocked());
+        assert!(q_dir.join(stage_name).exists());
+        assert_eq!(std::fs::read(q_dir.join(stage_name)).unwrap(), staging_data);
+
+        engine.set_fault_inject_rollback_conflict_collision(false);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_217_read_failure_during_conflict_digest_calculation_records_unreadable_and_blocks_recovery(
+    ) {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_217_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let q_dir = engine.quarantine_dir();
+        std::fs::create_dir_all(&q_dir).unwrap();
+        let q_cap_dir =
+            cap_std::fs::Dir::open_ambient_dir(&q_dir, cap_std::ambient_authority()).unwrap();
+
+        let stage_name = ".aether-clean-stage-chk217";
+        q_cap_dir.write(stage_name, b"DATA_217").unwrap();
+
+        let expected_id = filesystem_engine::FileObjectIdentity {
+            volume_serial_number: 7777,
+            file_index_high: 7777,
+            file_index_low: 7777,
+        };
+
+        // Inject read failure during digest calculation
+        engine.set_fault_inject_conflict_digest_read_failure(true);
+
+        let rolled = engine.rollback_cleanup_stage(
+            &q_cap_dir,
+            stage_name,
+            "file_217.txt",
+            Some(expected_id),
+            None,
+        );
+
+        assert!(engine.is_recovery_blocked());
+
+        let mut record = QuarantineRecord {
+            id: "rec_217".into(),
+            original_relative_path: "file_217.txt".into(),
+            quarantined_filename: "old_217".into(),
+            quarantined_path: "old_path_217".into(),
+            quarantined_at: "now".into(),
+            expected_sha256: "exp".into(),
+            actual_sha256: Some("STALE_HASH_MUST_BE_CLEARED".into()),
+            reason: "initial".into(),
+            status: QuarantineStatus::PendingCleanup,
+            retained_staging_filename: None,
+            retained_staging_path: None,
+        };
+
+        CheckpointEngine::apply_rollback_result_to_record(&mut record, &rolled, &q_dir);
+        assert_eq!(
+            record.actual_sha256, None,
+            "Digest calculation failure must record explicit unreadable state, never stale hash"
+        );
+        assert!(record.reason.contains("Unreadable") || record.reason.contains("ReadFailure"));
+
+        engine.set_fault_inject_conflict_digest_read_failure(false);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_218_correct_manifest_state_for_retained_suspicious_artifact() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_218_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let q_dir = engine.quarantine_dir();
+        std::fs::create_dir_all(&q_dir).unwrap();
+        let q_cap_dir =
+            cap_std::fs::Dir::open_ambient_dir(&q_dir, cap_std::ambient_authority()).unwrap();
+
+        let stage_name = ".aether-clean-stage-chk218";
+        let payload = b"SUSPICIOUS_PAYLOAD_218";
+        q_cap_dir.write(stage_name, payload).unwrap();
+
+        let expected_id = filesystem_engine::FileObjectIdentity {
+            volume_serial_number: 6666,
+            file_index_high: 6666,
+            file_index_low: 6666,
+        };
+
+        engine.set_fault_inject_rollback_conflict_collision(true);
+        let rolled = engine.rollback_cleanup_stage(
+            &q_cap_dir,
+            stage_name,
+            "file_218.txt",
+            Some(expected_id),
+            None,
+        );
+
+        let mut manifest = RecoveryManifest::default();
+        let mut rec = QuarantineRecord {
+            id: "rec_218".into(),
+            original_relative_path: "file_218.txt".into(),
+            quarantined_filename: "old_quarantined_218".into(),
+            quarantined_path: "old_quarantined_path_218".into(),
+            quarantined_at: chrono::Utc::now().to_rfc3339(),
+            expected_sha256: "expected_hash_218".into(),
+            actual_sha256: None,
+            reason: "suspicious test".into(),
+            status: QuarantineStatus::PendingCleanup,
+            retained_staging_filename: None,
+            retained_staging_path: None,
+        };
+
+        CheckpointEngine::apply_rollback_result_to_record(&mut rec, &rolled, &q_dir);
+        manifest.records.push(rec);
+        manifest.save(&engine.recovery_manifest_path()).unwrap();
+
+        // Reload manifest from disk and verify exact fields
+        let loaded = RecoveryManifest::load(&engine.recovery_manifest_path()).unwrap();
+        let r = loaded.records.iter().find(|x| x.id == "rec_218").unwrap();
+        assert_eq!(r.status, QuarantineStatus::PreservedConflict);
+        assert_eq!(r.quarantined_filename, stage_name);
+        assert_eq!(r.retained_staging_filename, Some(stage_name.to_string()));
+        assert_eq!(
+            r.retained_staging_path,
+            Some(q_dir.join(stage_name).to_string_lossy().to_string())
+        );
+        assert_eq!(
+            r.actual_sha256.as_deref(),
+            Some(CheckpointEngine::sha256_digest(payload).as_str())
+        );
+        assert!(engine.is_recovery_blocked());
+
+        engine.set_fault_inject_rollback_conflict_collision(false);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_219_startup_reconciliation_of_retained_suspicious_artifacts() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_219_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let q_dir = engine.quarantine_dir();
+        std::fs::create_dir_all(&q_dir).unwrap();
+
+        let stage_name = ".aether-clean-stage-chk219";
+        let payload = b"RETAINED_SUSPICIOUS_ARTIFACT_219";
+        std::fs::write(q_dir.join(stage_name), payload).unwrap();
+
+        let rec = QuarantineRecord {
+            id: "rec_219".into(),
+            original_relative_path: "file_219.txt".into(),
+            quarantined_filename: stage_name.into(),
+            quarantined_path: q_dir.join(stage_name).display().to_string(),
+            quarantined_at: chrono::Utc::now().to_rfc3339(),
+            expected_sha256: "exp_hash_219".into(),
+            actual_sha256: Some(CheckpointEngine::sha256_digest(payload)),
+            reason: "Retained suspicious replacement artifact".into(),
+            status: QuarantineStatus::PreservedConflict,
+            retained_staging_filename: Some(stage_name.into()),
+            retained_staging_path: Some(q_dir.join(stage_name).display().to_string()),
+        };
+
+        let mut manifest = RecoveryManifest::default();
+        manifest.records.push(rec);
+        manifest.save(&engine.recovery_manifest_path()).unwrap();
+
+        // Perform startup reconciliation on restarted engine
+        let restarted_engine = CheckpointEngine::new(&storage_dir);
+        let reconciled = restarted_engine.reconcile_quarantine().unwrap();
+
+        let r = reconciled
+            .records
+            .iter()
+            .find(|x| x.id == "rec_219")
+            .unwrap();
+        assert_eq!(
+            r.status,
+            QuarantineStatus::PreservedConflict,
+            "Retained suspicious artifact must remain PreservedConflict"
+        );
+        assert_eq!(
+            r.actual_sha256.as_deref(),
+            Some(CheckpointEngine::sha256_digest(payload).as_str()),
+            "Reconciliation must confirm hash of surviving retained artifact"
+        );
+        assert!(
+            q_dir.join(stage_name).exists(),
+            "Retained artifact must not be unlinked during reconciliation"
+        );
+
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
