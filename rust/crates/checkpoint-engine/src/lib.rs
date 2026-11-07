@@ -13110,8 +13110,10 @@ mod tests {
 
         // Hook replaces staging entry before rollback
         engine.set_post_stage_rename_hook(Some(move |stage_path: &Path| {
+            let temp_new = stage_path.with_extension("replacement-tmp");
+            std::fs::write(&temp_new, "REPLACED_BEFORE_ROLLBACK_195").unwrap();
             let _ = std::fs::remove_file(stage_path);
-            std::fs::write(stage_path, "REPLACED_BEFORE_ROLLBACK_195").unwrap();
+            std::fs::rename(&temp_new, stage_path).unwrap();
         }));
 
         let res = engine.cleanup_quarantine(&rec.id);
@@ -13148,8 +13150,10 @@ mod tests {
 
         // Hook replaces with identical bytes but new identity
         engine.set_post_stage_rename_hook(Some(move |stage_path: &Path| {
+            let temp_new = stage_path.with_extension("replacement-tmp");
+            std::fs::write(&temp_new, payload).unwrap();
             let _ = std::fs::remove_file(stage_path);
-            std::fs::write(stage_path, payload).unwrap();
+            std::fs::rename(&temp_new, stage_path).unwrap();
         }));
 
         let res = engine.cleanup_quarantine(&rec.id);
@@ -13181,8 +13185,10 @@ mod tests {
             .unwrap();
 
         engine.set_post_stage_rename_hook(Some(move |stage_path: &Path| {
+            let temp_new = stage_path.with_extension("replacement-tmp");
+            std::fs::write(&temp_new, "DIFFERENT_CORRUPTED_BYTES_197").unwrap();
             let _ = std::fs::remove_file(stage_path);
-            std::fs::write(stage_path, "DIFFERENT_CORRUPTED_BYTES_197").unwrap();
+            std::fs::rename(&temp_new, stage_path).unwrap();
         }));
 
         let res = engine.cleanup_quarantine(&rec.id);
@@ -13216,8 +13222,10 @@ mod tests {
         let orig_q_filename = rec.quarantined_filename.clone();
 
         engine.set_post_stage_rename_hook(Some(move |stage_path: &Path| {
+            let temp_new = stage_path.with_extension("replacement-tmp");
+            std::fs::write(&temp_new, "REPLACEMENT_198").unwrap();
             let _ = std::fs::remove_file(stage_path);
-            std::fs::write(stage_path, "REPLACEMENT_198").unwrap();
+            std::fs::rename(&temp_new, stage_path).unwrap();
         }));
 
         let _ = engine.cleanup_quarantine(&rec.id);
@@ -13258,8 +13266,10 @@ mod tests {
         let replacement_hash = CheckpointEngine::sha256_digest(replacement_bytes);
 
         engine.set_post_stage_rename_hook(Some(move |stage_path: &Path| {
+            let temp_new = stage_path.with_extension("replacement-tmp");
+            std::fs::write(&temp_new, replacement_bytes).unwrap();
             let _ = std::fs::remove_file(stage_path);
-            std::fs::write(stage_path, replacement_bytes).unwrap();
+            std::fs::rename(&temp_new, stage_path).unwrap();
         }));
 
         let _ = engine.cleanup_quarantine(&rec.id);
@@ -13358,8 +13368,10 @@ mod tests {
 
         // Hook replaces r1 during staging in batch
         engine.set_post_stage_rename_hook(Some(move |stage_path: &Path| {
+            let temp_new = stage_path.with_extension("replacement-tmp");
+            std::fs::write(&temp_new, "BATCH_USURPER_202").unwrap();
             let _ = std::fs::remove_file(stage_path);
-            std::fs::write(stage_path, "BATCH_USURPER_202").unwrap();
+            std::fs::rename(&temp_new, stage_path).unwrap();
         }));
 
         let res = engine.cleanup_all_quarantined();
