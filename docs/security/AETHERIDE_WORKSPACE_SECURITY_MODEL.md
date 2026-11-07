@@ -384,6 +384,37 @@ To eliminate irreversible destruction of recoverable user data when external pro
      * If unreferenced/untracked staging files exist on disk, reconciliation automatically adopts them into the durable manifest as `QuarantineStatus::PreservedConflict`, calculating SHA-256 digests and surfacing them for manual inspection.
      * An engine in `RecoveryBlocked` can only be unblocked once reconciliation successfully proves all artifacts are tracked and consistent.
 
+
+### 5.7 Sprint 23.2.15 Security Advancements: Final Rollback Identity Integrity, Atomic Recoverability & Reconciliation Fail-Closed Audit
+
+1. **Original Identity Binding Through Every Rollback Path:**
+   - Previous implementations could capture a new identity during rollback if staging substitution occurred, potentially publishing an adversarial replacement to the original filename.
+   - In Sprint 23.2.15, the original pre-staging `FileObjectIdentity` captured at Step 0 is strictly propagated through all rollback functions (`rollback_cleanup_stage` and `publish_no_overwrite`).
+   - If the candidate file in staging does not match the original authorized identity:
+     * It is **never** published to the original filename or accepted as the authorized artifact.
+     * It is safely renamed to `<filename>.suspicious-replacement.<uuid>` in quarantine storage.
+     * The actual SHA-256 digest of the surviving replacement is computed and recorded in the manifest.
+     * `RecoveryBlocked` is activated with explicit diagnostics explaining that the original object was lost or substituted.
+   - If Step 0 fails to capture identity due to any non-NotFound error, rollback also activates `RecoveryBlocked` fail-closed.
+   - Batch cleanup (`cleanup_all_quarantined`) and single cleanup enforce identical identity-binding contracts.
+
+2. **Kernel-Guaranteed vs. POSIX Retained Staging Disposal:**
+   - In `publish_no_overwrite`:
+     * Before removing the staging directory entry, `pre_staging_link_removal_hook` is called, and both destination and staging identities are re-verified against the original authorized identity.
+     * On Windows: `remove_file_windows_exclusive(&stage_abs, &expected_hash, Some(expected_identity))` is used. This opens the handle exclusively (`share_mode(0)`), checks volume and file index against the authorized identity, verifies the byte digest, and applies `FileDispositionInfo (DeleteFile = 1)`. If an adversary replaced the file, the identity check fails and deletion is rejected with `PermissionDenied`. The replacement artifact is never deleted as a side effect.
+     * On POSIX: Standard userland `unlink(2)` cannot provide an atomic identity-bound deletion guarantee across separate directory entries against open handles. Therefore, POSIX strictly retains the staging link (`PublishedWithRetainedStaging`), preventing any possibility of data loss or deleting the only remaining copy of an artifact.
+     * Post-removal verification checks destination existence and identity on disk. If the destination is missing or its identity drifted, `RecoveryBlocked` is activated immediately.
+
+3. **Explicit, Fail-Closed Reconciliation Error Classification:**
+   - `reconcile_quarantine` strictly audits all entries. Only `std::io::ErrorKind::NotFound` marks a quarantine artifact absent (`CleanedUp`).
+   - All other errors (permission denied, metadata errors, I/O read errors):
+     * Transition the quarantine record to `PreservedConflict`.
+     * Retained staging links that cannot be inspected never cause records to be marked `CleanedUp`.
+     * Untracked or tracked symlinks/reparse points found in quarantine are recorded as suspicious objects without following them.
+     * `RecoveryBlocked` is activated fail-closed with detailed diagnostic messages identifying the offending file and failure reason.
+   - Clean reconciliation runs (where all artifacts are inspectable and verified) clear `RecoveryBlocked` and return the engine to normal operation.
+   - Reconciliation is idempotent: repeated runs do not duplicate records for existing tracked or untracked artifacts.
+
 ---
 
 ## 6. AI Gateway Streaming & Cancellation

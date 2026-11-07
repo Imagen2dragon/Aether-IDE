@@ -312,6 +312,29 @@ Binary files (e.g. PNG files containing `0x89 0x50 0x4E 0x47` and arbitrary byte
   - Startup reconciliation (`reconcile_quarantine`) scans quarantine storage, discovers retained `.aether-clean-stage-*` artifacts, and adopts them into the recovery manifest as `PreservedConflict` (`test_chk_185`).
   - Rollback publication uncertainty activates `RecoveryBlocked` fail-closed (`test_chk_186`), and rollback operations strictly refuse to return successful status when destination recoverability is unproven (`test_chk_187`).
 
+- Final rollback identity integrity, atomic recoverability, and reconciliation fail-closed audit (`test_chk_188` through `test_chk_208`) proves that:
+  - Replacing destination after final identity check preserves staging link on disk (`test_chk_188`).
+  - Replacing staging entry after final identity check never deletes replacement as a side effect (`test_chk_189`).
+  - Original object remains recoverable on disk in both destination and staging replacement race scenarios (`test_chk_190`).
+  - Replacement object is never deleted as a side effect during exclusive unlinking (`test_chk_191`).
+  - Retained staging artifacts are durably persisted in manifest and successfully reconciled after restart (`test_chk_192`).
+  - Publication uncertainty activates `RecoveryBlocked` fail-closed (`test_chk_193`).
+  - Rollback returns non-success publication status when destination recoverability is unproven (`test_chk_194`).
+  - Replacing staging entry before rollback begins is rejected (`test_chk_195`).
+  - Replacing staging entry with identical bytes but different object identity is rejected (`test_chk_196`).
+  - Replacing staging entry with different bytes and different identity is safely preserved as conflict without clobbering destination (`test_chk_197`).
+  - Rollback never publishes replacement candidate as authorized original (`test_chk_198`).
+  - Manifest digest and provenance accurately describe the actual surviving artifact on disk (`test_chk_199`).
+  - Original identity is propagated through every rollback call (`test_chk_200`).
+  - Missing original identity query failure causes `RecoveryBlocked` fail-closed (`test_chk_201`).
+  - Batch cleanup follows the exact same fail-closed identity-binding contract on every entry (`test_chk_202`).
+  - Unreadable untracked staging artifact triggers `PreservedConflict` and `RecoveryBlocked` (`test_chk_203`).
+  - Metadata permission failure on retained staging never marks record `CleanedUp` (`test_chk_204`).
+  - Read failure on existing tracked staging artifact transitions to `PreservedConflict` and triggers `RecoveryBlocked` (`test_chk_205`).
+  - Symlink staging artifact recorded as suspicious conflict object without following target (`test_chk_206`).
+  - Repeated reconciliation runs are idempotent without duplicate manifest records (`test_chk_207`).
+  - `RecoveryBlocked` activation includes detailed diagnostics and blocks subsequent cleanups (`test_chk_208`).
+
 ### 3.4 Model Gateway Streaming
 The previous default trait implementation of `ModelProvider::stream_completion` which silently called `complete()` and returned a single fake chunk was eliminated. Tests confirm:
 - Providers that do not implement streaming explicitly fail with a descriptive `AetherError::ModelProvider`.
