@@ -2265,7 +2265,7 @@ impl CheckpointEngine {
                 original_filename,
                 uuid::Uuid::new_v4().simple()
             );
-            let conflict_abs = q_dir.join(&conflict_name);
+            let _conflict_abs = q_dir.join(&conflict_name);
 
             // Avoid overwrite-capable conflict publication:
             // 1. Verify conflict destination is confirmed absent
@@ -2290,7 +2290,7 @@ impl CheckpointEngine {
                             &stage_abs,
                             "",
                             None,
-                            Some(&conflict_abs),
+                            Some(&_conflict_abs),
                         )
                         .is_ok();
                         #[cfg(not(windows))]
