@@ -13920,9 +13920,20 @@ mod tests {
         // On Windows: hook runs while exclusive handles on BOTH stage_abs and dest are held with FILE_SHARE_READ,
         // BEFORE SetFileInformationByHandle applies deletion disposition!
         #[cfg(windows)]
+        let hook_executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(windows)]
+        let dest_handle_open_verified = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        #[cfg(windows)]
         {
             let stage_id_for_hook = stage_id;
+            let hook_executed_clone = Arc::clone(&hook_executed);
+            let dest_handle_clone = Arc::clone(&dest_handle_open_verified);
+
             engine.set_hook_windows_post_exclusive_open(Some(move |stage: &Path, dest: &Path| {
+                hook_executed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                dest_handle_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+
                 // 1. Attempt adversarial destination unlink while destination and staging handles are held
                 let unlink_err = std::fs::remove_file(dest).expect_err(
                     "Windows kernel must reject adversarial destination unlink with ERROR_SHARING_VIOLATION while exclusive handle is held!",
@@ -13934,7 +13945,7 @@ mod tests {
                     unlink_err
                 );
 
-                // 2. Also assert adversarial staging unlink is rejected with sharing violation
+                // 2. Attempt adversarial staging unlink while staging handle is held
                 let stage_unlink_err = std::fs::remove_file(stage).expect_err(
                     "Windows kernel must reject adversarial staging unlink with ERROR_SHARING_VIOLATION!",
                 );
@@ -13945,7 +13956,31 @@ mod tests {
                     stage_unlink_err
                 );
 
-                // 3. Assert destination and staging links remain intact on disk
+                // 3. Attempt external write/truncate to destination while handle is held
+                let write_dest_err = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(dest)
+                    .expect_err("Windows kernel must reject write access to destination with sharing violation!");
+                assert_eq!(
+                    write_dest_err.raw_os_error(),
+                    Some(32),
+                    "Expected Windows ERROR_SHARING_VIOLATION (os error 32) on destination write, got {:?}",
+                    write_dest_err
+                );
+
+                // 4. Attempt external write/truncate to staging while handle is held
+                let write_stage_err = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(stage)
+                    .expect_err("Windows kernel must reject write access to staging with sharing violation!");
+                assert_eq!(
+                    write_stage_err.raw_os_error(),
+                    Some(32),
+                    "Expected Windows ERROR_SHARING_VIOLATION (os error 32) on staging write, got {:?}",
+                    write_stage_err
+                );
+
+                // 5. Assert destination and staging links remain intact on disk
                 assert!(
                     dest.exists(),
                     "Destination hard link must remain intact after blocked adversarial unlink attempt"
@@ -13955,7 +13990,7 @@ mod tests {
                     "Staging link must remain intact after blocked adversarial unlink attempt"
                 );
 
-                // 4. Verify their object identities still match
+                // 6. Verify their object identities still match
                 let dest_id = filesystem_engine::query_file_object_identity(dest)
                     .expect("Must query destination identity");
                 let stage_id_now = filesystem_engine::query_file_object_identity(stage)
@@ -13968,6 +14003,13 @@ mod tests {
                     Some(dest_id),
                     stage_id_for_hook,
                     "Destination identity must match authorized original staging identity"
+                );
+
+                // 7. Verify destination content remains uncorrupted
+                assert_eq!(
+                    std::fs::read(dest).unwrap(),
+                    original_data,
+                    "Destination content must remain identical to authorized original data"
                 );
             }));
         }
@@ -13989,6 +14031,16 @@ mod tests {
 
         #[cfg(windows)]
         {
+            // Prove the hook actually executed and was reached
+            assert!(
+                hook_executed.load(std::sync::atomic::Ordering::SeqCst),
+                "Critical security invariant: CHK-210 post-exclusive-open hook MUST have executed!"
+            );
+            assert!(
+                dest_handle_open_verified.load(std::sync::atomic::Ordering::SeqCst),
+                "Destination handle MUST have been successfully acquired before hook execution!"
+            );
+
             // On Windows: helper unlinks the staging link while destination remains safely published
             assert!(
                 !stage_abs.exists(),
@@ -14019,6 +14071,16 @@ mod tests {
 
     #[test]
     fn test_chk_210b_destination_identity_mismatch_preserves_staging_and_blocks_recovery() {
+        // Scoped RAII guard ensuring fault injection flag is reset on any return or panic
+        struct ScopedFaultReset<F: FnOnce()>(Option<F>);
+        impl<F: FnOnce()> Drop for ScopedFaultReset<F> {
+            fn drop(&mut self) {
+                if let Some(reset) = self.0.take() {
+                    reset();
+                }
+            }
+        }
+
         let temp_dir =
             std::env::temp_dir().join(format!("aether_chk_210b_{}", uuid::Uuid::new_v4().simple()));
         let storage_dir = temp_dir.join(".aether").join("checkpoints");
@@ -14038,9 +14100,11 @@ mod tests {
         let stage_hash = CheckpointEngine::sha256_digest(original_data);
 
         #[cfg(windows)]
-        {
-            filesystem_engine::set_fault_inject_windows_dest_identity_mismatch(true);
-        }
+        filesystem_engine::set_fault_inject_windows_dest_identity_mismatch(true);
+        #[cfg(windows)]
+        let _guard = ScopedFaultReset(Some(|| {
+            filesystem_engine::set_fault_inject_windows_dest_identity_mismatch(false);
+        }));
 
         let rolled = engine.rollback_cleanup_stage(
             &q_cap_dir,
@@ -14052,7 +14116,6 @@ mod tests {
 
         #[cfg(windows)]
         {
-            filesystem_engine::set_fault_inject_windows_dest_identity_mismatch(false);
             assert!(
                 stage_abs.exists(),
                 "Staging link must NOT be unlinked when destination identity mismatch is detected!"
@@ -14076,6 +14139,140 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_220_empirical_windows_sharing_matrix() {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use std::os::windows::io::AsRawHandle;
+            let temp_dir = std::env::temp_dir()
+                .join(format!("aether_matrix_{}", uuid::Uuid::new_v4().simple()));
+            std::fs::create_dir_all(&temp_dir).unwrap();
+            let file_stage = temp_dir.join("stage.bin");
+            let file_dest = temp_dir.join("dest.bin");
+
+            std::fs::write(&file_stage, b"SHARING MATRIX TEST DATA").unwrap();
+            std::fs::hard_link(&file_stage, &file_dest).unwrap();
+
+            const DELETE: u32 = 0x00010000;
+            const GENERIC_READ: u32 = 0x80000000;
+            const FILE_SHARE_READ: u32 = 0x00000001;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+
+            // Handle 1 (staging): access = GENERIC_READ | DELETE, share = FILE_SHARE_READ
+            let handle_stage = std::fs::OpenOptions::new()
+                .read(true)
+                .access_mode(GENERIC_READ | DELETE)
+                .share_mode(FILE_SHARE_READ)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&file_stage)
+                .expect("Handle 1 (stage) must open");
+
+            // Handle 2 (dest): access = GENERIC_READ, share = FILE_SHARE_READ
+            let handle_dest = std::fs::OpenOptions::new()
+                .read(true)
+                .access_mode(GENERIC_READ)
+                .share_mode(FILE_SHARE_READ)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&file_dest)
+                .expect("Handle 2 (dest) must open successfully with reciprocal share mode");
+
+            // 1. External attempt to unlink dest is blocked with ERROR_SHARING_VIOLATION (32)
+            let ext_unlink_dest = std::fs::remove_file(&file_dest);
+            assert!(
+                ext_unlink_dest.is_err(),
+                "External unlink of dest must fail"
+            );
+            assert_eq!(
+                ext_unlink_dest.unwrap_err().raw_os_error(),
+                Some(32),
+                "Must be ERROR_SHARING_VIOLATION"
+            );
+
+            // 2. External attempt to unlink stage is blocked with ERROR_SHARING_VIOLATION (32)
+            let ext_unlink_stage = std::fs::remove_file(&file_stage);
+            assert!(
+                ext_unlink_stage.is_err(),
+                "External unlink of stage must fail"
+            );
+            assert_eq!(
+                ext_unlink_stage.unwrap_err().raw_os_error(),
+                Some(32),
+                "Must be ERROR_SHARING_VIOLATION"
+            );
+
+            // 3. External attempt to write/truncate dest is blocked with ERROR_SHARING_VIOLATION (32)
+            let ext_write_dest = std::fs::OpenOptions::new().write(true).open(&file_dest);
+            assert!(ext_write_dest.is_err(), "External write of dest must fail");
+            assert_eq!(
+                ext_write_dest.unwrap_err().raw_os_error(),
+                Some(32),
+                "Must be ERROR_SHARING_VIOLATION"
+            );
+
+            // 4. External attempt to write/truncate stage is blocked with ERROR_SHARING_VIOLATION (32)
+            let ext_write_stage = std::fs::OpenOptions::new().write(true).open(&file_stage);
+            assert!(
+                ext_write_stage.is_err(),
+                "External write of stage must fail"
+            );
+            assert_eq!(
+                ext_write_stage.unwrap_err().raw_os_error(),
+                Some(32),
+                "Must be ERROR_SHARING_VIOLATION"
+            );
+
+            // 5. Verify SetFileInformationByHandle on handle_stage applies deletion disposition
+            #[repr(C)]
+            #[allow(non_snake_case)]
+            struct FILE_DISPOSITION_INFO {
+                DeleteFile: u8,
+            }
+            #[allow(non_snake_case)]
+            extern "system" {
+                fn SetFileInformationByHandle(
+                    hFile: *mut std::ffi::c_void,
+                    FileInformationClass: u32,
+                    lpFileInformation: *mut std::ffi::c_void,
+                    dwBufferSize: u32,
+                ) -> i32;
+            }
+            let mut info = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+            let res = unsafe {
+                SetFileInformationByHandle(
+                    handle_stage.as_raw_handle(),
+                    4, // FileDispositionInfo
+                    &mut info as *mut _ as *mut std::ffi::c_void,
+                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            };
+            assert_ne!(res, 0, "SetFileInformationByHandle must succeed");
+
+            drop(handle_stage);
+            assert!(
+                !file_stage.exists(),
+                "Stage link must be deleted after handle_stage is closed"
+            );
+            assert!(
+                file_dest.exists(),
+                "Dest link must survive while handle_dest is still held"
+            );
+
+            drop(handle_dest);
+            assert!(!file_stage.exists(), "Stage link remains deleted");
+            assert!(
+                file_dest.exists(),
+                "Dest link remains intact on disk as sole survivor"
+            );
+            assert_eq!(
+                std::fs::read(&file_dest).unwrap(),
+                b"SHARING MATRIX TEST DATA"
+            );
+
+            let _ = std::fs::remove_dir_all(&temp_dir);
+        }
     }
 
     #[test]
