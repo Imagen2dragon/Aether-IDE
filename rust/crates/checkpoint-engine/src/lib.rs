@@ -13850,10 +13850,23 @@ mod tests {
         let stage_id = filesystem_engine::query_file_object_identity(&stage_abs).ok();
         let stage_hash = CheckpointEngine::sha256_digest(original_data);
 
+        let stage_id_for_hook = stage_id;
         // Adversarial hook executes AFTER final pathname re-check and BEFORE Windows exclusive handle acquisition
         engine.set_post_final_pathname_checks_hook(Some(move |dest_path: &Path| {
-            let _ = std::fs::remove_file(dest_path);
-            std::fs::write(dest_path, "ADVERSARIAL_POST_PATHNAME_USURPER_209").unwrap();
+            std::fs::remove_file(dest_path)
+                .expect("Adversarial hook must unlink destination hard link");
+            std::fs::write(dest_path, "ADVERSARIAL_POST_PATHNAME_USURPER_209")
+                .expect("Adversarial hook must write replacement destination file");
+            assert!(
+                dest_path.exists(),
+                "Adversarial replacement destination must exist on disk"
+            );
+            let new_dest_id = filesystem_engine::query_file_object_identity(dest_path)
+                .expect("Must query replacement destination identity");
+            assert!(
+                Some(new_dest_id) != stage_id_for_hook,
+                "Replacement destination identity must differ from authorized staging identity"
+            );
         }));
 
         let rolled = engine.rollback_cleanup_stage(
@@ -13904,13 +13917,28 @@ mod tests {
         let stage_id = filesystem_engine::query_file_object_identity(&stage_abs).ok();
         let stage_hash = CheckpointEngine::sha256_digest(original_data);
 
-        // On Windows: hook runs while exclusive handle on stage_abs is held with share_mode(0),
+        // On Windows: hook runs while exclusive handle on stage_abs is held with FILE_SHARE_READ,
         // BEFORE SetFileInformationByHandle applies deletion disposition!
         #[cfg(windows)]
-        engine.set_hook_windows_post_exclusive_open(Some(move |_stage: &Path, dest: &Path| {
-            let _ = std::fs::remove_file(dest);
-            std::fs::write(dest, "CONCURRENT_DESTINATION_REPLACEMENT_210").unwrap();
-        }));
+        {
+            let stage_id_for_hook = stage_id;
+            engine.set_hook_windows_post_exclusive_open(Some(move |_stage: &Path, dest: &Path| {
+                std::fs::remove_file(dest)
+                    .expect("Adversarial hook must unlink destination hard link");
+                std::fs::write(dest, "CONCURRENT_DESTINATION_REPLACEMENT_210")
+                    .expect("Adversarial hook must write replacement destination file");
+                assert!(
+                    dest.exists(),
+                    "Adversarial replacement destination must exist on disk"
+                );
+                let new_dest_id = filesystem_engine::query_file_object_identity(dest)
+                    .expect("Must query replacement destination identity");
+                assert!(
+                    Some(new_dest_id) != stage_id_for_hook,
+                    "Replacement destination identity must differ from authorized staging identity"
+                );
+            }));
+        }
 
         let rolled = engine.rollback_cleanup_stage(
             &q_cap_dir,

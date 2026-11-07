@@ -202,18 +202,26 @@ npm --prefix apps/desktop run build: Clean (tsc --noEmit && vite build succeeded
 ========================================================================================
 ```
 
-### 4.3 Authoritative GitHub Actions CI Matrix Results (Exact-HEAD `4732caac8ffb26a643867ec4c6d66e746a58bc2f`)
+### 4.3 Authoritative GitHub Actions CI Matrix Results (Exact-HEAD `8c8a2929daefab8439505f9ab2a137fb08f0b888`)
 
-All 5 matrix jobs for PR #24 against exact final commit `4732caac8ffb26a643867ec4c6d66e746a58bc2f` completed with **100% SUCCESS**:
+All 5 matrix jobs for PR #24 against exact reviewed commit `8c8a2929daefab8439505f9ab2a137fb08f0b888` completed with **100% SUCCESS**:
 
-- **Push CI Run ID:** `42365890801` (URL: https://github.com/Imagen2dragon/Aether-IDE/actions/runs/42365890801)
-- **Pull Request CI Run ID:** `42365895058` (URL: https://github.com/Imagen2dragon/Aether-IDE/actions/runs/42365895058)
-- **Matrix Results (Push Run 42365890801):**
-  1. **Windows x64 (MSVC) Build & Package:** **SUCCESS** in 8m28s (Job ID: `128383744444`)
-  2. **macOS ARM64 (Apple Silicon) Build & Package:** **SUCCESS** in 4m46s (Job ID: `128383744417`)
-  3. **Linux x64 (GNU) Build & Package:** **SUCCESS** in 6m23s (Job ID: `128383744206`)
-  4. **Code Formatting & Quality:** **SUCCESS** in 26s (Job ID: `128383744336`)
-  5. **TypeScript & Frontend Workbench Verification:** **SUCCESS** in 45s (Job ID: `128383744421`)
+- **Pull Request CI Run ID:** `42366592618` (URL: https://github.com/Imagen2dragon/Aether-IDE/actions/runs/42366592618)
+- **Push CI Run ID:** `42366588665` (URL: https://github.com/Imagen2dragon/Aether-IDE/actions/runs/42366588665)
+- **Matrix Results (PR Run 42366592618):**
+  1. **Windows x64 (MSVC) Build & Package:** **SUCCESS** in 6m28s (Job ID: `128383756448`)
+  2. **macOS ARM64 (Apple Silicon) Build & Package:** **SUCCESS** in 4m23s (Job ID: `128383756428`)
+  3. **Linux x64 (GNU) Build & Package:** **SUCCESS** in 4m16s (Job ID: `128383756460`)
+  4. **Code Formatting & Quality:** **SUCCESS** in 21s (Job ID: `128383756464`)
+  5. **TypeScript & Frontend Workbench Verification:** **SUCCESS** in 58s (Job ID: `128383756329`)
+- **Matrix Results (Push Run 42366588665):**
+  1. **Windows x64 (MSVC) Build & Package:** **SUCCESS** in 9m13s (Job ID: `128385828278`)
+  2. **macOS ARM64 (Apple Silicon) Build & Package:** **SUCCESS** in 4m21s (Job ID: `128385828386`)
+  3. **Linux x64 (GNU) Build & Package:** **SUCCESS** in 6m03s (Job ID: `128385828206`)
+  4. **Code Formatting & Quality:** **SUCCESS** in 18s (Job ID: `128385828269`)
+  5. **TypeScript & Frontend Workbench Verification:** **SUCCESS** in 47s (Job ID: `128385828174`)
+- **Historical Note (Intermediate Commit `4732caac8ffb26a643867ec4c6d66e746a58bc2f`):**
+  - Prior push run `42365890801` and PR run `42365895058` also achieved 100% green before the final documentation commit.
 - **Release Artifacts Generated:**
   - `AetherIDE-v0.1.0-beta.2-windows-x64`
   - `AetherIDE-v0.1.0-beta.2-macos-arm64`

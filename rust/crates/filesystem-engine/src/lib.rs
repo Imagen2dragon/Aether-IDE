@@ -1730,8 +1730,8 @@ impl WorkspaceCapability {
                         #[cfg(windows)]
                         {
                             // On Windows, use exclusive handle deletion:
-                            // 1. Open with share_mode(0) (exclusive access) and DELETE permission.
-                            //    If any other process holds any open handle, open fails immediately.
+                            // 1. Open with FILE_SHARE_READ (denying concurrent writes and deletes) and DELETE permission.
+                            //    If any concurrent process holds a write or delete handle, open fails immediately.
                             // 2. While holding the handle, read bytes and verify hash against expected_hash.
                             // 3. If hash matches, set FileDispositionInfo (DeleteFile = 1) on the handle.
                             // 4. Closing the handle unlinks the file atomically at kernel level without race.
