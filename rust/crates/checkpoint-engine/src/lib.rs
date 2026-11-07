@@ -2065,6 +2065,7 @@ impl CheckpointEngine {
 
             #[cfg(not(windows))]
             {
+                let _ = expected_hash;
                 // POSIX Fail-Closed: Standard POSIX cannot provide identity-bound exclusive unlinking
                 // across independent directory entries. Retain staging link to eliminate deletion race!
                 (
