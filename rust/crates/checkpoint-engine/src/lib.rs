@@ -14072,7 +14072,10 @@ mod tests {
     #[test]
     fn test_chk_210b_destination_identity_mismatch_preserves_staging_and_blocks_recovery() {
         // Scoped RAII guard ensuring fault injection flag is reset on any return or panic
+        #[cfg(windows)]
+        #[allow(dead_code)]
         struct ScopedFaultReset<F: FnOnce()>(Option<F>);
+        #[cfg(windows)]
         impl<F: FnOnce()> Drop for ScopedFaultReset<F> {
             fn drop(&mut self) {
                 if let Some(reset) = self.0.take() {
