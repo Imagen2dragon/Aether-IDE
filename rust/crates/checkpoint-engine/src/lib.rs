@@ -13917,25 +13917,57 @@ mod tests {
         let stage_id = filesystem_engine::query_file_object_identity(&stage_abs).ok();
         let stage_hash = CheckpointEngine::sha256_digest(original_data);
 
-        // On Windows: hook runs while exclusive handle on stage_abs is held with FILE_SHARE_READ,
+        // On Windows: hook runs while exclusive handles on BOTH stage_abs and dest are held with FILE_SHARE_READ,
         // BEFORE SetFileInformationByHandle applies deletion disposition!
         #[cfg(windows)]
         {
             let stage_id_for_hook = stage_id;
-            engine.set_hook_windows_post_exclusive_open(Some(move |_stage: &Path, dest: &Path| {
-                std::fs::remove_file(dest)
-                    .expect("Adversarial hook must unlink destination hard link");
-                std::fs::write(dest, "CONCURRENT_DESTINATION_REPLACEMENT_210")
-                    .expect("Adversarial hook must write replacement destination file");
+            engine.set_hook_windows_post_exclusive_open(Some(move |stage: &Path, dest: &Path| {
+                // 1. Attempt adversarial destination unlink while destination and staging handles are held
+                let unlink_err = std::fs::remove_file(dest).expect_err(
+                    "Windows kernel must reject adversarial destination unlink with ERROR_SHARING_VIOLATION while exclusive handle is held!",
+                );
+                assert_eq!(
+                    unlink_err.raw_os_error(),
+                    Some(32),
+                    "Expected Windows ERROR_SHARING_VIOLATION (os error 32) on destination unlink, got {:?}",
+                    unlink_err
+                );
+
+                // 2. Also assert adversarial staging unlink is rejected with sharing violation
+                let stage_unlink_err = std::fs::remove_file(stage).expect_err(
+                    "Windows kernel must reject adversarial staging unlink with ERROR_SHARING_VIOLATION!",
+                );
+                assert_eq!(
+                    stage_unlink_err.raw_os_error(),
+                    Some(32),
+                    "Expected Windows ERROR_SHARING_VIOLATION (os error 32) on staging unlink, got {:?}",
+                    stage_unlink_err
+                );
+
+                // 3. Assert destination and staging links remain intact on disk
                 assert!(
                     dest.exists(),
-                    "Adversarial replacement destination must exist on disk"
+                    "Destination hard link must remain intact after blocked adversarial unlink attempt"
                 );
-                let new_dest_id = filesystem_engine::query_file_object_identity(dest)
-                    .expect("Must query replacement destination identity");
                 assert!(
-                    Some(new_dest_id) != stage_id_for_hook,
-                    "Replacement destination identity must differ from authorized staging identity"
+                    stage.exists(),
+                    "Staging link must remain intact after blocked adversarial unlink attempt"
+                );
+
+                // 4. Verify their object identities still match
+                let dest_id = filesystem_engine::query_file_object_identity(dest)
+                    .expect("Must query destination identity");
+                let stage_id_now = filesystem_engine::query_file_object_identity(stage)
+                    .expect("Must query staging identity");
+                assert_eq!(
+                    dest_id, stage_id_now,
+                    "Destination and staging identities must remain identical"
+                );
+                assert_eq!(
+                    Some(dest_id),
+                    stage_id_for_hook,
+                    "Destination identity must match authorized original staging identity"
                 );
             }));
         }
@@ -13948,28 +13980,95 @@ mod tests {
             Some(&stage_hash),
         );
 
-        // Staging link MUST NOT be unlinked! Original content is 100% preserved.
+        let dest_abs = q_dir.join("dest_210.txt");
         assert!(
-            stage_abs.exists(),
-            "Original staging object must not be lost when destination is replaced under exclusive handle lock!"
+            dest_abs.exists(),
+            "Destination artifact must survive intact with authorized content!"
         );
-        assert_eq!(std::fs::read(&stage_abs).unwrap(), original_data);
+        assert_eq!(std::fs::read(&dest_abs).unwrap(), original_data);
 
         #[cfg(windows)]
         {
-            assert_eq!(
-                rolled.status,
-                RollbackPublicationStatus::PublicationUncertainBlocked
-            );
+            // On Windows: helper unlinks the staging link while destination remains safely published
             assert!(
-                engine.is_recovery_blocked(),
-                "RecoveryBlocked must be engaged when destination mismatch is detected under handle lock!"
+                !stage_abs.exists(),
+                "Staging link must be cleanly unlinked on Windows after verified publication"
+            );
+            assert_eq!(rolled.status, RollbackPublicationStatus::PublishedVerified);
+            assert!(
+                !engine.is_recovery_blocked(),
+                "RecoveryBlocked must NOT be active when publication succeeded without unapproved replacement!"
             );
             engine.set_hook_windows_post_exclusive_open(None::<fn(&Path, &Path)>);
         }
         #[cfg(not(windows))]
         {
             // On POSIX, retained staging link policy guarantees recoverability
+            assert!(
+                stage_abs.exists(),
+                "Staging link must be retained on POSIX fail-closed policy"
+            );
+            assert_eq!(
+                rolled.status,
+                RollbackPublicationStatus::PublishedWithRetainedStaging
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_chk_210b_destination_identity_mismatch_preserves_staging_and_blocks_recovery() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aether_chk_210b_{}", uuid::Uuid::new_v4().simple()));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let engine = Arc::new(CheckpointEngine::new(&storage_dir));
+        let q_dir = engine.quarantine_dir();
+        std::fs::create_dir_all(&q_dir).unwrap();
+        let q_cap_dir =
+            cap_std::fs::Dir::open_ambient_dir(&q_dir, cap_std::ambient_authority()).unwrap();
+
+        let stage_name = ".aether-clean-stage-chk210b";
+        let original_data = b"CRITICAL AUTHORIZED DATA 210B";
+        q_cap_dir.write(stage_name, original_data).unwrap();
+        let stage_abs = q_dir.join(stage_name);
+        let stage_id = filesystem_engine::query_file_object_identity(&stage_abs).ok();
+        let stage_hash = CheckpointEngine::sha256_digest(original_data);
+
+        #[cfg(windows)]
+        {
+            filesystem_engine::set_fault_inject_windows_dest_identity_mismatch(true);
+        }
+
+        let rolled = engine.rollback_cleanup_stage(
+            &q_cap_dir,
+            stage_name,
+            "dest_210b.txt",
+            stage_id,
+            Some(&stage_hash),
+        );
+
+        #[cfg(windows)]
+        {
+            filesystem_engine::set_fault_inject_windows_dest_identity_mismatch(false);
+            assert!(
+                stage_abs.exists(),
+                "Staging link must NOT be unlinked when destination identity mismatch is detected!"
+            );
+            assert_eq!(std::fs::read(&stage_abs).unwrap(), original_data);
+            assert_eq!(
+                rolled.status,
+                RollbackPublicationStatus::PublicationUncertainBlocked
+            );
+            assert!(
+                engine.is_recovery_blocked(),
+                "RecoveryBlocked must be active on destination identity mismatch!"
+            );
+        }
+        #[cfg(not(windows))]
+        {
             assert_eq!(
                 rolled.status,
                 RollbackPublicationStatus::PublishedWithRetainedStaging

@@ -49,6 +49,10 @@ In strict compliance with the **Sprint 23.2.17 Final Evidence Closure Directive*
 
 ### 2.1 Hardened CHK-210 (Destination Replaced Under Staging Handle Lock)
 
+> [!NOTE]
+> **Sprint 23.2.18 Share-Mode Consistency Clarification:**
+> In Sprint 23.2.17, `remove_file_windows_exclusive` held an exclusive handle only on `stage_abs`. In NTFS, unlinking an un-opened hard link (`dest`) when `nNumberOfLinks > 1` was permitted by Windows kernel sharing rules, while `stage_abs` was locked against unlinking (`ERROR_SHARING_VIOLATION` / OS error 32). In Sprint 23.2.18, `remove_file_windows_exclusive` was upgraded to hold `dest` open with `FILE_SHARE_READ` concurrently with `stage_abs`. Under this dual-handle lock, Windows kernel actively rejects any adversarial unlink of `dest` with `ERROR_SHARING_VIOLATION` (code 32). CHK-210 was aligned to verify this kernel-level rejection, and CHK-210B was introduced for deterministic destination identity mismatch fault injection. See `docs/releases/AETHERIDE_SPRINT_23_2_18_SHARE_MODE_AUDIT_REPORT.md` for complete audit details.
+
 **File Modified:** `rust/crates/checkpoint-engine/src/lib.rs` (`test_chk_210_replace_destination_while_exclusive_handle_held_preserves_staging_without_loss`)
 
 ```rust

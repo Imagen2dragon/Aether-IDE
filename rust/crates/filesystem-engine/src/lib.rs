@@ -47,6 +47,7 @@ pub type WindowsPostExclusiveOpenHook =
 thread_local! {
     static FAULT_INJECT_WINDOWS_REPARSE_POINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAULT_INJECT_WINDOWS_IDENTITY_MISMATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAULT_INJECT_WINDOWS_DEST_IDENTITY_MISMATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAULT_INJECT_WINDOWS_DEST_IDENTITY_QUERY_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static HOOK_WINDOWS_PRE_EXCLUSIVE_OPEN: std::cell::RefCell<Option<WindowsPreExclusiveOpenHook>> = const { std::cell::RefCell::new(None) };
     static HOOK_WINDOWS_POST_EXCLUSIVE_OPEN: std::cell::RefCell<Option<WindowsPostExclusiveOpenHook>> = const { std::cell::RefCell::new(None) };
@@ -106,6 +107,16 @@ pub fn is_fault_inject_windows_identity_mismatch() -> bool {
     FAULT_INJECT_WINDOWS_IDENTITY_MISMATCH.with(|cell| cell.get())
 }
 
+#[cfg(windows)]
+pub fn set_fault_inject_windows_dest_identity_mismatch(inject: bool) {
+    FAULT_INJECT_WINDOWS_DEST_IDENTITY_MISMATCH.with(|cell| cell.set(inject));
+}
+
+#[cfg(windows)]
+pub fn is_fault_inject_windows_dest_identity_mismatch() -> bool {
+    FAULT_INJECT_WINDOWS_DEST_IDENTITY_MISMATCH.with(|cell| cell.get())
+}
+
 #[cfg(not(windows))]
 pub fn set_hook_windows_pre_exclusive_open(_hook: Option<WindowsPreExclusiveOpenHook>) {}
 
@@ -143,6 +154,14 @@ pub fn set_fault_inject_windows_identity_mismatch(_inject: bool) {}
 
 #[cfg(not(windows))]
 pub fn is_fault_inject_windows_identity_mismatch() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn set_fault_inject_windows_dest_identity_mismatch(_inject: bool) {}
+
+#[cfg(not(windows))]
+pub fn is_fault_inject_windows_dest_identity_mismatch() -> bool {
     false
 }
 
@@ -376,9 +395,22 @@ pub fn remove_file_windows_exclusive(
         )));
     }
 
-    // While exclusive handle on staging file remains open, query and verify destination identity (Sprint 23.2.16 P1)
-    if let Some(dest) = destination_path {
-        // Hook while exclusive handle is held, before destination verification (CHK-210)
+    // While exclusive handle on staging file remains open, open and verify destination handle (Sprint 23.2.16 & Sprint 23.2.18)
+    let dest_handle = if let Some(dest) = destination_path {
+        // Sprint 23.2.18: Open destination handle with GENERIC_READ and FILE_SHARE_READ.
+        // This kernel lock guarantees:
+        // 1. Any adversarial attempt to delete or unlink destination fails with ERROR_SHARING_VIOLATION (code 32).
+        // 2. Any adversarial attempt to write or truncate destination fails with ERROR_SHARING_VIOLATION (code 32).
+        // 3. Destination identity and attributes are verified directly from this verified open handle without TOCTOU races.
+        let dest_file = std::fs::OpenOptions::new()
+            .read(true)
+            .access_mode(GENERIC_READ)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(dest)
+            .map_err(AetherError::Io)?;
+
+        // Hook while exclusive handles on both staging and destination are held (CHK-210)
         if let Some(ref hook) = get_hook_windows_post_exclusive_open() {
             hook(path, dest);
         }
@@ -390,7 +422,46 @@ pub fn remove_file_windows_exclusive(
             )));
         }
 
-        let dest_identity = query_file_object_identity(dest)?;
+        let dest_file_type = unsafe { GetFileType(dest_file.as_raw_handle()) };
+        if dest_file_type != FILE_TYPE_DISK {
+            return Err(AetherError::PermissionDenied(format!(
+                "Security rejection: Destination '{}' is not a standard disk file (file type: 0x{:x}); refusing exclusive deletion",
+                dest.display(),
+                dest_file_type
+            )));
+        }
+
+        let mut dest_by_handle_info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+        let dest_info_res = unsafe {
+            GetFileInformationByHandle(dest_file.as_raw_handle(), dest_by_handle_info.as_mut_ptr())
+        };
+        if dest_info_res == 0 {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+        let dest_file_info = unsafe { dest_by_handle_info.assume_init() };
+
+        let dest_is_reparse = (dest_file_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        let dest_is_dir = (dest_file_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if dest_is_reparse || dest_is_dir {
+            return Err(AetherError::PermissionDenied(format!(
+                "Security rejection: Destination '{}' is a reparse point or directory (attributes: 0x{:x}); refusing exclusive deletion to prevent target redirection",
+                dest.display(),
+                dest_file_info.dwFileAttributes
+            )));
+        }
+
+        let dest_identity = FileObjectIdentity {
+            volume_serial_number: dest_file_info.dwVolumeSerialNumber as u64,
+            file_index_high: dest_file_info.nFileIndexHigh as u64,
+            file_index_low: dest_file_info.nFileIndexLow as u64,
+        };
+
+        if is_fault_inject_windows_dest_identity_mismatch() {
+            return Err(AetherError::PermissionDenied(format!(
+                "Security rejection: Injected destination identity mismatch for '{}'",
+                dest.display()
+            )));
+        }
 
         if dest_identity != actual_identity {
             return Err(AetherError::PermissionDenied(format!(
@@ -412,7 +483,11 @@ pub fn remove_file_windows_exclusive(
                 )));
             }
         }
-    }
+
+        Some(dest_file)
+    } else {
+        None
+    };
 
     #[repr(C)]
     #[allow(non_snake_case)]
@@ -443,6 +518,7 @@ pub fn remove_file_windows_exclusive(
     }
 
     drop(file);
+    drop(dest_handle);
     Ok(())
 }
 
