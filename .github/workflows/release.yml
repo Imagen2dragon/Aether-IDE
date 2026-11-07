@@ -1,0 +1,351 @@
+name: AetherIDE Release Pipeline
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  code-quality:
+    name: Code Formatting & Quality
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Check Rust Formatting
+        run: |
+          cd rust
+          cargo fmt --all -- --check
+
+  frontend-build:
+    name: TypeScript & Frontend Workbench Verification
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Desktop Dependencies
+        run: |
+          cd apps/desktop
+          npm install --ignore-scripts
+      - name: Build Desktop Workbench
+        run: |
+          cd apps/desktop
+          npm run build
+
+  windows-build:
+    name: Windows x64 (MSVC) Build & Package
+    needs: [code-quality, frontend-build]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Target Directory
+        shell: bash
+        run: echo "CARGO_TARGET_DIR=${{ runner.temp }}/aether-build/windows-x64" >> $GITHUB_ENV
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run Windows Clippy
+        run: |
+          cd rust
+          cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run Windows Tests
+        run: |
+          cd rust
+          cargo test --workspace
+      - name: Build Windows Binaries (Release)
+        run: |
+          cd rust
+          cargo build --workspace --release
+      - name: Build Desktop Workbench
+        run: |
+          cd apps/desktop
+          npm install --ignore-scripts
+          npm run build
+      - name: Install Inno Setup Compiler
+        run: |
+          choco install innosetup -y
+      - name: Package Windows Release Artifacts
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $ver = if ($tag -like 'v*') { $tag.Substring(1) } else { $tag }
+          ./scripts/package-windows.ps1 -Version $ver -SkipBuild -RequireInstaller
+      - name: Verify Windows Package Outputs
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $ver = if ($tag -like 'v*') { $tag.Substring(1) } else { $tag }
+          $installer = "dist/AetherIDE-Setup-$ver-x64.exe"
+          $installerHash = "dist/AetherIDE-Setup-$ver-x64.exe.sha256"
+          $zip = "dist/AetherIDE-v$ver-windows-x64.zip"
+          $zipHash = "dist/AetherIDE-v$ver-windows-x64.zip.sha256"
+          foreach ($f in @($installer, $installerHash, $zip, $zipHash)) {
+            if (-not (Test-Path $f)) {
+              throw "Required Windows release asset missing: $f"
+            }
+            if ((Get-Item $f).Length -eq 0) {
+              throw "Windows release asset is empty: $f"
+            }
+          }
+          Write-Host "All Windows release packages verified successfully."
+      - name: Upload Windows Release Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-windows
+          path: |
+            dist/*.exe
+            dist/*.exe.sha256
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error
+
+  linux-build:
+    name: Linux x64 (GNU) Build & Package
+    needs: [code-quality, frontend-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Target Directory
+        shell: bash
+        run: echo "CARGO_TARGET_DIR=${{ runner.temp }}/aether-build/linux-x64" >> $GITHUB_ENV
+      - name: Install Linux Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libsoup2.4-dev || sudo apt-get install -y libgtk-3-dev libsoup-3.0-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev || sudo apt-get install -y libwebkit2gtk-4.0-dev
+          sudo apt-get install -y dbus-x11 gnome-keyring xvfb
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+          components: clippy
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run Linux Clippy
+        run: |
+          cd rust
+          cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run Authoritative Linux Tests (D-Bus Session)
+        run: |
+          cd rust
+          dbus-run-session -- cargo test --workspace
+      - name: Build Linux Binaries (Release)
+        run: |
+          cd rust
+          cargo build --workspace --release
+      - name: Build Desktop Workbench
+        run: |
+          cd apps/desktop
+          npm install --ignore-scripts
+          npm run build
+      - name: Package Linux Release Artifacts
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          bash scripts/package-linux.sh "$VERSION"
+      - name: Verify Linux Package Outputs
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          TAR="dist/AetherIDE-v$VERSION-linux-x64.tar.gz"
+          TAR_HASH="dist/AetherIDE-v$VERSION-linux-x64.tar.gz.sha256"
+          for f in "$TAR" "$TAR_HASH"; do
+            if [ ! -s "$f" ]; then
+              echo "Required Linux release asset missing or empty: $f"
+              exit 1
+            fi
+          done
+          echo "Linux release package verified successfully."
+      - name: Upload Linux Release Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-linux
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  macos-build:
+    name: macOS ARM64 (Apple Silicon) Build & Package
+    needs: [code-quality, frontend-build]
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Target Directory
+        shell: bash
+        run: echo "CARGO_TARGET_DIR=${{ runner.temp }}/aether-build/macos-arm64" >> $GITHUB_ENV
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+          components: clippy
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Setup Deterministic Headless macOS Keychain
+        run: |
+          KEYCHAIN_PATH="${RUNNER_TEMP}/aether_ci.keychain-db"
+          KEYCHAIN_PASS="ci_test_password"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security show-keychain-info "$KEYCHAIN_PATH"
+      - name: Run macOS Clippy
+        run: |
+          cd rust
+          cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run macOS Tests
+        run: |
+          cd rust
+          cargo test --workspace
+      - name: Build macOS Binaries (Release)
+        run: |
+          cd rust
+          cargo build --workspace --release
+      - name: Build Desktop Workbench
+        run: |
+          cd apps/desktop
+          npm install --ignore-scripts
+          npm run build
+      - name: Package macOS Release Artifacts
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          bash scripts/package-macos.sh "$VERSION"
+      - name: Verify macOS Package Outputs
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          TAR="dist/AetherIDE-v$VERSION-macos-arm64.tar.gz"
+          TAR_HASH="dist/AetherIDE-v$VERSION-macos-arm64.tar.gz.sha256"
+          for f in "$TAR" "$TAR_HASH"; do
+            if [ ! -s "$f" ]; then
+              echo "Required macOS release asset missing or empty: $f"
+              exit 1
+            fi
+          done
+          echo "macOS release package verified successfully."
+      - name: Upload macOS Release Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-macos
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+      - name: Cleanup macOS Keychain
+        if: always()
+        run: |
+          KEYCHAIN_PATH="${RUNNER_TEMP}/aether_ci.keychain-db"
+          if [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
+
+  publish-release:
+    name: Publish Official GitHub Release
+    needs: [code-quality, frontend-build, windows-build, linux-build, macos-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download All Release Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Verify Release Assets & Checksums
+        run: |
+          set -euo pipefail
+          cd release-assets
+          echo "Downloaded release assets:"
+          ls -lh
+          
+          VERSION="${GITHUB_REF_NAME#v}"
+          REQUIRED_FILES=(
+            "AetherIDE-Setup-${VERSION}-x64.exe"
+            "AetherIDE-Setup-${VERSION}-x64.exe.sha256"
+            "AetherIDE-v${VERSION}-windows-x64.zip"
+            "AetherIDE-v${VERSION}-windows-x64.zip.sha256"
+            "AetherIDE-v${VERSION}-linux-x64.tar.gz"
+            "AetherIDE-v${VERSION}-linux-x64.tar.gz.sha256"
+            "AetherIDE-v${VERSION}-macos-arm64.tar.gz"
+            "AetherIDE-v${VERSION}-macos-arm64.tar.gz.sha256"
+          )
+          
+          for file in "${REQUIRED_FILES[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "ERROR: Missing required release asset: $file"
+              exit 1
+            fi
+            if [ ! -s "$file" ]; then
+              echo "ERROR: Release asset is 0 bytes: $file"
+              exit 1
+            fi
+          done
+          
+          echo "Verifying SHA-256 digests..."
+          for checksum_file in *.sha256; do
+            echo "Checking $checksum_file..."
+            sha256sum -c "$checksum_file"
+          done
+          echo "All release asset checksums verified successfully!"
+      - name: Extract Release Notes
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          python3 -c "
+          import re, sys
+          tag = sys.argv[1]
+          with open('docs/RELEASE_NOTES.md', 'r', encoding='utf-8') as f:
+              notes = f.read()
+          pattern = r'(## ' + re.escape(tag) + r'[\s\S]*?)(?=\n## v|\Z)'
+          match = re.search(pattern, notes)
+          if match:
+              with open('RELEASE_SECTION.md', 'w', encoding='utf-8') as out:
+                  out.write(match.group(1).strip())
+          else:
+              with open('RELEASE_SECTION.md', 'w', encoding='utf-8') as out:
+                  out.write('# AetherIDE ' + tag + '\n\nOfficial production release build for ' + tag + '.')
+          " "$VERSION"
+          cat RELEASE_SECTION.md
+      - name: Check Existing Release & Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "ERROR: Release $TAG already exists on GitHub! Refusing to overwrite."
+            exit 1
+          fi
+          
+          echo "Creating official GitHub Release for $TAG..."
+          gh release create "$TAG" \
+            --title "AetherIDE $TAG" \
+            --notes-file RELEASE_SECTION.md \
+            release-assets/*
+          
+          echo "Official GitHub Release $TAG successfully created and published!"

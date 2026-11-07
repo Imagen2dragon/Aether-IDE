@@ -67,7 +67,7 @@ jobs:
       - name: Package Windows Release Artifacts
         shell: pwsh
         run: |
-          ./scripts/package-windows.ps1 -SkipBuild
+          ./scripts/package-windows.ps1 -SkipBuild -RequireInstaller
       - name: Upload Windows Release Artifact
         uses: actions/upload-artifact@v4
         with:

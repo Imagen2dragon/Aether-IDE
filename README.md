@@ -15,6 +15,46 @@ Unlike simple UI wrappers or chatbot sidebars, AetherIDE is powered by a multith
 
 ---
 
+## 💾 Download AetherIDE (v0.1.0-beta.2)
+
+Official, production-packaged releases are published on [GitHub Releases](https://github.com/Imagen2dragon/Aether-IDE/releases/tag/v0.1.0-beta.2).
+
+### 📦 Release Packages & Direct Downloads
+
+| Platform | Distribution Format | Download Link | Checksum |
+| :--- | :--- | :--- | :--- |
+| **Windows 10/11 x64** | **Setup Installer (.exe)** *(Recommended)* | [**AetherIDE-Setup-0.1.0-beta.2-x64.exe**](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.2/AetherIDE-Setup-0.1.0-beta.2-x64.exe) | [SHA-256](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.2/AetherIDE-Setup-0.1.0-beta.2-x64.exe.sha256) |
+| **Windows 10/11 x64** | **Portable (.zip)** | [AetherIDE-v0.1.0-beta.2-windows-x64.zip](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.2/AetherIDE-v0.1.0-beta.2-windows-x64.zip) | [SHA-256](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.2/AetherIDE-v0.1.0-beta.2-windows-x64.zip.sha256) |
+| **Linux x64** | **Portable Archive (.tar.gz)** | [AetherIDE-v0.1.0-beta.2-linux-x64.tar.gz](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.2/AetherIDE-v0.1.0-beta.2-linux-x64.tar.gz) | [SHA-256](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.2/AetherIDE-v0.1.0-beta.2-linux-x64.tar.gz.sha256) |
+| **macOS ARM64** | **Apple Silicon (.tar.gz)** | [AetherIDE-v0.1.0-beta.2-macos-arm64.tar.gz](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.2/AetherIDE-v0.1.0-beta.2-macos-arm64.tar.gz) | [SHA-256](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.2/AetherIDE-v0.1.0-beta.2-macos-arm64.tar.gz.sha256) |
+
+### 🔒 Cryptographic SHA-256 Verification
+
+To verify the integrity of your downloaded package, compare its computed hash with the published `.sha256` digest:
+
+**Windows (PowerShell):**
+```powershell
+Get-FileHash -Algorithm SHA256 .\AetherIDE-Setup-0.1.0-beta.2-x64.exe
+```
+
+**Linux / macOS (Terminal):**
+```bash
+sha256sum -c AetherIDE-v0.1.0-beta.2-linux-x64.tar.gz.sha256
+# or on macOS:
+shasum -a 256 -c AetherIDE-v0.1.0-beta.2-macos-arm64.tar.gz.sha256
+```
+
+### 💻 Installation & Operating System Support
+
+- **Windows 10/11 x64:** Run `AetherIDE-Setup-0.1.0-beta.2-x64.exe` to perform a non-administrative, per-user installation (installs to `%LOCALAPPDATA%\Programs\AetherIDE`). Creates Start Menu and optional Desktop shortcuts, registers the clean uninstaller, and optionally adds the `aether` CLI to your user `PATH`.
+  > *Note on Code Signing:* As an open-source beta release, binaries are compiled deterministically and published with authoritative SHA-256 checksums without a paid commercial EV certificate. When launching the installer, Windows SmartScreen may show an "Unknown Publisher" prompt. Click **More info** -> **Run anyway**.
+- **Linux x64:** Extract the `.tar.gz` archive to your desired location (e.g., `tar -xzf AetherIDE-v0.1.0-beta.2-linux-x64.tar.gz -C ~/.local/share/`) and execute `./AetherIDE`. Requires `glibc 2.35+`, `webkit2gtk-4.1` (or `4.0`), and `gnome-keyring` / `dbus`.
+- **macOS ARM64:** Extract `AetherIDE-v0.1.0-beta.2-macos-arm64.tar.gz` and move `AetherIDE.app` to `/Applications`. Requires Apple Silicon (M1/M2/M3/M4) running macOS 13 (Ventura) or newer.
+
+For complete release details, see the [v0.1.0-beta.2 Release Notes](docs/RELEASE_NOTES.md).
+
+---
+
 ## 🚀 Key Architectural Pillars
 
 ### 1. 🦀 Rust-First Core (`rust/`)

@@ -201,6 +201,9 @@ if ($PackageType -in @("installer", "all")) {
     if ($isccPath) {
         Write-Host "Compiling Inno Setup installer using $isccPath..." -ForegroundColor Green
         & $isccPath "$IDE_ROOT\scripts\installer\aetheride_installer.iss"
+        if ($LASTEXITCODE -ne 0 -and $RequireInstaller) {
+            throw "Installer build failed: ISCC compilation exited with code $LASTEXITCODE (RequireInstaller specified)"
+        }
         if (Test-Path $INSTALLER_EXE) {
             $installerHash = (Get-FileHash -Path $INSTALLER_EXE -Algorithm SHA256).Hash
             Set-Content -Path "$INSTALLER_EXE.sha256" -Value "$installerHash  $(Split-Path $INSTALLER_EXE -Leaf)"
@@ -213,6 +216,9 @@ if ($PackageType -in @("installer", "all")) {
                 Details = "Size: $((Get-Item $INSTALLER_EXE).Length) bytes, SHA256: $installerHash"
             })
         } else {
+            if ($RequireInstaller) {
+                throw "Installer build failed: ISCC completed but installer was not found at $INSTALLER_EXE (RequireInstaller specified)"
+            }
             $PackagingResults.Add([PSCustomObject]@{
                 Format = "Inno Setup EXE"
                 Path = $INSTALLER_EXE
@@ -247,6 +253,10 @@ Write-Host "`n============================================================" -For
 Write-Host " Windows Release Packaging Status Summary" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 $PackagingResults | Format-Table -AutoSize | Out-String | Write-Host
+
+if ($RequireInstaller -and (-not (Test-Path $INSTALLER_EXE))) {
+    throw "Installer build failed: Required installer was not produced at $INSTALLER_EXE"
+}
 
 $hasFailures = $PackagingResults | Where-Object { $_.Status -eq "FAILED" }
 if ($hasFailures) {
