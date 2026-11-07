@@ -271,6 +271,33 @@ export interface CheckpointRestoreReport {
   preserved_backups?: string[];
   compensated_files?: string[];
   recovery_conflicts?: string[];
+  quarantined_artifacts?: string[];
+  cleanup_pending?: boolean;
+}
+
+// Quarantine & Recovery Subsystem
+export type QuarantineStatus =
+  | "PendingMove"
+  | "PendingCleanup"
+  | "CleanedUp"
+  | "PreservedConflict";
+
+export interface QuarantineRecord {
+  id: string;
+  original_relative_path: string;
+  quarantined_filename: string;
+  quarantined_path: string;
+  retained_staging_filename?: string;
+  retained_staging_path?: string;
+  quarantined_at: string;
+  expected_sha256: string;
+  actual_sha256?: string;
+  reason: string;
+  status: QuarantineStatus;
+}
+
+export interface RecoveryManifest {
+  records: QuarantineRecord[];
 }
 
 // Git Engine

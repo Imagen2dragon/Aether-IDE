@@ -59,10 +59,17 @@ pub fn run() {
             // 6. Mobile, Checkpoint & LSP
             let metro_pid: commands::mobile::ActiveMetroPid =
                 Arc::new(parking_lot::Mutex::new(None));
+            let ckpt_engine =
+                checkpoint_engine::CheckpointEngine::new(data_dir.join("checkpoints"));
+            if let Err(e) = ckpt_engine.initialize_and_reconcile() {
+                tracing::error!(
+                    "Startup checkpoint quarantine reconciliation failed: {}. Checkpoint engine placed in recovery blocked mode.",
+                    e
+                );
+                ckpt_engine.set_recovery_blocked(Some(e.to_string()));
+            }
             let checkpoint_engine: commands::checkpoint::SharedCheckpointEngine =
-                Arc::new(parking_lot::Mutex::new(
-                    checkpoint_engine::CheckpointEngine::new(data_dir.join("checkpoints")),
-                ));
+                Arc::new(parking_lot::Mutex::new(ckpt_engine));
             let lsp_mux: commands::lsp::SharedLspMultiplexer =
                 Arc::new(lsp_client::LspMultiplexer::new(data_dir));
 
@@ -148,6 +155,10 @@ pub fn run() {
             commands::checkpoint_list,
             commands::checkpoint_restore_preview,
             commands::checkpoint_restore,
+            commands::checkpoint_list_quarantine,
+            commands::checkpoint_cleanup_quarantine,
+            commands::checkpoint_reconcile_quarantine,
+            commands::checkpoint_get_recovery_status,
             // Git Engine
             commands::git_get_status,
             commands::git_stage_file,
