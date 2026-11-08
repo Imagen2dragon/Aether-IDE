@@ -15855,7 +15855,7 @@ mod tests {
             "test_replacement",
             "ws-1",
             &ws_dir,
-            Some(&[file.clone()]),
+            Some(std::slice::from_ref(&file)),
         );
 
         assert!(

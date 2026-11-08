@@ -842,7 +842,7 @@ mod tests {
             )
             .unwrap();
             assert!(
-                matches_inside.len() >= 1,
+                !matches_inside.is_empty(),
                 "Internal file/symlink should be matched"
             );
         }
