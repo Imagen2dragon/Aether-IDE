@@ -36,13 +36,31 @@ export const App: React.FC = () => {
     ThemeService.init()
   );
 
-  // Navigation & Layout State
+  // Navigation & Layout State (Concept 2 Expanded Obsidian Pro Workbench Defaults)
+  const isDesktopViewport = typeof window !== "undefined" && window.innerWidth >= 1200;
+
   const [activeView, setActiveView] = useState<ActiveSidebarView>("explorer");
-  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
-  const [isBottomPanelOpen, setIsBottomPanelOpen] = useState(false);
-  const [bottomTab, setBottomTab] = useState<BottomPanelTab>("terminal");
-  const [isAiOpen, setIsAiOpen] = useState(false);
+  const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(() => {
+    const saved = localStorage.getItem("aether_workbench_sidebar_open");
+    return saved !== null ? saved === "true" : true;
+  });
+  const [isBottomPanelOpen, setIsBottomPanelOpen] = useState<boolean>(() => {
+    const saved = localStorage.getItem("aether_workbench_bottom_open");
+    return saved !== null ? saved === "true" : isDesktopViewport;
+  });
+  const [bottomTab, setBottomTab] = useState<BottomPanelTab>(() => {
+    const saved = localStorage.getItem("aether_workbench_bottom_tab") as BottomPanelTab;
+    if (saved && ["terminal", "problems", "output", "debug", "tests", "doctor"].includes(saved)) {
+      return saved;
+    }
+    return "terminal";
+  });
+  const [isAiOpen, setIsAiOpen] = useState<boolean>(() => {
+    const saved = localStorage.getItem("aether_workbench_ai_open");
+    return saved !== null ? saved === "true" : isDesktopViewport;
+  });
   const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
+  const [targetLine, setTargetLine] = useState<{ path: string; line: number } | null>(null);
 
   // Panel Resizing State (persisted in localStorage)
   const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
@@ -82,6 +100,34 @@ export const App: React.FC = () => {
     refreshDiagnostics();
   }, []);
 
+  // Persist layout preferences across restarts
+  useEffect(() => {
+    localStorage.setItem("aether_workbench_sidebar_open", String(isSidebarOpen));
+  }, [isSidebarOpen]);
+
+  useEffect(() => {
+    localStorage.setItem("aether_workbench_bottom_open", String(isBottomPanelOpen));
+  }, [isBottomPanelOpen]);
+
+  useEffect(() => {
+    localStorage.setItem("aether_workbench_bottom_tab", bottomTab);
+  }, [bottomTab]);
+
+  useEffect(() => {
+    localStorage.setItem("aether_workbench_ai_open", String(isAiOpen));
+  }, [isAiOpen]);
+
+  // Window resize responsiveness: collapse AI panel if viewport < 1100px to avoid crowding editor
+  useEffect(() => {
+    const handleResize = () => {
+      if (window.innerWidth < 1100 && isAiOpen) {
+        setIsAiOpen(false);
+      }
+    };
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, [isAiOpen]);
+
   const refreshGit = async () => {
     try {
       const status = await TauriService.getGitStatus();
@@ -118,7 +164,7 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleOpenFile = async (filePath?: string) => {
+  const handleOpenFile = async (filePath?: string, targetLineNum?: number) => {
     try {
       const res = await TauriService.openFile(filePath);
       const fileName = res.path.split(/[\\/]/).pop() || "untitled";
@@ -151,6 +197,11 @@ export const App: React.FC = () => {
       });
 
       setActiveTabPath(res.path);
+      if (targetLineNum) {
+        setTargetLine({ path: res.path, line: targetLineNum });
+      } else {
+        setTargetLine(null);
+      }
     } catch (err) {
       console.error("Open file error:", err);
     }
@@ -188,9 +239,22 @@ export const App: React.FC = () => {
     });
   };
 
-  const handleApplyDiffToEditor = (diffSnippet: string) => {
-    if (!activeTabPath) return;
-    handleContentChange(activeTabPath, diffSnippet);
+  const handleApplyDiffToEditor = (targetPath: string, updatedContent: string) => {
+    if (!targetPath) return;
+
+    // Protect buffer identity: update ONLY the buffer matching the approved target.
+    // If the user switched tabs to another file while review was open, the active tab is preserved unchanged.
+    setOpenTabs((prevTabs) => {
+      const exists = prevTabs.some((t) => t.path === targetPath);
+      if (exists) {
+        return prevTabs.map((tab) =>
+          tab.path === targetPath
+            ? { ...tab, content: updatedContent, isDirty: false }
+            : tab
+        );
+      }
+      return prevTabs;
+    });
   };
 
   // --- Resizing Handlers ---
@@ -399,7 +463,7 @@ export const App: React.FC = () => {
                 />
               )}
               {activeView === "search" && (
-                <SearchPanel onOpenFile={(p) => handleOpenFile(p)} />
+                <SearchPanel onOpenFile={(p, line) => handleOpenFile(p, line)} />
               )}
               {activeView === "git" && <GitPanel />}
               {activeView === "debug" && <DebugPanel />}
@@ -456,6 +520,7 @@ export const App: React.FC = () => {
           <EditorArea
             openTabs={openTabs}
             activeTabPath={activeTabPath}
+            targetLine={targetLine}
             onSelectTab={(p) => setActiveTabPath(p)}
             onCloseTab={handleCloseTab}
             onContentChange={handleContentChange}

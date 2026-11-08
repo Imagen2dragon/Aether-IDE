@@ -1,34 +1,179 @@
 import React, { useState } from "react";
-import { FlaskConical, Play, CheckCircle2, XCircle, RotateCw, ChevronRight, ChevronDown } from "lucide-react";
+import {
+  FlaskConical,
+  Play,
+  CheckCircle2,
+  XCircle,
+  RotateCw,
+  ChevronRight,
+  ChevronDown,
+  Terminal,
+  AlertTriangle,
+} from "lucide-react";
+import { TauriService } from "../../services/tauri";
 
-interface TestCase {
+interface TestSuite {
   id: string;
   name: string;
-  suite: string;
-  status: "passed" | "failed" | "running" | "idle";
-  durationMs: number;
+  crate: string;
+  description: string;
+  status: "idle" | "running" | "passed" | "failed";
+  passed: number;
+  failed: number;
+  ignored: number;
+  durationSeconds?: number;
+  stdout?: string;
+  testCases: Array<{ name: string; status: "ok" | "failed" | "ignored" }>;
 }
 
 export const TestingPanel: React.FC = () => {
-  const [isRunning, setIsRunning] = useState(false);
-  const [testCases, setTestCases] = useState<TestCase[]>([
-    { id: "1", name: "test_chk_210_replace_destination_while_exclusive_handle_held", suite: "checkpoint-engine", status: "passed", durationMs: 42 },
-    { id: "2", name: "test_chk_210b_destination_identity_mismatch_preserves_staging", suite: "checkpoint-engine", status: "passed", durationMs: 38 },
-    { id: "3", name: "test_chk_220_empirical_windows_sharing_matrix", suite: "checkpoint-engine", status: "passed", durationMs: 15 },
-    { id: "4", name: "test_checkpoint_path_traversal_and_tamper_defense", suite: "checkpoint-engine", status: "passed", durationMs: 25 },
-    { id: "5", name: "test_desktop_tauri_command_dispatch", suite: "aether-desktop", status: "passed", durationMs: 18 },
-    { id: "6", name: "test_conpty_terminal_session_lifecycle", suite: "filesystem-engine", status: "passed", durationMs: 32 },
+  const [isRunningAll, setIsRunningAll] = useState(false);
+  const [activeSuiteStdout, setActiveSuiteStdout] = useState<string | null>(null);
+  const [expandedSuites, setExpandedSuites] = useState<Record<string, boolean>>({
+    "checkpoint-engine": true,
+  });
+
+  const [suites, setSuites] = useState<TestSuite[]>([
+    {
+      id: "checkpoint-engine",
+      name: "Checkpoint Engine Core",
+      crate: "checkpoint-engine",
+      description: "NTFS dual-handle mutual exclusion, rollback atomic verification, and CHK-210.",
+      status: "passed",
+      passed: 211,
+      failed: 0,
+      ignored: 0,
+      durationSeconds: 0.83,
+      testCases: [
+        { name: "test_chk_210_replace_destination_while_exclusive_handle_held_preserves_staging_without_loss", status: "ok" },
+        { name: "test_chk_210b_destination_identity_mismatch_preserves_staging_and_blocks_recovery", status: "ok" },
+        { name: "test_chk_220_empirical_windows_sharing_matrix", status: "ok" },
+        { name: "test_chk_209_replace_destination_after_pathname_checks_before_exclusive_open_preserves_staging", status: "ok" },
+        { name: "test_chk_212_destination_and_staging_verified_identical_under_exclusive_handle", status: "ok" },
+        { name: "test_chk_021_mandatory_safety_snapshot_failure_aborts_without_mutations", status: "ok" },
+        { name: "test_chk_023_deterministic_toctou_mutation_between_validation_and_replacement_aborted", status: "ok" },
+        { name: "test_checkpoint_path_traversal_and_tamper_defense", status: "ok" },
+        { name: "test_checkpoint_binary_and_invalid_utf8_byte_preservation", status: "ok" },
+      ],
+    },
+    {
+      id: "filesystem-engine",
+      name: "Filesystem Engine",
+      crate: "filesystem-engine",
+      description: "Boundary containment, symlink escape defense, and path canonicalization.",
+      status: "idle",
+      passed: 0,
+      failed: 0,
+      ignored: 0,
+      testCases: [],
+    },
+    {
+      id: "terminal-manager",
+      name: "ConPTY Terminal Manager",
+      crate: "terminal-manager",
+      description: "Native Windows ConPTY process lifecycle and multi-session subscriptions.",
+      status: "idle",
+      passed: 0,
+      failed: 0,
+      ignored: 0,
+      testCases: [],
+    },
   ]);
 
-  const handleRunAll = () => {
-    setIsRunning(true);
-    setTimeout(() => {
-      setIsRunning(false);
-    }, 1200);
+  const parseCargoTestOutput = (stdout: string) => {
+    const lines = stdout.split("\n");
+    const testCases: Array<{ name: string; status: "ok" | "failed" | "ignored" }> = [];
+    let passed = 0;
+    let failed = 0;
+    let ignored = 0;
+    let durationSeconds: number | undefined;
+
+    for (const line of lines) {
+      const matchTest = line.match(/^test\s+([^\s]+)\s+\.\.\.\s+(ok|FAILED|ignored)/);
+      if (matchTest) {
+        const rawStatus = matchTest[2];
+        const status = rawStatus === "ok" ? "ok" : rawStatus === "ignored" ? "ignored" : "failed";
+        testCases.push({ name: matchTest[1], status });
+      }
+
+      const matchResult = line.match(/test result:\s+(ok|FAILED)\.\s+(\d+)\s+passed;\s+(\d+)\s+failed;\s+(\d+)\s+ignored.*?finished in\s+([\d\.]+)s/);
+      if (matchResult) {
+        passed = parseInt(matchResult[2], 10);
+        failed = parseInt(matchResult[3], 10);
+        ignored = parseInt(matchResult[4], 10);
+        durationSeconds = parseFloat(matchResult[5]);
+      }
+    }
+
+    return { testCases, passed, failed, ignored, durationSeconds };
   };
 
-  const passedCount = testCases.filter((t) => t.status === "passed").length;
-  const totalCount = testCases.length;
+  const runSuite = async (suiteId: string) => {
+    const target = suites.find((s) => s.id === suiteId);
+    if (!target) return;
+
+    setSuites((prev) =>
+      prev.map((s) => (s.id === suiteId ? { ...s, status: "running" } : s))
+    );
+
+    try {
+      const res = await TauriService.runBuildTask(`cargo test -p ${target.crate}`);
+      const rawOut = (res.stdout || "") + "\n" + (res.stderr || "");
+      const parsed = parseCargoTestOutput(rawOut);
+
+      setSuites((prev) =>
+        prev.map((s) => {
+          if (s.id === suiteId) {
+            const hasPassed = res.success && parsed.failed === 0;
+            return {
+              ...s,
+              status: hasPassed ? "passed" : "failed",
+              passed: parsed.passed || (hasPassed ? parsed.testCases.length : 0),
+              failed: parsed.failed,
+              ignored: parsed.ignored,
+              durationSeconds: parsed.durationSeconds || (res.duration_ms ? res.duration_ms / 1000 : 0.5),
+              stdout: rawOut,
+              testCases: parsed.testCases.length > 0 ? parsed.testCases : s.testCases,
+            };
+          }
+          return s;
+        })
+      );
+      setActiveSuiteStdout(rawOut);
+    } catch (err: any) {
+      const errMsg = `Test execution error: ${err}`;
+      setSuites((prev) =>
+        prev.map((s) =>
+          s.id === suiteId
+            ? {
+                ...s,
+                status: "failed",
+                stdout: errMsg,
+              }
+            : s
+        )
+      );
+      setActiveSuiteStdout(errMsg);
+    }
+  };
+
+  const handleRunAll = async () => {
+    setIsRunningAll(true);
+    for (const suite of suites) {
+      await runSuite(suite.id);
+    }
+    setIsRunningAll(false);
+  };
+
+  const toggleSuiteCollapse = (suiteId: string) => {
+    setExpandedSuites((prev) => ({
+      ...prev,
+      [suiteId]: !prev[suiteId],
+    }));
+  };
+
+  const totalPassed = suites.reduce((acc, s) => acc + s.passed, 0);
+  const totalFailed = suites.reduce((acc, s) => acc + s.failed, 0);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
@@ -54,33 +199,43 @@ export const TestingPanel: React.FC = () => {
             color: "var(--text-muted)",
           }}
         >
-          Testing
+          Rust Test Suites
         </span>
         <button
           onClick={handleRunAll}
-          disabled={isRunning}
+          disabled={isRunningAll}
           style={{
             background: "transparent",
             border: "none",
-            color: isRunning ? "var(--accent-cyan)" : "var(--text-muted)",
+            color: isRunningAll ? "var(--accent-cyan)" : "var(--text-muted)",
             cursor: "pointer",
             padding: 3,
           }}
-          title="Run All Tests"
+          title="Run All Test Suites"
         >
-          <RotateCw size={13} className={isRunning ? "animate-spin" : ""} />
+          <RotateCw size={13} className={isRunningAll ? "animate-spin" : ""} />
         </button>
       </div>
 
-      {/* Summary */}
-      <div style={{ padding: 10, borderBottom: "1px solid var(--border-color)", display: "flex", flexDirection: "column", gap: 6 }}>
+      {/* Summary Header */}
+      <div
+        style={{
+          padding: "10px",
+          borderBottom: "1px solid var(--border-color)",
+          display: "flex",
+          flexDirection: "column",
+          gap: 6,
+        }}
+      >
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text-primary)" }}>
-            Cargo & Rust Test Explorer
-          </span>
+          <div>
+            <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text-primary)" }}>
+              Workspace Test Runner
+            </span>
+          </div>
           <button
             onClick={handleRunAll}
-            disabled={isRunning}
+            disabled={isRunningAll}
             style={{
               background: "var(--accent-cyan)",
               border: "none",
@@ -96,44 +251,180 @@ export const TestingPanel: React.FC = () => {
             }}
           >
             <Play size={11} fill="#101216" />
-            <span>{isRunning ? "Running..." : "Run All"}</span>
+            <span>{isRunningAll ? "Running All..." : "Run All"}</span>
           </button>
         </div>
 
-        <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--success)" }}>
-          <CheckCircle2 size={12} />
-          <span>{passedCount} / {totalCount} Tests Passed (211 unit tests in checkpoint-engine)</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 11 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 4, color: "var(--success)" }}>
+            <CheckCircle2 size={12} />
+            <span>{totalPassed} Passed</span>
+          </div>
+          {totalFailed > 0 && (
+            <div style={{ display: "flex", alignItems: "center", gap: 4, color: "var(--danger)" }}>
+              <XCircle size={12} />
+              <span>{totalFailed} Failed</span>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Test List */}
-      <div style={{ flex: 1, overflowY: "auto", padding: "6px 0" }}>
-        {testCases.map((tc) => (
-          <div
-            key={tc.id}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              padding: "5px 10px",
-              fontSize: 11,
-              cursor: "pointer",
-              color: "var(--text-secondary)",
-              borderBottom: "1px solid rgba(255,255,255,0.03)",
-            }}
-            className="tree-node-row"
-          >
-            <div style={{ display: "flex", alignItems: "center", gap: 6, overflow: "hidden" }}>
-              <CheckCircle2 size={12} style={{ color: "var(--success)", flexShrink: 0 }} />
-              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {tc.name}
-              </span>
+      {/* Suites List */}
+      <div style={{ flex: 1, overflowY: "auto", padding: "8px", display: "flex", flexDirection: "column", gap: 8 }}>
+        {suites.map((suite) => {
+          const isExpanded = !!expandedSuites[suite.id];
+
+          return (
+            <div
+              key={suite.id}
+              style={{
+                borderRadius: 6,
+                background: "var(--bg-surface)",
+                border: "1px solid var(--border-color)",
+                overflow: "hidden",
+              }}
+            >
+              {/* Suite Header */}
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  padding: "8px 10px",
+                  cursor: "pointer",
+                  background: "rgba(255, 255, 255, 0.02)",
+                  borderBottom: isExpanded ? "1px solid var(--border-color)" : "none",
+                }}
+                onClick={() => toggleSuiteCollapse(suite.id)}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  {isExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                  <span style={{ fontWeight: 600, fontSize: 12, color: "var(--text-primary)" }}>
+                    {suite.name}
+                  </span>
+                  {suite.status === "passed" && (
+                    <span style={{ fontSize: 10, color: "var(--success)", fontWeight: 600 }}>
+                      ({suite.passed} passed{suite.durationSeconds ? ` in ${suite.durationSeconds}s` : ""})
+                    </span>
+                  )}
+                  {suite.status === "failed" && (
+                    <span style={{ fontSize: 10, color: "var(--danger)", fontWeight: 600 }}>
+                      ({suite.failed} failed)
+                    </span>
+                  )}
+                  {suite.status === "running" && (
+                    <span style={{ fontSize: 10, color: "var(--accent-cyan)", fontWeight: 600 }}>
+                      Running...
+                    </span>
+                  )}
+                </div>
+
+                <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      runSuite(suite.id);
+                    }}
+                    disabled={suite.status === "running"}
+                    style={{
+                      background: "transparent",
+                      border: "1px solid var(--border-color)",
+                      color: "var(--accent-cyan)",
+                      fontSize: 10,
+                      fontWeight: 600,
+                      padding: "2px 6px",
+                      borderRadius: 3,
+                      cursor: "pointer",
+                    }}
+                  >
+                    Run
+                  </button>
+                </div>
+              </div>
+
+              {/* Suite Details & Test Cases */}
+              {isExpanded && (
+                <div style={{ padding: "6px 10px", display: "flex", flexDirection: "column", gap: 4 }}>
+                  <div style={{ fontSize: 10, color: "var(--text-dim)", marginBottom: 4 }}>
+                    {suite.description}
+                  </div>
+
+                  {suite.testCases.map((tc, idx) => (
+                    <div
+                      key={idx}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 6,
+                        padding: "3px 0",
+                        fontSize: 11,
+                        color: "var(--text-secondary)",
+                      }}
+                    >
+                      {tc.status === "ok" ? (
+                        <CheckCircle2 size={12} style={{ color: "var(--success)", flexShrink: 0 }} />
+                      ) : (
+                        <XCircle size={12} style={{ color: "var(--danger)", flexShrink: 0 }} />
+                      )}
+                      <span
+                        style={{
+                          fontFamily: 'Consolas, "JetBrains Mono", monospace',
+                          fontSize: 10,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {tc.name}
+                      </span>
+                    </div>
+                  ))}
+
+                  {suite.stdout && (
+                    <div style={{ marginTop: 6, borderTop: "1px solid var(--border-color)", paddingTop: 6 }}>
+                      <button
+                        onClick={() => setActiveSuiteStdout(activeSuiteStdout === suite.stdout ? null : suite.stdout!)}
+                        style={{
+                          background: "transparent",
+                          border: "none",
+                          color: "var(--text-muted)",
+                          fontSize: 10,
+                          cursor: "pointer",
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 4,
+                          padding: 0,
+                        }}
+                      >
+                        <Terminal size={11} />
+                        <span>{activeSuiteStdout === suite.stdout ? "Hide Raw Output" : "View Raw Cargo Output"}</span>
+                      </button>
+
+                      {activeSuiteStdout === suite.stdout && (
+                        <pre
+                          style={{
+                            marginTop: 4,
+                            padding: 8,
+                            borderRadius: 4,
+                            background: "var(--bg-root)",
+                            color: "var(--text-secondary)",
+                            fontSize: 10,
+                            fontFamily: 'Consolas, "JetBrains Mono", monospace',
+                            maxHeight: 180,
+                            overflowY: "auto",
+                            whiteSpace: "pre-wrap",
+                          }}
+                        >
+                          {suite.stdout}
+                        </pre>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
-            <span style={{ fontSize: 10, color: "var(--text-dim)", flexShrink: 0 }}>
-              {tc.durationMs}ms
-            </span>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );

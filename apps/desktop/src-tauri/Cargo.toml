@@ -33,6 +33,7 @@ tokio-util = "0.7"
 parking_lot = "0.12"
 tracing = "0.1"
 sha2 = "0.10"
+regex = "1.10"
 
 # AetherIDE Workspace Crates
 application-core = { path = "../../../rust/crates/application-core" }

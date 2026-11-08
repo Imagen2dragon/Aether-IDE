@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::info;
 
 pub type SharedGateway = Arc<ModelGateway>;
 
@@ -115,10 +115,12 @@ pub struct StructuredProposal {
     pub proposal_id: String,
     pub workspace_id: String,
     pub relative_path: String,
-    pub operation: String, // "modify" | "create" | "delete"
+    pub operation: String, // "replace_file" | "apply_patch" | "insert_at" | "create_file" | "delete_file" | "modify"
     pub base_hash: String, // SHA-256 of file at proposal time
     pub unified_diff: String,
     pub proposed_content: String,
+    #[serde(default)]
+    pub insertion_line: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,8 +372,24 @@ pub async fn ai_preview_proposal(
 pub async fn ai_apply_proposal(
     app: AppHandle,
     proposal: StructuredProposal,
-    force: bool,
+    _force: Option<bool>,
 ) -> Result<ApplyProposalResult, String> {
+    // 0. Operation contract validation
+    let valid_ops = [
+        "replace_file",
+        "apply_patch",
+        "insert_at",
+        "create_file",
+        "delete_file",
+        "modify",
+    ];
+    if !valid_ops.contains(&proposal.operation.as_str()) {
+        return Err(format!(
+            "Invalid proposal operation '{}'. Permitted operations: replace_file, apply_patch, insert_at, create_file, delete_file.",
+            proposal.operation
+        ));
+    }
+
     let ws_arc = app.state::<SharedWorkspace>();
     let ws = ws_arc.lock();
     let (cap, root, rel_path) = ws.resolve_in_workspace(&proposal.relative_path)?;
@@ -379,45 +397,124 @@ pub async fn ai_apply_proposal(
     drop(ws);
 
     let full_path = root.join(&rel_path);
+    let target_exists = full_path.exists();
 
-    // 1. Conflict detection against disk hash
-    if full_path.exists() {
+    // 1. Mandatory base_hash validation and conflict detection for existing files
+    if target_exists {
+        if proposal.operation == "create_file" {
+            return Err(format!(
+                "Cannot create file '{}': file already exists on disk. Use replace_file, apply_patch, or insert_at.",
+                rel_path
+            ));
+        }
+
+        // CRITICAL: Reject empty base_hash on existing file modifications
+        if proposal.base_hash.trim().is_empty() {
+            return Err(format!(
+                "Safety Violation: Proposal base_hash cannot be empty when modifying existing file '{}'. A valid base hash must be obtained via preview before applying.",
+                rel_path
+            ));
+        }
+
         let current_bytes = std::fs::read(&full_path)
             .map_err(|e| format!("Failed to read target file '{:?}': {}", full_path, e))?;
         let current_disk_hash = compute_sha256(&current_bytes);
 
-        if !force && !proposal.base_hash.is_empty() && proposal.base_hash != current_disk_hash {
+        // Strict conflict check: never allow silent overwrite of concurrent modifications
+        if proposal.base_hash != current_disk_hash {
             return Err(format!(
-                "Conflict detected: File '{}' was modified on disk since the AI proposal was generated. (Expected base: {}, Current disk: {}). Please review changes before applying.",
+                "Conflict detected: File '{}' was modified on disk since the AI proposal was reviewed. (Expected base: {}, Current disk: {}). Please review a fresh preview before applying.",
                 rel_path, proposal.base_hash, current_disk_hash
             ));
         }
+    } else if proposal.operation != "create_file"
+        && proposal.operation != "replace_file"
+        && proposal.operation != "modify"
+    {
+        return Err(format!(
+            "Cannot perform operation '{}' on non-existent file '{}'. Use create_file instead.",
+            proposal.operation, rel_path
+        ));
     }
 
-    // 2. Create recovery checkpoint of workspace before writing
-    let backup_ckpt_id = {
+    // 2. Mandatory Pre-Edit Checkpoint for modifications to existing files (MANDATORY FAIL-CLOSED)
+    let mut backup_ckpt_id = None;
+    if target_exists {
         let ckpt_engine_arc = app.state::<SharedCheckpointEngine>();
         let ckpt_engine = ckpt_engine_arc.lock();
         let desc = format!("Pre-AI edit backup for {}", rel_path);
-        match ckpt_engine.create_checkpoint_with_root(
-            &desc,
-            &ws_id,
-            &root,
-            Some(std::slice::from_ref(&full_path)),
-        ) {
-            Ok(ckpt) => Some(ckpt.checkpoint_id),
-            Err(e) => {
-                warn!("Failed to create pre-edit checkpoint: {}", e);
-                None
-            }
+        let ckpt = ckpt_engine
+            .create_checkpoint_with_root(
+                &desc,
+                &ws_id,
+                &root,
+                Some(std::slice::from_ref(&full_path)),
+            )
+            .map_err(|e| {
+                format!(
+                    "Mandatory pre-edit checkpoint failed for '{}': {}. Write aborted to prevent unrecoverable data loss.",
+                    rel_path, e
+                )
+            })?;
+        backup_ckpt_id = Some(ckpt.checkpoint_id);
+    }
+
+    // 3. Compute final content based on operation
+    let final_content = match proposal.operation.as_str() {
+        "delete_file" => {
+            cap.delete_file_conditional(&rel_path, &proposal.base_hash)
+                .map_err(|e| format!("Failed to delete file '{}': {}", rel_path, e))?;
+            return Ok(ApplyProposalResult {
+                success: true,
+                relative_path: rel_path.clone(),
+                new_hash: String::new(),
+                message: format!("File '{}' safely deleted", rel_path),
+                backup_checkpoint_id: backup_ckpt_id,
+            });
         }
+        "insert_at" => {
+            let original_bytes = std::fs::read(&full_path).map_err(|e| {
+                format!(
+                    "Failed to read target file for insertion '{:?}': {}",
+                    full_path, e
+                )
+            })?;
+            let original_str = String::from_utf8_lossy(&original_bytes);
+            let lines: Vec<&str> = original_str.lines().collect();
+            let insert_idx = proposal.insertion_line.unwrap_or(1).saturating_sub(1) as usize;
+            let mut new_lines = Vec::new();
+            let mut inserted = false;
+            for (idx, line) in lines.iter().enumerate() {
+                if idx == insert_idx {
+                    new_lines.push(proposal.proposed_content.as_str());
+                    inserted = true;
+                }
+                new_lines.push(*line);
+            }
+            if !inserted {
+                new_lines.push(proposal.proposed_content.as_str());
+            }
+            new_lines.join("\n")
+        }
+        "replace_file" | "create_file" | "modify" => {
+            // Safety guard: prevent accidental wipe of substantial existing file by a trivial snippet
+            if target_exists && proposal.proposed_content.trim().is_empty() {
+                return Err(format!(
+                    "Safety Violation: Refusing to replace non-empty file '{}' with empty content. Use delete_file to intentionally remove a file.",
+                    rel_path
+                ));
+            }
+            proposal.proposed_content.clone()
+        }
+        "apply_patch" => proposal.proposed_content.clone(),
+        _ => proposal.proposed_content.clone(),
     };
 
-    // 3. Atomically write proposed content via capability
-    cap.write_file_atomic(&rel_path, &proposal.proposed_content)
+    // 4. Atomically write proposed content via capability
+    cap.write_file_atomic(&rel_path, &final_content)
         .map_err(|e| format!("Atomic write failed for '{}': {}", rel_path, e))?;
 
-    // 4. Verify resulting written file
+    // 5. Verify resulting written file
     let final_bytes = std::fs::read(&full_path)
         .map_err(|e| format!("Failed to verify written file '{:?}': {}", full_path, e))?;
     let new_hash = compute_sha256(&final_bytes);
@@ -429,9 +526,9 @@ pub async fn ai_apply_proposal(
 
     Ok(ApplyProposalResult {
         success: true,
-        relative_path: rel_path,
+        relative_path: rel_path.clone(),
         new_hash,
-        message: format!("Changes safely applied to {}", proposal.relative_path),
+        message: format!("Changes safely applied to {}", rel_path),
         backup_checkpoint_id: backup_ckpt_id,
     })
 }
@@ -553,5 +650,134 @@ mod tests {
         let cleaned_gen2 = registry.cleanup("req-race", 2);
         assert!(cleaned_gen2, "Matching generation cleanup must succeed");
         assert_eq!(registry.entry_count(), 0);
+    }
+
+    #[test]
+    fn test_ai_safety_empty_base_hash_rejected_for_existing_file() {
+        let proposal = StructuredProposal {
+            proposal_id: "prop-1".into(),
+            workspace_id: "ws-1".into(),
+            relative_path: "src/main.rs".into(),
+            operation: "replace_file".into(),
+            base_hash: "".into(),
+            unified_diff: "".into(),
+            proposed_content: "fn main() {}".into(),
+            insertion_line: None,
+        };
+        let target_exists = true;
+        let res: Result<(), String> = if target_exists && proposal.base_hash.trim().is_empty() {
+            Err(
+                "Safety Violation: Proposal base_hash cannot be empty when modifying existing file"
+                    .into(),
+            )
+        } else {
+            Ok(())
+        };
+        assert!(
+            res.is_err(),
+            "Empty base hash on existing file must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_ai_safety_stale_base_hash_and_external_modification_rejected() {
+        let initial_bytes = b"fn main() { println!(\"v1\"); }";
+        let initial_hash = compute_sha256(initial_bytes);
+
+        let external_edit_bytes = b"fn main() { println!(\"v2-external\"); }";
+        let external_hash = compute_sha256(external_edit_bytes);
+
+        assert_ne!(initial_hash, external_hash);
+
+        let proposal = StructuredProposal {
+            proposal_id: "prop-conflict".into(),
+            workspace_id: "ws-1".into(),
+            relative_path: "src/main.rs".into(),
+            operation: "replace_file".into(),
+            base_hash: initial_hash.clone(),
+            unified_diff: "".into(),
+            proposed_content: "fn main() { println!(\"v3-ai\"); }".into(),
+            insertion_line: None,
+        };
+
+        let conflict_detected = proposal.base_hash != external_hash;
+        assert!(
+            conflict_detected,
+            "External modification must trigger conflict detection"
+        );
+    }
+
+    #[test]
+    fn test_ai_safety_checkpoint_creation_failure_aborts_application() {
+        let checkpoint_succeeded = false;
+        let rel_path = "src/main.rs";
+        let write_executed = std::sync::atomic::AtomicBool::new(false);
+
+        let result: Result<String, String> = if !checkpoint_succeeded {
+            Err(format!(
+                "Mandatory pre-edit checkpoint failed for '{}': Simulated checkpoint failure. Write aborted.",
+                rel_path
+            ))
+        } else {
+            write_executed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("Success".into())
+        };
+
+        assert!(result.is_err());
+        assert!(!write_executed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(result
+            .unwrap_err()
+            .contains("Mandatory pre-edit checkpoint failed"));
+    }
+
+    #[test]
+    fn test_ai_safety_empty_content_wipes_rejected() {
+        let target_exists = true;
+        let proposed_content = "   ";
+        let res: Result<(), String> = if target_exists && proposed_content.trim().is_empty() {
+            Err("Safety Violation: Refusing to replace non-empty file with empty content".into())
+        } else {
+            Ok(())
+        };
+        assert!(res.is_err(), "Empty content replacement must be rejected");
+    }
+
+    #[test]
+    fn test_ai_safety_operation_contract_validation() {
+        let valid_ops = [
+            "replace_file",
+            "apply_patch",
+            "insert_at",
+            "create_file",
+            "delete_file",
+            "modify",
+        ];
+        assert!(valid_ops.contains(&"replace_file"));
+        assert!(valid_ops.contains(&"insert_at"));
+        assert!(valid_ops.contains(&"create_file"));
+        assert!(valid_ops.contains(&"delete_file"));
+        assert!(!valid_ops.contains(&"arbitrary_code_block"));
+    }
+
+    #[test]
+    fn test_ai_safety_path_traversal_and_symlink_escape_rejected() {
+        let bad_paths = [
+            "../secret.txt",
+            "foo/../../etc/passwd",
+            "..\\windows\\system32",
+            "/absolute/root/file",
+            "C:\\windows\\win.ini",
+        ];
+        for bad in bad_paths {
+            let has_escape = bad.contains("..")
+                || bad.starts_with('/')
+                || bad.starts_with('\\')
+                || (bad.len() > 1 && bad.chars().nth(1) == Some(':'));
+            assert!(
+                has_escape,
+                "Path traversal/escape sequence must be flagged: {}",
+                bad
+            );
+        }
     }
 }

@@ -18,6 +18,7 @@ import { ThemeService } from "../../services/theme";
 interface EditorAreaProps {
   openTabs: OpenFileTab[];
   activeTabPath: string | null;
+  targetLine?: { path: string; line: number } | null;
   onSelectTab: (path: string) => void;
   onCloseTab: (path: string) => void;
   onContentChange: (path: string, content: string) => void;
@@ -29,6 +30,7 @@ interface EditorAreaProps {
 export const EditorArea: React.FC<EditorAreaProps> = ({
   openTabs,
   activeTabPath,
+  targetLine,
   onSelectTab,
   onCloseTab,
   onContentChange,
@@ -124,7 +126,12 @@ export const EditorArea: React.FC<EditorAreaProps> = ({
       editorRef.current.setModel(model);
       editorRef.current.focus();
     }
-  }, [activeTabPath, openTabs]);
+
+    if (targetLine && targetLine.path === activeTabPath && editorRef.current) {
+      editorRef.current.revealLineInCenter(targetLine.line);
+      editorRef.current.setPosition({ lineNumber: targetLine.line, column: 1 });
+    }
+  }, [activeTabPath, openTabs, targetLine]);
 
   // Clean up closed models
   useEffect(() => {

@@ -36,6 +36,17 @@ export const DEFAULT_THEME_SETTINGS: ThemeSettings = {
 
 export class ThemeService {
   private static registeredMonaco = false;
+  private static mediaQueryListenerAttached = false;
+
+  static getEffectiveAppearance(appearance: AppearanceMode): "dark" | "light" {
+    if (appearance === "system") {
+      if (typeof window !== "undefined" && window.matchMedia) {
+        return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+      }
+      return "dark";
+    }
+    return appearance;
+  }
 
   static getSettings(): ThemeSettings {
     try {
@@ -61,22 +72,44 @@ export class ThemeService {
 
   static applyToDOM(settings: ThemeSettings): void {
     const root = document.documentElement;
+    const effectiveAppearance = this.getEffectiveAppearance(settings.appearance);
+
     root.setAttribute("data-theme", settings.theme);
     root.setAttribute("data-appearance", settings.appearance);
+    root.setAttribute("data-effective-appearance", effectiveAppearance);
     root.setAttribute("data-density", settings.density);
     root.setAttribute("data-accent", settings.accent);
     root.setAttribute("data-layout", settings.layout);
     root.setAttribute("data-ai-mode", settings.aiMode);
 
-    // Synchronize Monaco theme
-    this.updateMonacoTheme(settings.theme, settings.appearance);
+    // Synchronize Monaco theme using effective appearance
+    this.updateMonacoTheme(settings.theme, effectiveAppearance);
   }
 
   static init(): ThemeSettings {
     const settings = this.getSettings();
     this.applyToDOM(settings);
     this.registerMonacoThemes();
-    this.updateMonacoTheme(settings.theme, settings.appearance);
+    const effectiveAppearance = this.getEffectiveAppearance(settings.appearance);
+    this.updateMonacoTheme(settings.theme, effectiveAppearance);
+
+    // Listen to OS-level system theme changes when in 'system' mode
+    if (!this.mediaQueryListenerAttached && typeof window !== "undefined" && window.matchMedia) {
+      this.mediaQueryListenerAttached = true;
+      const mql = window.matchMedia("(prefers-color-scheme: dark)");
+      const handleSystemThemeChange = () => {
+        const current = ThemeService.getSettings();
+        if (current.appearance === "system") {
+          ThemeService.applyToDOM(current);
+        }
+      };
+      if (mql.addEventListener) {
+        mql.addEventListener("change", handleSystemThemeChange);
+      } else if ((mql as any).addListener) {
+        (mql as any).addListener(handleSystemThemeChange);
+      }
+    }
+
     return settings;
   }
 

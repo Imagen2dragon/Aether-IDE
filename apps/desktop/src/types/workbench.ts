@@ -127,10 +127,11 @@ export interface StructuredProposal {
   proposal_id: string;
   workspace_id: string;
   relative_path: string;
-  operation: "modify" | "create" | "delete";
+  operation: "replace_file" | "apply_patch" | "insert_at" | "create_file" | "delete_file" | "modify";
   base_hash: string;
   unified_diff: string;
   proposed_content: string;
+  insertion_line?: number;
 }
 
 export interface ProposalReviewPreview {

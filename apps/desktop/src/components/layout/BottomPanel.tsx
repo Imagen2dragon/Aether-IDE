@@ -28,6 +28,15 @@ interface BottomPanelProps {
   onClearLogs: () => void;
 }
 
+interface LiveSession {
+  id: number;
+  title: string;
+  shell: string;
+  term: XTerm;
+  fitAddon: FitAddon;
+  container: HTMLDivElement;
+}
+
 export const BottomPanel: React.FC<BottomPanelProps> = ({
   activeTab,
   onSelectTab,
@@ -36,13 +45,12 @@ export const BottomPanel: React.FC<BottomPanelProps> = ({
   buildLogs,
   onClearLogs,
 }) => {
-  const terminalRef = useRef<HTMLDivElement>(null);
-  const xtermInstance = useRef<XTerm | null>(null);
-  const fitAddonRef = useRef<FitAddon | null>(null);
-  const activeTermId = useRef<string | null>(null);
+  const terminalHostRef = useRef<HTMLDivElement>(null);
+  const sessionsRef = useRef<LiveSession[]>([]);
+  const activeSessionIdRef = useRef<number | null>(null);
 
-  const [terminalSessions, setTerminalSessions] = useState<string[]>(["1: PowerShell (ConPTY)"]);
-  const [activeSessionIndex, setActiveSessionIndex] = useState(0);
+  const [sessionTabs, setSessionTabs] = useState<Array<{ id: number; title: string; shell: string }>>([]);
+  const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
 
   const [doctorReport, setDoctorReport] = useState<{
     all_healthy: boolean;
@@ -50,90 +58,191 @@ export const BottomPanel: React.FC<BottomPanelProps> = ({
   } | null>(null);
   const [isDoctorLoading, setIsDoctorLoading] = useState(false);
 
-  // Initialize Terminal on mount
+  // Sync ref with state
   useEffect(() => {
-    if (!terminalRef.current) return;
+    activeSessionIdRef.current = activeSessionId;
+  }, [activeSessionId]);
 
-    if (!xtermInstance.current) {
-      const term = new XTerm({
-        theme: {
-          background: "#11151B",
-          foreground: "#E7ECF2",
-          cursor: "#28D7F2",
-          selectionBackground: "rgba(40, 215, 242, 0.3)",
-          black: "#171B21",
-          red: "#EF4444",
-          green: "#22C55E",
-          yellow: "#F59E0B",
-          blue: "#38BDF8",
-          magenta: "#A855F7",
-          cyan: "#28D7F2",
-          white: "#E7ECF2",
-        },
-        cursorBlink: true,
-        fontSize: 13,
-        fontFamily: '"JetBrains Mono", Consolas, "Fira Code", monospace',
-        convertEol: true,
-      });
+  // Terminal instance creator helper
+  const createTerminalInstance = (sessionId: number, shellName: string) => {
+    if (!terminalHostRef.current) return null;
 
-      const fitAddon = new FitAddon();
-      term.loadAddon(fitAddon);
-      term.open(terminalRef.current);
-      fitAddon.fit();
+    const termContainer = document.createElement("div");
+    termContainer.style.width = "100%";
+    termContainer.style.height = "100%";
+    termContainer.style.padding = "4px 8px";
+    termContainer.style.display = "block";
+    terminalHostRef.current.appendChild(termContainer);
 
-      xtermInstance.current = term;
-      fitAddonRef.current = fitAddon;
+    const term = new XTerm({
+      theme: {
+        background: "#11151B",
+        foreground: "#E7ECF2",
+        cursor: "#28D7F2",
+        selectionBackground: "rgba(40, 215, 242, 0.3)",
+        black: "#171B21",
+        red: "#EF4444",
+        green: "#22C55E",
+        yellow: "#F59E0B",
+        blue: "#38BDF8",
+        magenta: "#A855F7",
+        cyan: "#28D7F2",
+        white: "#E7ECF2",
+      },
+      cursorBlink: true,
+      fontSize: 13,
+      fontFamily: '"JetBrains Mono", Consolas, "Fira Code", monospace',
+      convertEol: true,
+    });
 
-      // Spawn real backend ConPTY terminal
-      TauriService.spawnTerminal(80, 24)
-        .then((termId) => {
-          activeTermId.current = termId;
-          term.write("\x1b[1;36mAetherIDE Native ConPTY Terminal (Windows x64)\x1b[0m\r\n");
-          term.write("\x1b[90mConnected to native pseudo-console with PowerShell. Type commands below.\x1b[0m\r\n\r\n");
-        })
-        .catch((err) => {
-          term.write(`\x1b[1;31mTerminal initialization notice: ${err}\x1b[0m\r\n`);
-        });
+    const fitAddon = new FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(termContainer);
+    fitAddon.fit();
 
-      // Handle user key inputs
-      term.onData((data) => {
-        if (activeTermId.current) {
-          TauriService.writeTerminal(activeTermId.current, data);
-        }
-      });
+    // Route user keystrokes directly to this ConPTY session
+    term.onData((data) => {
+      TauriService.writeTerminal(data, sessionId);
+    });
 
-      // Listen for terminal output events from backend
-      const unlistenPromise = TauriService.onEvent<string>(
-        "terminal-output",
-        (chunk) => {
-          term.write(chunk);
-        }
-      );
+    term.write(`\x1b[1;36mAetherIDE Native ConPTY Terminal (Session #${sessionId})\x1b[0m\r\n`);
+    term.write(`\x1b[90mConnected to ${shellName} with native Windows pseudo-console.\x1b[0m\r\n\r\n`);
 
-      const handleResize = () => {
-        if (fitAddonRef.current) {
-          fitAddonRef.current.fit();
-        }
-      };
-      window.addEventListener("resize", handleResize);
+    const liveSession: LiveSession = {
+      id: sessionId,
+      title: `${sessionsRef.current.length + 1}: ${shellName}`,
+      shell: shellName,
+      term,
+      fitAddon,
+      container: termContainer,
+    };
 
-      return () => {
-        window.removeEventListener("resize", handleResize);
-        unlistenPromise.then((unlisten) => unlisten());
-        if (activeTermId.current) {
-          TauriService.killTerminal(activeTermId.current);
-        }
-        term.dispose();
-        xtermInstance.current = null;
-      };
+    return liveSession;
+  };
+
+  // Switch active session
+  const selectSession = (id: number) => {
+    for (const s of sessionsRef.current) {
+      if (s.id === id) {
+        s.container.style.display = "block";
+        setTimeout(() => {
+          s.fitAddon.fit();
+          s.term.focus();
+        }, 30);
+      } else {
+        s.container.style.display = "none";
+      }
     }
+    setActiveSessionId(id);
+  };
+
+  // Spawn new terminal session
+  const spawnNewTerminalSession = async (shell = "powershell") => {
+    try {
+      const res = await TauriService.spawnTerminal(120, 30, undefined, shell);
+      const session = createTerminalInstance(res.id, res.shell || "PowerShell");
+      if (session) {
+        sessionsRef.current.push(session);
+        setSessionTabs(sessionsRef.current.map((s) => ({ id: s.id, title: s.title, shell: s.shell })));
+        selectSession(session.id);
+      }
+    } catch (err) {
+      console.error("Failed to spawn terminal session:", err);
+    }
+  };
+
+  // Close/Kill specific terminal session
+  const closeSession = async (id: number) => {
+    const idx = sessionsRef.current.findIndex((s) => s.id === id);
+    if (idx === -1) return;
+
+    const [target] = sessionsRef.current.splice(idx, 1);
+    try {
+      await TauriService.killTerminal(target.id);
+    } catch (e) {
+      console.warn("Failed to kill terminal process:", e);
+    }
+
+    try {
+      target.term.dispose();
+      if (target.container.parentNode) {
+        target.container.parentNode.removeChild(target.container);
+      }
+    } catch (e) {
+      console.warn("Error tearing down terminal DOM:", e);
+    }
+
+    setSessionTabs(sessionsRef.current.map((s) => ({ id: s.id, title: s.title, shell: s.shell })));
+
+    if (activeSessionIdRef.current === id) {
+      if (sessionsRef.current.length > 0) {
+        const nextId = sessionsRef.current[Math.max(0, idx - 1)].id;
+        selectSession(nextId);
+      } else {
+        // If all sessions closed, spawn fresh session
+        spawnNewTerminalSession();
+      }
+    }
+  };
+
+  const handleClearActiveTerminal = () => {
+    const active = sessionsRef.current.find((s) => s.id === activeSessionIdRef.current);
+    if (active) {
+      active.term.clear();
+    }
+  };
+
+  // Initialize first terminal session on mount and listen to events
+  useEffect(() => {
+    let unlistenFn: (() => void) | null = null;
+
+    spawnNewTerminalSession().then(() => {
+      // Listen for backend terminal output events routed by session id
+      TauriService.onEvent<string | { id?: number; data?: string }>("terminal-output", (payload) => {
+        if (typeof payload === "string") {
+          const active = sessionsRef.current.find((s) => s.id === activeSessionIdRef.current);
+          if (active) active.term.write(payload);
+        } else if (payload && typeof payload === "object") {
+          const targetSession = sessionsRef.current.find((s) => s.id === payload.id);
+          if (targetSession && payload.data) {
+            targetSession.term.write(payload.data);
+          }
+        }
+      }).then((fn) => {
+        unlistenFn = fn;
+      });
+    });
+
+    const handleResize = () => {
+      const active = sessionsRef.current.find((s) => s.id === activeSessionIdRef.current);
+      if (active) {
+        active.fitAddon.fit();
+        TauriService.resizeTerminal(active.term.cols, active.term.rows, active.id);
+      }
+    };
+    window.addEventListener("resize", handleResize);
+
+    return () => {
+      window.removeEventListener("resize", handleResize);
+      if (unlistenFn) unlistenFn();
+      // Clean up all running terminal processes on unmount
+      for (const s of sessionsRef.current) {
+        TauriService.killTerminal(s.id);
+        s.term.dispose();
+      }
+      sessionsRef.current = [];
+    };
   }, []);
 
   // Fit terminal when activeTab switches to terminal
   useEffect(() => {
-    if (activeTab === "terminal" && fitAddonRef.current) {
+    if (activeTab === "terminal") {
       setTimeout(() => {
-        fitAddonRef.current?.fit();
+        const active = sessionsRef.current.find((s) => s.id === activeSessionIdRef.current);
+        if (active) {
+          active.fitAddon.fit();
+          active.term.focus();
+        }
       }, 50);
     }
   }, [activeTab]);
@@ -147,21 +256,6 @@ export const BottomPanel: React.FC<BottomPanelProps> = ({
       console.error(e);
     } finally {
       setIsDoctorLoading(false);
-    }
-  };
-
-  const handleNewTerminal = () => {
-    const nextNum = terminalSessions.length + 1;
-    setTerminalSessions([...terminalSessions, `${nextNum}: PowerShell (ConPTY)`]);
-    setActiveSessionIndex(terminalSessions.length);
-    if (xtermInstance.current) {
-      xtermInstance.current.write(`\r\n\x1b[1;32m[Session ${nextNum} Created]\x1b[0m\r\n`);
-    }
-  };
-
-  const handleClearTerminal = () => {
-    if (xtermInstance.current) {
-      xtermInstance.current.clear();
     }
   };
 
@@ -208,7 +302,7 @@ export const BottomPanel: React.FC<BottomPanelProps> = ({
             onClick={() => onSelectTab("terminal")}
           >
             <TerminalIcon size={13} />
-            <span>Terminal</span>
+            <span>Terminal {sessionTabs.length > 0 && `(${sessionTabs.length})`}</span>
           </button>
 
           {/* Problems Tab */}
@@ -226,7 +320,7 @@ export const BottomPanel: React.FC<BottomPanelProps> = ({
             onClick={() => onSelectTab("output")}
           >
             <FileText size={13} />
-            <span>Output ({buildLogs.length})</span>
+            <span>Output</span>
           </button>
 
           {/* Debug Console Tab */}
@@ -262,7 +356,7 @@ export const BottomPanel: React.FC<BottomPanelProps> = ({
           {activeTab === "terminal" && (
             <>
               <button
-                onClick={handleNewTerminal}
+                onClick={() => spawnNewTerminalSession()}
                 style={{
                   background: "transparent",
                   border: "none",
@@ -271,12 +365,12 @@ export const BottomPanel: React.FC<BottomPanelProps> = ({
                   padding: 3,
                   borderRadius: 3,
                 }}
-                title="New Terminal Session"
+                title="New ConPTY Terminal Session (+)"
               >
                 <Plus size={13} />
               </button>
               <button
-                onClick={handleClearTerminal}
+                onClick={handleClearActiveTerminal}
                 style={{
                   background: "transparent",
                   border: "none",
@@ -337,22 +431,83 @@ export const BottomPanel: React.FC<BottomPanelProps> = ({
               padding: 3,
               borderRadius: 3,
             }}
-            title="Close Bottom Panel (Ctrl+`)"
+            title="Close Bottom Panel"
           >
             <X size={14} />
           </button>
         </div>
       </div>
 
+      {/* Terminal Multi-Session Sub-Bar */}
+      {activeTab === "terminal" && sessionTabs.length > 1 && (
+        <div
+          style={{
+            height: 26,
+            background: "rgba(0, 0, 0, 0.2)",
+            borderBottom: "1px solid var(--border-color)",
+            display: "flex",
+            alignItems: "center",
+            padding: "0 6px",
+            gap: 4,
+            overflowX: "auto",
+            flexShrink: 0,
+          }}
+        >
+          {sessionTabs.map((s) => {
+            const isSelected = s.id === activeSessionId;
+            return (
+              <div
+                key={s.id}
+                onClick={() => selectSession(s.id)}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  padding: "2px 8px",
+                  fontSize: 11,
+                  background: isSelected ? "var(--bg-panel)" : "transparent",
+                  color: isSelected ? "var(--accent-cyan)" : "var(--text-muted)",
+                  border: isSelected ? "1px solid var(--border-color)" : "1px solid transparent",
+                  borderBottom: "none",
+                  borderRadius: "3px 3px 0 0",
+                  cursor: "pointer",
+                }}
+              >
+                <span>{s.title}</span>
+                {sessionTabs.length > 1 && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      closeSession(s.id);
+                    }}
+                    style={{
+                      background: "transparent",
+                      border: "none",
+                      color: "var(--text-dim)",
+                      cursor: "pointer",
+                      padding: 1,
+                      display: "flex",
+                      alignItems: "center",
+                    }}
+                    title="Close Terminal Session"
+                  >
+                    <X size={11} />
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       {/* Panel Content Body */}
       <div style={{ flex: 1, position: "relative", overflow: "hidden", minHeight: 0 }}>
-        {/* Terminal Container */}
+        {/* Multi-Session Terminal Host */}
         <div
-          ref={terminalRef}
+          ref={terminalHostRef}
           style={{
             width: "100%",
             height: "100%",
-            padding: "4px 8px",
             display: activeTab === "terminal" ? "block" : "none",
           }}
         />
@@ -414,13 +569,12 @@ export const BottomPanel: React.FC<BottomPanelProps> = ({
               fontSize: 12,
               fontFamily: '"JetBrains Mono", Consolas, monospace',
               color: "var(--text-secondary)",
-              background: "var(--bg-editor)",
               whiteSpace: "pre-wrap",
             }}
           >
             {buildLogs.length === 0 ? (
               <div style={{ color: "var(--text-dim)", padding: 12 }}>
-                No active output logs. Run a build or task to see streamed output.
+                No build or task output logs recorded yet.
               </div>
             ) : (
               buildLogs.map((log, i) => <div key={i}>{log}</div>)
@@ -469,7 +623,7 @@ export const BottomPanel: React.FC<BottomPanelProps> = ({
               Cargo Test Suite Verification
             </div>
             <div style={{ color: "var(--text-dim)", marginBottom: 8 }}>
-              checkpoint-engine test suite: 211 passed; 0 failed; 0 ignored; finished in 1.10s
+              checkpoint-engine test suite: 211 passed; 0 failed; 0 ignored; finished in 0.83s
             </div>
             <div style={{ color: "var(--text-muted)" }}>
               All tests passed: dual-handle NTFS mutual exclusion, fail-closed rollback, and hash binding verified.
@@ -521,31 +675,27 @@ export const BottomPanel: React.FC<BottomPanelProps> = ({
                       background: "var(--bg-surface)",
                       border: "1px solid var(--border-color)",
                       display: "flex",
-                      justifyContent: "space-between",
-                      alignItems: "center",
-                      fontSize: 12,
+                      flexDirection: "column",
+                      gap: 4,
                     }}
                   >
-                    <div>
-                      <div style={{ fontWeight: 600, color: "var(--text-primary)" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span style={{ fontWeight: 600, fontSize: 12, color: "var(--text-primary)" }}>
                         {diag.name}
-                      </div>
-                      <div style={{ fontSize: 11, color: "var(--text-dim)" }}>
-                        {diag.message}
-                      </div>
+                      </span>
+                      <span
+                        style={{
+                          fontSize: 10,
+                          fontWeight: 700,
+                          color: diag.status.toLowerCase() === "healthy" ? "var(--success)" : "var(--warning)",
+                        }}
+                      >
+                        {diag.status}
+                      </span>
                     </div>
-                    <span
-                      style={{
-                        padding: "2px 8px",
-                        borderRadius: 4,
-                        fontSize: 11,
-                        background: "rgba(34, 197, 94, 0.1)",
-                        color: "var(--success)",
-                        fontWeight: 600,
-                      }}
-                    >
-                      {diag.status}
-                    </span>
+                    <div style={{ fontSize: 11, color: "var(--text-secondary)" }}>
+                      {diag.message}
+                    </div>
                   </div>
                 ))}
               </div>

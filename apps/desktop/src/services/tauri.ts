@@ -76,24 +76,64 @@ export class TauriService {
     return invoke("workspace_set_trust", { rootPath, isTrusted });
   }
 
-  // --- Terminal ---
-  static async spawnTerminal(cols = 80, rows = 24, cwd?: string): Promise<any> {
-    return invoke("terminal_spawn", { cwd, cols, rows });
+  // --- Terminal Multi-Session ---
+  static async spawnTerminal(cols = 120, rows = 30, cwd?: string, shell?: string): Promise<{ success: boolean; id: number; shell: string; cwd?: string }> {
+    return invoke("terminal_spawn", { cwd, cols, rows, shell });
   }
 
-  static async writeTerminal(idOrData: string, data?: string): Promise<boolean> {
-    const text = data !== undefined ? data : idOrData;
-    return invoke("terminal_write", { data: text });
+  static async writeTerminal(data: string, sessionId?: number): Promise<boolean> {
+    return invoke("terminal_write", { data, sessionId });
   }
 
-  static async resizeTerminal(idOrCols: string | number, colsOrRows: number, rowsOptional?: number): Promise<boolean> {
-    const cols = typeof idOrCols === "number" ? idOrCols : colsOrRows;
-    const rows = rowsOptional !== undefined ? rowsOptional : colsOrRows;
-    return invoke("terminal_resize", { cols, rows });
+  static async resizeTerminal(cols: number, rows: number, sessionId?: number): Promise<boolean> {
+    return invoke("terminal_resize", { cols, rows, sessionId });
   }
 
-  static async killTerminal(_id?: string): Promise<boolean> {
-    return invoke("terminal_kill");
+  static async killTerminal(sessionId?: number): Promise<boolean> {
+    return invoke("terminal_kill", { sessionId });
+  }
+
+  static async listTerminalSessions(): Promise<any[]> {
+    return invoke("terminal_list_sessions");
+  }
+
+  // --- Workspace Search & Replace ---
+  static async searchWorkspace(
+    query: string,
+    options: {
+      isCaseSensitive?: boolean;
+      isWholeWord?: boolean;
+      isRegex?: boolean;
+      maxResults?: number;
+    } = {}
+  ): Promise<Array<{ file: string; line: number; col: number; match_text: string; line_content: string }>> {
+    return invoke("workspace_search", {
+      query,
+      isCaseSensitive: !!options.isCaseSensitive,
+      isWholeWord: !!options.isWholeWord,
+      isRegex: !!options.isRegex,
+      maxResults: options.maxResults || 300,
+    });
+  }
+
+  static async replaceInWorkspace(
+    filePath: string,
+    searchQuery: string,
+    replacement: string,
+    options: {
+      isCaseSensitive?: boolean;
+      isWholeWord?: boolean;
+      isRegex?: boolean;
+    } = {}
+  ): Promise<{ success: boolean; file: string; replacements_count: number }> {
+    return invoke("workspace_replace_in_file", {
+      filePath,
+      searchQuery,
+      replacement,
+      isCaseSensitive: !!options.isCaseSensitive,
+      isWholeWord: !!options.isWholeWord,
+      isRegex: !!options.isRegex,
+    });
   }
 
   // --- System ---
@@ -193,8 +233,8 @@ export class TauriService {
     return invoke("ai_preview_proposal", { proposal });
   }
 
-  static async applyProposal(proposal: StructuredProposal, force = false): Promise<ApplyProposalResult> {
-    return invoke("ai_apply_proposal", { proposal, force });
+  static async applyProposal(proposal: StructuredProposal): Promise<ApplyProposalResult> {
+    return invoke("ai_apply_proposal", { proposal });
   }
 
   // --- AI Agents & Swarm Orchestration ---

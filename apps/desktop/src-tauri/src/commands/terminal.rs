@@ -14,6 +14,7 @@ pub async fn terminal_spawn(
     cwd: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
+    shell: Option<String>,
 ) -> Result<Value, String> {
     let workspace_cwd = {
         let session_arc = app.state::<SharedWorkspace>();
@@ -22,6 +23,7 @@ pub async fn terminal_spawn(
     };
 
     let target_cwd = cwd.map(PathBuf::from).or(workspace_cwd);
+    let shell_to_spawn = shell.unwrap_or_else(|| "powershell".to_string());
 
     let tm_arc = app.state::<SharedTerminalManager>();
     let active_id_arc = app.state::<ActiveTerminalId>();
@@ -29,7 +31,7 @@ pub async fn terminal_spawn(
     let session_info = {
         let tm = tm_arc.lock();
         tm.spawn_interactive(
-            "powershell",
+            &shell_to_spawn,
             target_cwd,
             cols.unwrap_or(120),
             rows.unwrap_or(30),
@@ -64,39 +66,66 @@ pub async fn terminal_spawn(
 }
 
 #[tauri::command]
-pub async fn terminal_write(app: AppHandle, data: String) -> Result<Value, String> {
+pub async fn terminal_write(
+    app: AppHandle,
+    data: String,
+    session_id: Option<u32>,
+) -> Result<Value, String> {
     let active_id_arc = app.state::<ActiveTerminalId>();
-    let active_id = active_id_arc.lock().ok_or("No active terminal session")?;
+    let target_id = session_id
+        .or_else(|| *active_id_arc.lock())
+        .ok_or("No active terminal session")?;
 
     let tm_arc = app.state::<SharedTerminalManager>();
     let tm = tm_arc.lock();
-    tm.write_input(active_id, data.as_bytes())
-        .map_err(|e| format!("Failed to write to terminal: {}", e))?;
+    tm.write_input(target_id, data.as_bytes())
+        .map_err(|e| format!("Failed to write to terminal {}: {}", target_id, e))?;
 
     Ok(json!({ "success": true }))
 }
 
 #[tauri::command]
-pub async fn terminal_resize(app: AppHandle, cols: u16, rows: u16) -> Result<Value, String> {
+pub async fn terminal_resize(
+    app: AppHandle,
+    cols: u16,
+    rows: u16,
+    session_id: Option<u32>,
+) -> Result<Value, String> {
     let active_id_arc = app.state::<ActiveTerminalId>();
-    let active_id = active_id_arc.lock().ok_or("No active terminal session")?;
+    let target_id = session_id
+        .or_else(|| *active_id_arc.lock())
+        .ok_or("No active terminal session")?;
 
     let tm_arc = app.state::<SharedTerminalManager>();
     let tm = tm_arc.lock();
-    tm.resize_terminal(active_id, cols, rows)
-        .map_err(|e| format!("Failed to resize terminal: {}", e))?;
+    tm.resize_terminal(target_id, cols, rows)
+        .map_err(|e| format!("Failed to resize terminal {}: {}", target_id, e))?;
 
     Ok(json!({ "success": true }))
 }
 
 #[tauri::command]
-pub async fn terminal_kill(app: AppHandle) -> Result<Value, String> {
+pub async fn terminal_kill(app: AppHandle, session_id: Option<u32>) -> Result<Value, String> {
     let active_id_arc = app.state::<ActiveTerminalId>();
-    let mut id_lock = active_id_arc.lock();
-    if let Some(id) = id_lock.take() {
+    let id_to_kill = session_id.or_else(|| active_id_arc.lock().take());
+
+    if let Some(id) = id_to_kill {
         let tm_arc = app.state::<SharedTerminalManager>();
         let tm = tm_arc.lock();
         let _ = tm.close_session(id);
+
+        let mut active_lock = active_id_arc.lock();
+        if *active_lock == Some(id) {
+            *active_lock = None;
+        }
     }
     Ok(json!({ "success": true }))
+}
+
+#[tauri::command]
+pub async fn terminal_list_sessions(app: AppHandle) -> Result<Value, String> {
+    let tm_arc = app.state::<SharedTerminalManager>();
+    let tm = tm_arc.lock();
+    let sessions = tm.list_sessions();
+    Ok(json!(sessions))
 }
