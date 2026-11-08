@@ -689,8 +689,7 @@ impl PinnedDirectoryHandle {
 
         let entry_ino = entry_stat.st_ino as u64;
         let entry_dev = entry_stat.st_dev as u64;
-        let expected_ino =
-            ((self.identity.file_index_high as u64) << 32) | (self.identity.file_index_low as u64);
+        let expected_ino = (self.identity.file_index_high << 32) | self.identity.file_index_low;
         let expected_dev = self.identity.volume_serial_number;
 
         if entry_dev != expected_dev || entry_ino != expected_ino {
@@ -809,8 +808,8 @@ pub fn pin_created_directory(path: &Path) -> Result<PinnedDirectoryHandle> {
     let ino = dir_stat.st_ino as u64;
     let identity = FileObjectIdentity {
         volume_serial_number: dir_stat.st_dev as u64,
-        file_index_high: (ino >> 32) as u64,
-        file_index_low: (ino & 0xFFFFFFFF) as u64,
+        file_index_high: ino >> 32,
+        file_index_low: ino & 0xFFFFFFFF,
     };
 
     Ok(PinnedDirectoryHandle {
@@ -851,11 +850,13 @@ fn clean_dir_descriptor(dir_fd: libc::c_int) -> Result<()> {
         let entry_ptr = unsafe { libc::readdir(dir_ptr) };
         if entry_ptr.is_null() {
             let err = std::io::Error::last_os_error();
-            if err.raw_os_error() != Some(0) && err.raw_os_error() != None {
-                unsafe {
-                    libc::closedir(dir_ptr);
+            if let Some(code) = err.raw_os_error() {
+                if code != 0 {
+                    unsafe {
+                        libc::closedir(dir_ptr);
+                    }
+                    return Err(AetherError::Io(err));
                 }
-                return Err(AetherError::Io(err));
             }
             break;
         }
