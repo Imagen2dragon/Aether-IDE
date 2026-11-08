@@ -81,7 +81,7 @@ if (Test-Path "$IDE_ROOT\apps\desktop\workbench") {
     Copy-Item "$IDE_ROOT\apps\desktop\workbench\*" "$STAGE_DIR\workbench\" -Recurse -Force
 }
 if (Test-Path "$IDE_ROOT\apps\desktop\dist") {
-    Copy-Item "$IDE_ROOT\apps\desktop\dist" "$STAGE_DIR\workbench\" -Recurse -Force
+    Copy-Item "$IDE_ROOT\apps\desktop\dist\*" "$STAGE_DIR\workbench\" -Recurse -Force
 }
 if (Test-Path "$IDE_ROOT\apps\desktop\package.json") {
     Copy-Item "$IDE_ROOT\apps\desktop\package.json" "$STAGE_DIR\workbench\" -Force

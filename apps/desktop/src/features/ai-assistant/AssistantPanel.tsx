@@ -38,6 +38,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
   activeFilePath,
   activeFileContent,
   onApplyDiff,
+  onClose,
 }) => {
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -355,6 +356,24 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
               <option value="gpt-4o">GPT-4o Omnimodal</option>
             )}
           </select>
+          {onClose && (
+            <button
+              onClick={onClose}
+              style={{
+                background: "transparent",
+                border: "none",
+                color: "var(--text-muted)",
+                cursor: "pointer",
+                padding: 3,
+                borderRadius: 3,
+                display: "flex",
+                alignItems: "center",
+              }}
+              title="Close AI Assistant (Ctrl+L)"
+            >
+              <X size={14} />
+            </button>
+          )}
         </div>
       </div>
 

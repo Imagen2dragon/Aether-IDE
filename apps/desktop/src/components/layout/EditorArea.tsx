@@ -1,7 +1,19 @@
 import React, { useEffect, useRef } from "react";
 import * as monaco from "monaco-editor";
-import { X, FolderOpen, FileCode, Zap, Code2, Terminal, Shield } from "lucide-react";
+import {
+  X,
+  FolderOpen,
+  FileCode,
+  Zap,
+  Code2,
+  Terminal,
+  Shield,
+  Save,
+  Split,
+  Search,
+} from "lucide-react";
 import type { OpenFileTab } from "../../types/workbench";
+import { ThemeService } from "../../services/theme";
 
 interface EditorAreaProps {
   openTabs: OpenFileTab[];
@@ -11,6 +23,7 @@ interface EditorAreaProps {
   onContentChange: (path: string, content: string) => void;
   onOpenFolder: () => void;
   onOpenFile: () => void;
+  onSaveFile?: () => void;
 }
 
 export const EditorArea: React.FC<EditorAreaProps> = ({
@@ -21,25 +34,29 @@ export const EditorArea: React.FC<EditorAreaProps> = ({
   onContentChange,
   onOpenFolder,
   onOpenFile,
+  onSaveFile,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const modelsRef = useRef<Map<string, monaco.editor.ITextModel>>(new Map());
 
-  // Initialize Monaco Editor instance
+  // Initialize Monaco Editor instance with JetBrains Mono typography and Obsidian Pro theme
   useEffect(() => {
     if (!containerRef.current) return;
+
+    ThemeService.registerMonacoThemes();
+    const currentTheme = ThemeService.getSettings();
 
     if (!editorRef.current) {
       editorRef.current = monaco.editor.create(containerRef.current, {
         value: "",
         language: "plaintext",
-        theme: "vs-dark",
+        theme: currentTheme.appearance === "light" ? "vs" : "aether-obsidian-pro",
         automaticLayout: true,
-        fontSize: 14,
-        fontFamily: 'Consolas, "Fira Code", monospace',
+        fontSize: 13.5,
+        fontFamily: '"JetBrains Mono", Consolas, "Fira Code", monospace',
         fontLigatures: true,
-        minimap: { enabled: true },
+        minimap: { enabled: true, maxColumn: 100 },
         renderLineHighlight: "all",
         bracketPairColorization: { enabled: true },
         cursorBlinking: "smooth",
@@ -47,6 +64,9 @@ export const EditorArea: React.FC<EditorAreaProps> = ({
         smoothScrolling: true,
         tabSize: 4,
         insertSpaces: true,
+        lineNumbers: "on",
+        folding: true,
+        renderWhitespace: "selection",
       });
 
       editorRef.current.onDidChangeModelContent(() => {
@@ -54,7 +74,6 @@ export const EditorArea: React.FC<EditorAreaProps> = ({
         const currentModel = editorRef.current.getModel();
         if (!currentModel) return;
 
-        // Find path matching current model
         for (const [path, model] of modelsRef.current.entries()) {
           if (model === currentModel) {
             onContentChange(path, model.getValue());
@@ -65,7 +84,6 @@ export const EditorArea: React.FC<EditorAreaProps> = ({
     }
 
     return () => {
-      // Cleanup on unmount
       if (editorRef.current) {
         editorRef.current.dispose();
         editorRef.current = null;
@@ -73,7 +91,7 @@ export const EditorArea: React.FC<EditorAreaProps> = ({
     };
   }, []);
 
-  // Update editor model when active tab or tabs list changes
+  // Update editor model when active tab changes
   useEffect(() => {
     if (!editorRef.current) return;
 
@@ -122,101 +140,126 @@ export const EditorArea: React.FC<EditorAreaProps> = ({
   const activeTab = openTabs.find((t) => t.path === activeTabPath);
 
   return (
-    <div className="editor-area-container" style={{ flex: 1, display: "flex", flexDirection: "column", height: "100%", background: "var(--bg-editor)", overflow: "hidden" }}>
+    <div
+      className="editor-area-container"
+      style={{
+        flex: 1,
+        display: "flex",
+        flexDirection: "column",
+        height: "100%",
+        background: "var(--bg-editor)",
+        overflow: "hidden",
+        minHeight: 0,
+        minWidth: 0,
+      }}
+    >
       {/* Editor Tabs Bar */}
       {openTabs.length > 0 && (
         <div
           className="editor-tabs-bar"
           style={{
-            height: 35,
-            background: "var(--bg-header)",
+            height: 36,
+            background: "var(--bg-surface)",
             borderBottom: "1px solid var(--border-color)",
             display: "flex",
             alignItems: "center",
-            overflowX: "auto",
+            justifyContent: "space-between",
+            overflow: "hidden",
             flexShrink: 0,
           }}
         >
-          {openTabs.map((tab) => {
-            const isActive = tab.path === activeTabPath;
-            return (
-              <div
-                key={tab.path}
-                className={`editor-tab ${isActive ? "active" : ""}`}
-                onClick={() => onSelectTab(tab.path)}
+          <div className="editor-tabs">
+            {openTabs.map((tab) => {
+              const isActive = tab.path === activeTabPath;
+              return (
+                <div
+                  key={tab.path}
+                  className={`editor-tab ${isActive ? "active" : ""}`}
+                  onClick={() => onSelectTab(tab.path)}
+                >
+                  <span>{tab.name}</span>
+                  {tab.isDirty && (
+                    <span
+                      style={{
+                        width: 7,
+                        height: 7,
+                        borderRadius: "50%",
+                        background: "var(--accent-cyan)",
+                        boxShadow: "0 0 6px var(--accent-cyan)",
+                      }}
+                    />
+                  )}
+                  <button
+                    className="tab-close-btn"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onCloseTab(tab.path);
+                    }}
+                    title="Close Tab (Ctrl+W)"
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Tab Actions */}
+          <div style={{ display: "flex", alignItems: "center", gap: 4, padding: "0 8px" }}>
+            {onSaveFile && activeTab?.isDirty && (
+              <button
+                onClick={onSaveFile}
                 style={{
+                  background: "transparent",
+                  border: "none",
+                  color: "var(--accent-cyan)",
+                  cursor: "pointer",
+                  padding: 4,
                   display: "flex",
                   alignItems: "center",
-                  gap: 8,
-                  padding: "0 12px",
-                  height: "100%",
-                  fontSize: 12,
-                  cursor: "pointer",
-                  background: isActive ? "var(--bg-editor)" : "transparent",
-                  color: isActive ? "var(--text-primary)" : "var(--text-muted)",
-                  borderRight: "1px solid var(--border-color)",
-                  borderTop: isActive ? "2px solid var(--accent-cyan)" : "2px solid transparent",
+                  gap: 4,
+                  fontSize: 11,
+                  fontWeight: 600,
                 }}
+                title="Save File (Ctrl+S)"
               >
-                <span>{tab.name}</span>
-                {tab.isDirty && (
-                  <span
-                    style={{
-                      width: 7,
-                      height: 7,
-                      borderRadius: "50%",
-                      background: "var(--accent-cyan)",
-                    }}
-                  />
-                )}
-                <button
-                  className="tab-close-btn"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onCloseTab(tab.path);
-                  }}
-                  style={{
-                    background: "transparent",
-                    border: "none",
-                    color: "inherit",
-                    cursor: "pointer",
-                    display: "flex",
-                    alignItems: "center",
-                    padding: 2,
-                    borderRadius: 3,
-                  }}
-                >
-                  <X size={13} />
-                </button>
-              </div>
-            );
-          })}
+                <Save size={13} />
+                <span>Save</span>
+              </button>
+            )}
+            <button
+              onClick={() => {
+                if (editorRef.current) {
+                  editorRef.current.trigger("keyboard", "actions.find", null);
+                }
+              }}
+              style={{
+                background: "transparent",
+                border: "none",
+                color: "var(--text-muted)",
+                cursor: "pointer",
+                padding: 4,
+                borderRadius: 3,
+              }}
+              title="Find in File (Ctrl+F)"
+            >
+              <Search size={13} />
+            </button>
+          </div>
         </div>
       )}
 
       {/* Breadcrumbs Bar */}
       {activeTab && (
-        <div
-          className="breadcrumbs-bar"
-          style={{
-            height: 24,
-            padding: "0 12px",
-            background: "var(--bg-editor)",
-            borderBottom: "1px solid var(--border-color)",
-            display: "flex",
-            alignItems: "center",
-            gap: 6,
-            fontSize: 11,
-            color: "var(--text-dim)",
-            flexShrink: 0,
-          }}
-        >
-          <span>{activeTab.path.replace(/\\/g, " > ")}</span>
+        <div className="breadcrumbs-bar">
+          <span className="crumb">workspace</span>
+          <span>&gt;</span>
+          <span className="crumb-active">{activeTab.path.replace(/\\/g, " > ")}</span>
         </div>
       )}
 
       {/* Editor Content Area */}
-      <div style={{ flex: 1, position: "relative", width: "100%", height: "100%", overflow: "hidden" }}>
+      <div style={{ flex: 1, position: "relative", width: "100%", height: "100%", overflow: "hidden", minHeight: 0, minWidth: 0 }}>
         {/* Monaco Editor Root */}
         <div
           ref={containerRef}
@@ -238,19 +281,19 @@ export const EditorArea: React.FC<EditorAreaProps> = ({
               flexDirection: "column",
               alignItems: "center",
               justifyContent: "center",
-              gap: 24,
+              gap: 20,
               padding: 32,
-              background: "radial-gradient(ellipse at center, #0f172a 0%, #070a12 100%)",
+              background: "radial-gradient(ellipse at center, #171B21 0%, #101216 75%)",
             }}
           >
             <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
               <Zap size={36} style={{ color: "var(--accent-cyan)" }} />
               <div>
-                <h1 style={{ fontSize: 24, fontWeight: 800, letterSpacing: -0.5 }}>
+                <h1 style={{ fontSize: 24, fontWeight: 800, letterSpacing: -0.5, color: "var(--text-primary)" }}>
                   Aether<span style={{ color: "var(--accent-cyan)" }}>IDE</span>
                 </h1>
                 <p style={{ fontSize: 13, color: "var(--text-muted)" }}>
-                  AI-Native Software Engineering Studio • Production v0.1.0-beta.2
+                  Concept 2 — Expanded Obsidian Pro Workbench • Production v0.1.0-beta.2
                 </p>
               </div>
             </div>
@@ -271,8 +314,8 @@ export const EditorArea: React.FC<EditorAreaProps> = ({
                   gap: 12,
                   padding: "14px 16px",
                   borderRadius: 8,
-                  background: "var(--bg-card)",
-                  border: "1px solid var(--border-light)",
+                  background: "var(--bg-surface)",
+                  border: "1px solid var(--border-color)",
                   color: "var(--text-primary)",
                   cursor: "pointer",
                   textAlign: "left",
@@ -283,7 +326,7 @@ export const EditorArea: React.FC<EditorAreaProps> = ({
                 <div>
                   <div style={{ fontWeight: 600, fontSize: 13 }}>Open Folder</div>
                   <div style={{ fontSize: 11, color: "var(--text-dim)" }}>
-                    Open local project workspace
+                    Open project workspace (Ctrl+K Ctrl+O)
                   </div>
                 </div>
               </button>
@@ -296,19 +339,19 @@ export const EditorArea: React.FC<EditorAreaProps> = ({
                   gap: 12,
                   padding: "14px 16px",
                   borderRadius: 8,
-                  background: "var(--bg-card)",
-                  border: "1px solid var(--border-light)",
+                  background: "var(--bg-surface)",
+                  border: "1px solid var(--border-color)",
                   color: "var(--text-primary)",
                   cursor: "pointer",
                   textAlign: "left",
                   transition: "all 0.15s",
                 }}
               >
-                <FileCode size={20} style={{ color: "var(--accent-indigo)" }} />
+                <FileCode size={20} style={{ color: "var(--accent-cyan)" }} />
                 <div>
                   <div style={{ fontWeight: 600, fontSize: 13 }}>Open File</div>
                   <div style={{ fontSize: 11, color: "var(--text-dim)" }}>
-                    Open single code file
+                    Open single code file (Ctrl+O)
                   </div>
                 </div>
               </button>
@@ -325,15 +368,15 @@ export const EditorArea: React.FC<EditorAreaProps> = ({
             >
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                 <Code2 size={14} style={{ color: "var(--accent-cyan)" }} />
-                <span>Monaco Editor</span>
+                <span>Monaco JetBrains Mono</span>
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                 <Terminal size={14} style={{ color: "var(--success)" }} />
-                <span>ConPTY Windows Terminal</span>
+                <span>Native Windows ConPTY</span>
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                <Shield size={14} style={{ color: "var(--purple)" }} />
-                <span>Zero-Mock Rust Backend</span>
+                <Shield size={14} style={{ color: "var(--accent-cyan)" }} />
+                <span>Dual-Handle Windows NTFS Integrity</span>
               </div>
             </div>
           </div>

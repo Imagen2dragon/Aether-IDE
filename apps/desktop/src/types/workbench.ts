@@ -1,13 +1,23 @@
 export type ActiveSidebarView =
   | "explorer"
-  | "brain"
+  | "search"
   | "git"
+  | "debug"
+  | "brain"
+  | "extensions"
+  | "testing"
   | "agents"
   | "mobile"
   | "build"
   | "settings";
 
-export type BottomPanelTab = "terminal" | "problems" | "output" | "doctor";
+export type BottomPanelTab =
+  | "terminal"
+  | "problems"
+  | "output"
+  | "debug"
+  | "tests"
+  | "doctor";
 
 export interface WorkspaceNode {
   name: string;
