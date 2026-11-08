@@ -290,6 +290,8 @@ pub struct CheckpointEngine {
     active_previews: Arc<Mutex<HashMap<String, ActivePreviewSession>>>,
     simulate_backup_failure: std::sync::atomic::AtomicBool,
     fault_inject_blob_storage_failure: std::sync::atomic::AtomicBool,
+    fault_inject_blob_storage_failure_partial: std::sync::atomic::AtomicBool,
+    fault_inject_metadata_publication_failure: std::sync::atomic::AtomicBool,
     active_restore_paths: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
     pre_replace_hook: Arc<Mutex<Option<PreReplaceHook>>>,
     post_hash_hook: Arc<Mutex<Option<PreReplaceHook>>>,
@@ -354,6 +356,8 @@ impl CheckpointEngine {
             active_previews: Arc::new(Mutex::new(HashMap::new())),
             simulate_backup_failure: std::sync::atomic::AtomicBool::new(false),
             fault_inject_blob_storage_failure: std::sync::atomic::AtomicBool::new(false),
+            fault_inject_blob_storage_failure_partial: std::sync::atomic::AtomicBool::new(false),
+            fault_inject_metadata_publication_failure: std::sync::atomic::AtomicBool::new(false),
             active_restore_paths: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pre_replace_hook: Arc::new(Mutex::new(None)),
             post_hash_hook: Arc::new(Mutex::new(None)),
@@ -438,6 +442,18 @@ impl CheckpointEngine {
     #[doc(hidden)]
     pub fn set_fault_inject_blob_storage_failure(&self, inject: bool) {
         self.fault_inject_blob_storage_failure
+            .store(inject, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn set_fault_inject_blob_storage_failure_partial(&self, inject: bool) {
+        self.fault_inject_blob_storage_failure_partial
+            .store(inject, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn set_fault_inject_metadata_publication_failure(&self, inject: bool) {
+        self.fault_inject_metadata_publication_failure
             .store(inject, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -3835,6 +3851,25 @@ impl CheckpointEngine {
         let blobs_dir = snapshot_dir.join("blobs");
         std::fs::create_dir_all(&blobs_dir)?;
 
+        struct SnapshotCleanupGuard<'a> {
+            snapshot_dir: &'a Path,
+            committed: bool,
+        }
+
+        impl<'a> Drop for SnapshotCleanupGuard<'a> {
+            fn drop(&mut self) {
+                if !self.committed && self.snapshot_dir.exists() {
+                    let _ = std::fs::remove_dir_all(self.snapshot_dir);
+                }
+            }
+        }
+
+        let mut cleanup_guard = SnapshotCleanupGuard {
+            snapshot_dir: &snapshot_dir,
+            committed: false,
+        };
+
+        let is_explicit = explicit_files.is_some();
         let files_to_snapshot = match explicit_files {
             Some(flist) => flist.to_vec(),
             None => Self::collect_workspace_files(root_dir),
@@ -3846,48 +3881,117 @@ impl CheckpointEngine {
         for file_path in &files_to_snapshot {
             // Must be within root_dir
             if !file_path.starts_with(root_dir) {
+                if is_explicit {
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Requested file '{:?}' is outside workspace root '{:?}'",
+                        file_path, root_dir
+                    )));
+                }
                 continue;
             }
 
             let rel_path = match file_path.strip_prefix(root_dir) {
                 Ok(r) => r.to_string_lossy().replace('\\', "/"),
-                Err(_) => continue,
+                Err(_) => {
+                    if is_explicit {
+                        return Err(AetherError::Internal(format!(
+                            "Failed to resolve relative path for '{:?}'",
+                            file_path
+                        )));
+                    }
+                    continue;
+                }
             };
 
             // Sanitize relative path
             if sanitize_relative_path(&rel_path).is_err() {
+                if is_explicit {
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Invalid relative path in requested file: '{}'",
+                        rel_path
+                    )));
+                }
                 continue;
             }
 
-            // Read file bytes
-            if let Ok(bytes) = std::fs::read(file_path) {
-                let hash = Self::sha256_digest(&bytes);
-                let blob_path = blobs_dir.join(&hash);
+            // Read file bytes with fail-closed error propagation
+            let bytes = std::fs::read(file_path).map_err(|e| {
+                AetherError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to read file '{:?}' for checkpoint: {}",
+                        file_path, e
+                    ),
+                ))
+            })?;
 
-                // Content-addressed write: deduplicate if blob already exists
-                if !blob_path.exists() {
-                    if self
-                        .fault_inject_blob_storage_failure
-                        .load(std::sync::atomic::Ordering::SeqCst)
-                    {
-                        // Clean up partial snapshot directory according to recovery contract
-                        let _ = std::fs::remove_dir_all(&snapshot_dir);
-                        return Err(AetherError::Io(std::io::Error::new(
-                            std::io::ErrorKind::StorageFull,
-                            "Checkpoint storage failure writing blob: physical disk full / storage write error",
-                        )));
-                    }
-                    std::fs::write(&blob_path, &bytes).map_err(AetherError::Io)?;
+            let hash = Self::sha256_digest(&bytes);
+            let blob_path = blobs_dir.join(&hash);
+
+            // Content-addressed write: deduplicate if blob already exists
+            if !blob_path.exists() {
+                // Injected storage failure before blob write
+                if self
+                    .fault_inject_blob_storage_failure
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(AetherError::Io(std::io::Error::new(
+                        std::io::ErrorKind::StorageFull,
+                        "Injected storage failure before blob write: physical disk full",
+                    )));
                 }
 
-                file_records.push(CheckpointFileRecord {
-                    root_id: "root-0".into(),
-                    relative_path: rel_path.clone(),
-                    sha256: hash.clone(),
-                    size_bytes: bytes.len() as u64,
-                });
+                // Injected storage failure during blob write (partial write)
+                if self
+                    .fault_inject_blob_storage_failure_partial
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    let partial_len = bytes.len() / 2;
+                    let _ = std::fs::write(&blob_path, &bytes[..partial_len]);
+                    return Err(AetherError::Io(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "Injected storage failure during blob write: partial write / disk full",
+                    )));
+                }
 
-                file_hashes.insert(rel_path, hash);
+                std::fs::write(&blob_path, &bytes).map_err(AetherError::Io)?;
+            }
+
+            // CRITICAL VERIFICATION:
+            // Verify blob length and SHA-256 before publishing manifest
+            let stored_bytes = std::fs::read(&blob_path).map_err(AetherError::Io)?;
+            if stored_bytes.len() != bytes.len() {
+                return Err(AetherError::Internal(format!(
+                    "Blob integrity verification failed for '{}': expected {} bytes, stored {} bytes",
+                    hash, bytes.len(), stored_bytes.len()
+                )));
+            }
+            let stored_hash = Self::sha256_digest(&stored_bytes);
+            if stored_hash != hash {
+                return Err(AetherError::Internal(format!(
+                    "Blob SHA-256 verification failed for '{}': stored content hash '{}' mismatch",
+                    hash, stored_hash
+                )));
+            }
+
+            file_records.push(CheckpointFileRecord {
+                root_id: "root-0".into(),
+                relative_path: rel_path.clone(),
+                sha256: hash.clone(),
+                size_bytes: bytes.len() as u64,
+            });
+
+            file_hashes.insert(rel_path, hash);
+        }
+
+        // For explicitly requested files, verify every requested file has been recorded
+        if let Some(flist) = explicit_files {
+            if file_records.len() != flist.len() {
+                return Err(AetherError::Internal(format!(
+                    "Checkpoint incomplete: requested {} files, but only {} recorded",
+                    flist.len(),
+                    file_records.len()
+                )));
             }
         }
 
@@ -3902,9 +4006,27 @@ impl CheckpointEngine {
             file_hashes,
         };
 
+        if self
+            .fault_inject_metadata_publication_failure
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(AetherError::Io(std::io::Error::other(
+                "Injected checkpoint metadata publication failure",
+            )));
+        }
+
         let meta_file = snapshot_dir.join("metadata.json");
         let json = serde_json::to_string_pretty(&checkpoint)?;
         FilesystemEngine::write_file_atomic(&meta_file, &json)?;
+
+        if !meta_file.is_file() {
+            return Err(AetherError::Internal(
+                "Checkpoint metadata verification failed: metadata.json does not exist after atomic write".into(),
+            ));
+        }
+
+        // Disarm cleanup guard only upon successful metadata publication
+        cleanup_guard.committed = true;
 
         info!(
             "Created workspace checkpoint '{}' with {} files (snapshot: {:?})",
@@ -14810,6 +14932,174 @@ mod tests {
         assert!(
             q_dir.join(stage_name).exists(),
             "Retained artifact must not be unlinked during reconciliation"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_checkpoint_requested_file_read_failure_fails_closed_and_cleans_up() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_chk_fail_read_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let ws_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let existing_file = ws_dir.join("exists.txt");
+        std::fs::write(&existing_file, "valid content").unwrap();
+        let missing_file = ws_dir.join("non_existent.txt");
+
+        let explicit = vec![existing_file, missing_file];
+        let res =
+            engine.create_checkpoint_with_root("fail_read_ckpt", "ws-1", &ws_dir, Some(&explicit));
+
+        assert!(
+            res.is_err(),
+            "Checkpoint creation must fail closed if requested file cannot be read"
+        );
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("Failed to read file"),
+            "Error must describe read failure: {}",
+            err
+        );
+
+        let listed = engine.list_checkpoints().unwrap();
+        assert!(listed.is_empty(), "No incomplete checkpoint must be listed");
+
+        let subdirs: Vec<_> = std::fs::read_dir(&storage_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert!(
+            subdirs.is_empty(),
+            "No orphaned snapshot directories must remain in storage: {:?}",
+            subdirs
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_checkpoint_blob_write_failure_before_write_fails_closed_and_cleans_up() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_chk_fail_blob_pre_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let ws_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let file = ws_dir.join("file.txt");
+        std::fs::write(&file, "test data").unwrap();
+
+        engine.set_fault_inject_blob_storage_failure(true);
+        let res =
+            engine.create_checkpoint_with_root("fail_blob_ckpt", "ws-1", &ws_dir, Some(&[file]));
+
+        assert!(
+            res.is_err(),
+            "Checkpoint creation must fail closed on blob write failure before write"
+        );
+        let listed = engine.list_checkpoints().unwrap();
+        assert!(listed.is_empty(), "No incomplete checkpoint must be listed");
+
+        let subdirs: Vec<_> = std::fs::read_dir(&storage_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert!(
+            subdirs.is_empty(),
+            "No orphaned snapshot directories must remain: {:?}",
+            subdirs
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_checkpoint_blob_write_failure_partial_write_fails_closed_and_cleans_up() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_chk_fail_blob_part_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let ws_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let file = ws_dir.join("file.txt");
+        std::fs::write(&file, "test data for partial blob write failure").unwrap();
+
+        engine.set_fault_inject_blob_storage_failure_partial(true);
+        let res = engine.create_checkpoint_with_root(
+            "fail_blob_part_ckpt",
+            "ws-1",
+            &ws_dir,
+            Some(&[file]),
+        );
+
+        assert!(
+            res.is_err(),
+            "Checkpoint creation must fail closed on partial blob write failure"
+        );
+        let listed = engine.list_checkpoints().unwrap();
+        assert!(listed.is_empty(), "No incomplete checkpoint must be listed");
+
+        let subdirs: Vec<_> = std::fs::read_dir(&storage_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert!(
+            subdirs.is_empty(),
+            "No orphaned snapshot directories must remain: {:?}",
+            subdirs
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_checkpoint_metadata_publication_failure_fails_closed_and_cleans_up() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_chk_fail_meta_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let ws_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let file = ws_dir.join("file.txt");
+        std::fs::write(&file, "test data for metadata failure").unwrap();
+
+        engine.set_fault_inject_metadata_publication_failure(true);
+        let res =
+            engine.create_checkpoint_with_root("fail_meta_ckpt", "ws-1", &ws_dir, Some(&[file]));
+
+        assert!(
+            res.is_err(),
+            "Checkpoint creation must fail closed on metadata publication failure"
+        );
+        let listed = engine.list_checkpoints().unwrap();
+        assert!(listed.is_empty(), "No incomplete checkpoint must be listed");
+
+        let subdirs: Vec<_> = std::fs::read_dir(&storage_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert!(
+            subdirs.is_empty(),
+            "No orphaned snapshot directories must remain: {:?}",
+            subdirs
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);

@@ -549,16 +549,14 @@ pub fn parse_unified_diff_internal(patch: &str) -> Result<(Vec<DiffHunk>, bool),
             }
         } else {
             // Zero-length produced lines (e.g. deletion hunk).
-            // In POSIX/GNU diff, new_start indicates the line after which the change occurs (or 0 if at start).
-            let is_valid_zero = hunk.new_start == lb
-                || (lb == 0 && hunk.new_start == 0)
-                || hunk.new_start == lb + 1;
-            if !is_valid_zero {
+            // In POSIX/GNU diff, new_start indicates the line after which the change occurs (0 if at start).
+            let expected_new_start = lb;
+            if hunk.new_start != expected_new_start {
                 return Err(format!(
-                    "Malformed patch: Hunk {} zero-length new_start ({}) is inconsistent with expected output lines ({})",
+                    "Malformed patch: Hunk {} zero-length new_start ({}) does not match expected output position ({})",
                     idx + 1,
                     hunk.new_start,
-                    lb
+                    expected_new_start
                 ));
             }
         }
@@ -577,7 +575,22 @@ pub fn parse_unified_diff(patch: &str) -> Result<Vec<DiffHunk>, String> {
 
 pub fn apply_unified_diff(original: &str, patch: &str) -> Result<String, String> {
     let (hunks, no_final_newline) = parse_unified_diff_internal(patch)?;
-    let is_crlf = original.contains("\r\n") || (original.is_empty() && patch.contains("\r\n"));
+    apply_diff_hunks_internal(original, &hunks, no_final_newline)
+}
+
+pub fn apply_diff_hunks_internal(
+    original: &str,
+    hunks: &[DiffHunk],
+    no_final_newline: bool,
+) -> Result<String, String> {
+    let is_crlf = original.contains("\r\n")
+        || (original.is_empty()
+            && hunks.iter().any(|h| {
+                h.lines.iter().any(|l| match l {
+                    DiffLine::Insert(s) | DiffLine::Context(s) => s.contains("\r\n"),
+                    _ => false,
+                })
+            }));
     let orig_has_trailing_newline = original.ends_with('\n');
 
     let orig_lines: Vec<&str> = if original.is_empty() {
@@ -642,15 +655,13 @@ pub fn apply_unified_diff(original: &str, patch: &str) -> Result<String, String>
                 ));
             }
         } else {
-            let is_valid_zero = hunk.new_start == lines_before
-                || (lines_before == 0 && hunk.new_start == 0)
-                || hunk.new_start == lines_before + 1;
-            if !is_valid_zero {
+            let expected_new_start = lines_before;
+            if hunk.new_start != expected_new_start {
                 return Err(format!(
-                    "Malformed patch: Hunk {} zero-length new_start ({}) is inconsistent with actual output lines ({})",
+                    "Malformed patch: Hunk {} zero-length new_start ({}) does not match actual output line position ({})",
                     hunk_idx + 1,
                     hunk.new_start,
-                    lines_before
+                    expected_new_start
                 ));
             }
         }
@@ -1684,6 +1695,154 @@ mod tests {
             stored_checkpoints.is_empty(),
             "No incomplete checkpoint must be treated as valid or listed in metadata"
         );
+
+        // Assert that no incomplete snapshot directory is left behind in storage
+        let storage_dir = temp.path().join(".aether").join("checkpoints");
+        if storage_dir.exists() {
+            let subdirs: Vec<_> = std::fs::read_dir(&storage_dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            assert!(
+                subdirs.is_empty(),
+                "No orphaned snapshot directory must remain in storage: {:?}",
+                subdirs
+            );
+        }
+    }
+
+    #[test]
+    fn test_ai_safety_genuine_checkpoint_partial_blob_write_failure_aborts_without_mutation() {
+        let (temp, session, ckpt) = setup_test_workspace();
+        let file_path = temp.path().join("partial_blob_target.rs");
+        let original_bytes = b"pub fn critical_computation() -> u64 { 42 }\n";
+        std::fs::write(&file_path, original_bytes).unwrap();
+        let hash = compute_sha256(original_bytes);
+
+        // Arm failure during blob writing (after partial write / truncated bytes)
+        ckpt.set_fault_inject_blob_storage_failure_partial(true);
+
+        let proposal = StructuredProposal {
+            proposal_id: "prop-partial-blob-fail".into(),
+            workspace_id: session.workspace_id(),
+            relative_path: "partial_blob_target.rs".into(),
+            operation: "replace_file".into(),
+            base_hash: hash,
+            unified_diff: "".into(),
+            proposed_content: "pub fn critical_computation() -> u64 { 999 }\n".into(),
+            insertion_line: None,
+        };
+
+        let res = execute_proposal_internal(&session, Some(&ckpt), &proposal);
+        assert!(
+            res.is_err(),
+            "Proposal must fail closed on partial blob write failure"
+        );
+
+        // Assert that target file remains untouched
+        assert_eq!(
+            std::fs::read(&file_path).unwrap(),
+            original_bytes,
+            "Target file must remain byte-for-byte untouched"
+        );
+
+        // Assert no staging artifacts remain
+        for entry in std::fs::read_dir(temp.path()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with(".aether-stage-"),
+                "No staging artifacts should remain: {}",
+                name
+            );
+        }
+
+        // Assert no incomplete checkpoint is registered
+        assert!(
+            ckpt.list_checkpoints().unwrap().is_empty(),
+            "No incomplete checkpoint must be listed"
+        );
+
+        // Assert no orphaned snapshot directory remains in storage
+        let storage_dir = temp.path().join(".aether").join("checkpoints");
+        if storage_dir.exists() {
+            let subdirs: Vec<_> = std::fs::read_dir(&storage_dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            assert!(
+                subdirs.is_empty(),
+                "No orphaned snapshot directory must remain in storage: {:?}",
+                subdirs
+            );
+        }
+    }
+
+    #[test]
+    fn test_ai_safety_genuine_checkpoint_metadata_publication_failure_aborts_without_mutation() {
+        let (temp, session, ckpt) = setup_test_workspace();
+        let file_path = temp.path().join("metadata_fail_target.rs");
+        let original_bytes = b"pub fn durable_transaction() -> bool { true }\n";
+        std::fs::write(&file_path, original_bytes).unwrap();
+        let hash = compute_sha256(original_bytes);
+
+        // Arm failure at metadata publication
+        ckpt.set_fault_inject_metadata_publication_failure(true);
+
+        let proposal = StructuredProposal {
+            proposal_id: "prop-meta-pub-fail".into(),
+            workspace_id: session.workspace_id(),
+            relative_path: "metadata_fail_target.rs".into(),
+            operation: "replace_file".into(),
+            base_hash: hash,
+            unified_diff: "".into(),
+            proposed_content: "pub fn durable_transaction() -> bool { false }\n".into(),
+            insertion_line: None,
+        };
+
+        let res = execute_proposal_internal(&session, Some(&ckpt), &proposal);
+        assert!(
+            res.is_err(),
+            "Proposal must fail closed on checkpoint metadata publication failure"
+        );
+
+        // Target file untouched
+        assert_eq!(
+            std::fs::read(&file_path).unwrap(),
+            original_bytes,
+            "Target file must remain byte-for-byte untouched"
+        );
+
+        // Zero staging artifacts
+        for entry in std::fs::read_dir(temp.path()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with(".aether-stage-"),
+                "No staging artifacts should remain: {}",
+                name
+            );
+        }
+
+        // Zero incomplete checkpoints listed
+        assert!(
+            ckpt.list_checkpoints().unwrap().is_empty(),
+            "No incomplete checkpoint must be listed"
+        );
+
+        // Zero orphaned snapshot directories left behind
+        let storage_dir = temp.path().join(".aether").join("checkpoints");
+        if storage_dir.exists() {
+            let subdirs: Vec<_> = std::fs::read_dir(&storage_dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            assert!(
+                subdirs.is_empty(),
+                "No orphaned snapshot directory must remain in storage: {:?}",
+                subdirs
+            );
+        }
     }
 
     #[test]
@@ -1768,6 +1927,82 @@ mod tests {
         assert_eq!(
             crlf_res, "line 1\r\nline 2 edited\r\nline 3\r\n",
             "CRLF preservation failed"
+        );
+    }
+
+    #[test]
+    fn test_diff_off_by_one_deletion_coordinate_rejected() {
+        let base_content = "line 1\nline 2\nline 3\n";
+
+        // Off-by-one deletion header: claims +2,0 when deleting line 2, but correct new-side coordinate is +1,0
+        let off_by_one_patch = "@@ -2,1 +2,0 @@\n-line 2\n";
+
+        // Must be rejected by parsing
+        let parse_res = parse_unified_diff(off_by_one_patch);
+        assert!(
+            parse_res.is_err(),
+            "parse_unified_diff must reject off-by-one deletion coordinate (+2,0)"
+        );
+        let parse_err = parse_res.unwrap_err();
+        assert!(
+            parse_err
+                .contains("zero-length new_start (2) does not match expected output position (1)"),
+            "Parse error must report coordinate mismatch: {}",
+            parse_err
+        );
+
+        // Must be rejected by application via apply_unified_diff
+        let apply_res = apply_unified_diff(base_content, off_by_one_patch);
+        assert!(
+            apply_res.is_err(),
+            "apply_unified_diff must reject off-by-one deletion coordinate (+2,0)"
+        );
+        let apply_err = apply_res.unwrap_err();
+        assert!(
+            apply_err.contains("zero-length new_start (2) does not match"),
+            "Apply error must report coordinate mismatch: {}",
+            apply_err
+        );
+
+        // Also test apply_diff_hunks_internal directly to verify application runtime coordinate rejection
+        let off_by_one_hunk = DiffHunk {
+            old_start: 2,
+            old_count: 1,
+            new_start: 2, // Off-by-one! Correct coordinate is 1
+            new_count: 0,
+            lines: vec![DiffLine::Delete("line 2".to_string())],
+        };
+        let hunk_apply_res = apply_diff_hunks_internal(base_content, &[off_by_one_hunk], false);
+        assert!(
+            hunk_apply_res.is_err(),
+            "apply_diff_hunks_internal runtime check must reject off-by-one deletion coordinate"
+        );
+        let hunk_apply_err = hunk_apply_res.unwrap_err();
+        assert!(
+            hunk_apply_err.contains(
+                "zero-length new_start (2) does not match actual output line position (1)"
+            ),
+            "Runtime hunk apply error must report actual output position mismatch: {}",
+            hunk_apply_err
+        );
+
+        // Correct deletion header (+1,0) succeeds in both parsing and application
+        let correct_patch = "@@ -2,1 +1,0 @@\n-line 2\n";
+        let correct_parse = parse_unified_diff(correct_patch);
+        assert!(
+            correct_parse.is_ok(),
+            "Correct deletion header must parse successfully"
+        );
+
+        let correct_apply = apply_unified_diff(base_content, correct_patch);
+        assert!(
+            correct_apply.is_ok(),
+            "Correct deletion header must apply successfully"
+        );
+        assert_eq!(
+            correct_apply.unwrap(),
+            "line 1\nline 3\n",
+            "Correct deletion must produce expected output"
         );
     }
 }

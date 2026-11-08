@@ -255,6 +255,25 @@ pub fn set_inject_unreadable_dir(path: Option<PathBuf>) {
     });
 }
 
+fn read_dir_with_seam(dir: &Path) -> std::io::Result<std::fs::ReadDir> {
+    let is_injected_unreadable = INJECT_UNREADABLE_DIR.with(|cell| {
+        if let Some(ref target) = *cell.borrow() {
+            dir == target || dir.ends_with(target)
+        } else {
+            false
+        }
+    });
+
+    if is_injected_unreadable {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("Injected OS permission denied reading directory {:?}", dir),
+        ));
+    }
+
+    std::fs::read_dir(dir)
+}
+
 pub fn execute_workspace_search(
     root: &Path,
     query: &str,
@@ -330,20 +349,15 @@ pub fn execute_workspace_search(
     visited_dirs.insert(canonical_root.clone());
 
     while let Some(dir) = stack.pop() {
-        let is_injected_unreadable = INJECT_UNREADABLE_DIR.with(|cell| {
-            if let Some(ref target) = *cell.borrow() {
-                &dir == target || dir.ends_with(target)
-            } else {
-                false
-            }
-        });
-
-        let entries = if is_injected_unreadable {
-            continue; // Emulate genuine OS permission denied error on unreadable directory
-        } else {
-            match std::fs::read_dir(&dir) {
-                Ok(e) => e,
-                Err(_) => continue, // Safely handle unreadable directories
+        let entries = match read_dir_with_seam(&dir) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    "Skipping unreadable or inaccessible directory {:?}: {}",
+                    dir,
+                    e
+                );
+                continue;
             }
         };
 
