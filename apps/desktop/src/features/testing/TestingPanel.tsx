@@ -12,7 +12,35 @@ import {
 } from "lucide-react";
 import { TauriService } from "../../services/tauri";
 
-interface TestSuite {
+export interface SupportedSuiteConfig {
+  id: string;
+  name: string;
+  crate: string;
+  description: string;
+}
+
+export const SUPPORTED_TEST_SUITES: readonly SupportedSuiteConfig[] = [
+  {
+    id: "checkpoint-engine",
+    name: "Checkpoint Engine Core",
+    crate: "checkpoint-engine",
+    description: "NTFS dual-handle mutual exclusion, rollback atomic verification, and CHK-210.",
+  },
+  {
+    id: "filesystem-engine",
+    name: "Filesystem Engine",
+    crate: "filesystem-engine",
+    description: "Boundary containment, symlink escape defense, and path canonicalization.",
+  },
+  {
+    id: "terminal-manager",
+    name: "ConPTY Terminal Manager",
+    crate: "terminal-manager",
+    description: "Native Windows ConPTY process lifecycle and multi-session subscriptions.",
+  },
+] as const;
+
+export interface TestSuite {
   id: string;
   name: string;
   crate: string;
@@ -21,7 +49,7 @@ interface TestSuite {
   passed: number;
   failed: number;
   ignored: number;
-  durationSeconds?: number;
+  durationSeconds: number | null;
   stdout?: string;
   testCases: Array<{ name: string; status: "ok" | "failed" | "ignored" }>;
 }
@@ -33,52 +61,17 @@ export const TestingPanel: React.FC = () => {
     "checkpoint-engine": true,
   });
 
-  const [suites, setSuites] = useState<TestSuite[]>([
-    {
-      id: "checkpoint-engine",
-      name: "Checkpoint Engine Core",
-      crate: "checkpoint-engine",
-      description: "NTFS dual-handle mutual exclusion, rollback atomic verification, and CHK-210.",
-      status: "passed",
-      passed: 211,
-      failed: 0,
-      ignored: 0,
-      durationSeconds: 0.83,
-      testCases: [
-        { name: "test_chk_210_replace_destination_while_exclusive_handle_held_preserves_staging_without_loss", status: "ok" },
-        { name: "test_chk_210b_destination_identity_mismatch_preserves_staging_and_blocks_recovery", status: "ok" },
-        { name: "test_chk_220_empirical_windows_sharing_matrix", status: "ok" },
-        { name: "test_chk_209_replace_destination_after_pathname_checks_before_exclusive_open_preserves_staging", status: "ok" },
-        { name: "test_chk_212_destination_and_staging_verified_identical_under_exclusive_handle", status: "ok" },
-        { name: "test_chk_021_mandatory_safety_snapshot_failure_aborts_without_mutations", status: "ok" },
-        { name: "test_chk_023_deterministic_toctou_mutation_between_validation_and_replacement_aborted", status: "ok" },
-        { name: "test_checkpoint_path_traversal_and_tamper_defense", status: "ok" },
-        { name: "test_checkpoint_binary_and_invalid_utf8_byte_preservation", status: "ok" },
-      ],
-    },
-    {
-      id: "filesystem-engine",
-      name: "Filesystem Engine",
-      crate: "filesystem-engine",
-      description: "Boundary containment, symlink escape defense, and path canonicalization.",
+  const [suites, setSuites] = useState<TestSuite[]>(() =>
+    SUPPORTED_TEST_SUITES.map((cfg) => ({
+      ...cfg,
       status: "idle",
       passed: 0,
       failed: 0,
       ignored: 0,
+      durationSeconds: null,
       testCases: [],
-    },
-    {
-      id: "terminal-manager",
-      name: "ConPTY Terminal Manager",
-      crate: "terminal-manager",
-      description: "Native Windows ConPTY process lifecycle and multi-session subscriptions.",
-      status: "idle",
-      passed: 0,
-      failed: 0,
-      ignored: 0,
-      testCases: [],
-    },
-  ]);
+    }))
+  );
 
   const parseCargoTestOutput = (stdout: string) => {
     const lines = stdout.split("\n");
@@ -86,7 +79,7 @@ export const TestingPanel: React.FC = () => {
     let passed = 0;
     let failed = 0;
     let ignored = 0;
-    let durationSeconds: number | undefined;
+    let durationSeconds: number | null = null;
 
     for (const line of lines) {
       const matchTest = line.match(/^test\s+([^\s]+)\s+\.\.\.\s+(ok|FAILED|ignored)/);
@@ -96,7 +89,9 @@ export const TestingPanel: React.FC = () => {
         testCases.push({ name: matchTest[1], status });
       }
 
-      const matchResult = line.match(/test result:\s+(ok|FAILED)\.\s+(\d+)\s+passed;\s+(\d+)\s+failed;\s+(\d+)\s+ignored.*?finished in\s+([\d\.]+)s/);
+      const matchResult = line.match(
+        /test result:\s+(ok|FAILED)\.\s+(\d+)\s+passed;\s+(\d+)\s+failed;\s+(\d+)\s+ignored.*?finished in\s+([\d\.]+)s/
+      );
       if (matchResult) {
         passed = parseInt(matchResult[2], 10);
         failed = parseInt(matchResult[3], 10);
@@ -112,8 +107,22 @@ export const TestingPanel: React.FC = () => {
     const target = suites.find((s) => s.id === suiteId);
     if (!target) return;
 
+    // Clear old test cases immediately upon start of run
     setSuites((prev) =>
-      prev.map((s) => (s.id === suiteId ? { ...s, status: "running" } : s))
+      prev.map((s) =>
+        s.id === suiteId
+          ? {
+              ...s,
+              status: "running",
+              passed: 0,
+              failed: 0,
+              ignored: 0,
+              durationSeconds: null,
+              testCases: [],
+              stdout: undefined,
+            }
+          : s
+      )
     );
 
     try {
@@ -121,19 +130,26 @@ export const TestingPanel: React.FC = () => {
       const rawOut = (res.stdout || "") + "\n" + (res.stderr || "");
       const parsed = parseCargoTestOutput(rawOut);
 
+      // Verify exit code, process success, AND parsed results
+      const hasPassed = Boolean(
+        res.success &&
+        res.exit_code === 0 &&
+        parsed.failed === 0 &&
+        (parsed.passed > 0 || parsed.testCases.length > 0)
+      );
+
       setSuites((prev) =>
         prev.map((s) => {
           if (s.id === suiteId) {
-            const hasPassed = res.success && parsed.failed === 0;
             return {
               ...s,
               status: hasPassed ? "passed" : "failed",
-              passed: parsed.passed || (hasPassed ? parsed.testCases.length : 0),
-              failed: parsed.failed,
+              passed: parsed.passed,
+              failed: parsed.failed + (!hasPassed && parsed.failed === 0 ? 1 : 0),
               ignored: parsed.ignored,
-              durationSeconds: parsed.durationSeconds || (res.duration_ms ? res.duration_ms / 1000 : 0.5),
+              durationSeconds: parsed.durationSeconds, // NEVER fallback to 0.5 or simulated numbers
               stdout: rawOut,
-              testCases: parsed.testCases.length > 0 ? parsed.testCases : s.testCases,
+              testCases: parsed.testCases,
             };
           }
           return s;
@@ -141,14 +157,17 @@ export const TestingPanel: React.FC = () => {
       );
       setActiveSuiteStdout(rawOut);
     } catch (err: any) {
-      const errMsg = `Test execution error: ${err}`;
+      const errMsg = `Test execution error: ${err?.message || err}`;
       setSuites((prev) =>
         prev.map((s) =>
           s.id === suiteId
             ? {
                 ...s,
                 status: "failed",
+                failed: 1,
+                durationSeconds: null,
                 stdout: errMsg,
+                testCases: [],
               }
             : s
         )
@@ -159,10 +178,17 @@ export const TestingPanel: React.FC = () => {
 
   const handleRunAll = async () => {
     setIsRunningAll(true);
-    for (const suite of suites) {
-      await runSuite(suite.id);
+    try {
+      for (const suite of suites) {
+        try {
+          await runSuite(suite.id);
+        } catch {
+          // Individual suite error handled inside runSuite; continue to next suite
+        }
+      }
+    } finally {
+      setIsRunningAll(false);
     }
-    setIsRunningAll(false);
   };
 
   const toggleSuiteCollapse = (suiteId: string) => {
@@ -304,7 +330,7 @@ export const TestingPanel: React.FC = () => {
                   </span>
                   {suite.status === "passed" && (
                     <span style={{ fontSize: 10, color: "var(--success)", fontWeight: 600 }}>
-                      ({suite.passed} passed{suite.durationSeconds ? ` in ${suite.durationSeconds}s` : ""})
+                      ({suite.passed} passed{suite.durationSeconds != null ? ` in ${suite.durationSeconds}s` : ""})
                     </span>
                   )}
                   {suite.status === "failed" && (

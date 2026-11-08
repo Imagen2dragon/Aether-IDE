@@ -329,6 +329,229 @@ pub async fn ai_cancel_stream(app: AppHandle, request_id: String) -> Result<bool
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffLine {
+    Context(String),
+    Delete(String),
+    Insert(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct DiffHunk {
+    pub old_start: usize,
+    pub old_count: usize,
+    pub new_start: usize,
+    pub new_count: usize,
+    pub lines: Vec<DiffLine>,
+}
+
+pub fn parse_unified_diff(patch: &str) -> Result<Vec<DiffHunk>, String> {
+    let re = regex::Regex::new(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@")
+        .map_err(|e| e.to_string())?;
+    let mut hunks = Vec::new();
+    let mut current_hunk: Option<DiffHunk> = None;
+    let mut has_seen_hunk_header = false;
+
+    for raw_line in patch.lines() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+
+        if let Some(caps) = re.captures(line) {
+            has_seen_hunk_header = true;
+            if let Some(h) = current_hunk.take() {
+                hunks.push(h);
+            }
+
+            let old_start: usize = caps[1]
+                .parse()
+                .map_err(|_| "Invalid old_start in hunk header".to_string())?;
+            let old_count: usize = caps
+                .get(2)
+                .map_or(Ok(1), |m| m.as_str().parse())
+                .map_err(|_| "Invalid old_count in hunk header".to_string())?;
+            let new_start: usize = caps[3]
+                .parse()
+                .map_err(|_| "Invalid new_start in hunk header".to_string())?;
+            let new_count: usize = caps
+                .get(4)
+                .map_or(Ok(1), |m| m.as_str().parse())
+                .map_err(|_| "Invalid new_count in hunk header".to_string())?;
+
+            current_hunk = Some(DiffHunk {
+                old_start,
+                old_count,
+                new_start,
+                new_count,
+                lines: Vec::new(),
+            });
+            continue;
+        }
+
+        if let Some(ref mut h) = current_hunk {
+            if let Some(stripped) = line.strip_prefix('+') {
+                h.lines.push(DiffLine::Insert(stripped.to_string()));
+            } else if let Some(stripped) = line.strip_prefix('-') {
+                h.lines.push(DiffLine::Delete(stripped.to_string()));
+            } else if let Some(stripped) = line.strip_prefix(' ') {
+                h.lines.push(DiffLine::Context(stripped.to_string()));
+            } else if line.is_empty() {
+                h.lines.push(DiffLine::Context(String::new()));
+            } else if line.starts_with('\\') {
+                continue;
+            } else {
+                return Err(format!(
+                    "Malformed patch line: '{}'. Must start with '+', '-', or ' '",
+                    line
+                ));
+            }
+        } else {
+            if line.starts_with("---")
+                || line.starts_with("+++")
+                || line.starts_with("diff ")
+                || line.starts_with("index ")
+            {
+                continue;
+            }
+            if !line.trim().is_empty() {
+                return Err(format!(
+                    "Malformed patch: Unexpected line before hunk header: '{}'",
+                    line
+                ));
+            }
+        }
+    }
+
+    if let Some(h) = current_hunk {
+        hunks.push(h);
+    }
+
+    if !has_seen_hunk_header || hunks.is_empty() {
+        return Err("Malformed patch: No unified diff hunk headers ('@@ -start,count +start,count @@') found in patch content".into());
+    }
+
+    let mut last_old_end = 0;
+    for (idx, hunk) in hunks.iter().enumerate() {
+        if idx > 0 && hunk.old_start < last_old_end {
+            return Err(format!(
+                "Ambiguous or overlapping hunks detected: hunk {} starts at line {} before previous hunk end {}",
+                idx + 1,
+                hunk.old_start,
+                last_old_end
+            ));
+        }
+        let hunk_end = if hunk.old_count == 0 {
+            hunk.old_start
+        } else {
+            hunk.old_start + hunk.old_count
+        };
+        last_old_end = hunk_end;
+    }
+
+    Ok(hunks)
+}
+
+pub fn apply_unified_diff(original: &str, patch: &str) -> Result<String, String> {
+    let hunks = parse_unified_diff(patch)?;
+    let is_crlf = original.contains("\r\n");
+    let has_trailing_newline = original.ends_with('\n');
+
+    let orig_lines: Vec<&str> = original
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
+    let orig_len =
+        if has_trailing_newline && !orig_lines.is_empty() && orig_lines.last() == Some(&"") {
+            orig_lines.len() - 1
+        } else {
+            orig_lines.len()
+        };
+    let active_orig = &orig_lines[..orig_len];
+
+    let mut output_lines: Vec<String> = Vec::new();
+    let mut curr_orig_idx: usize = 0;
+
+    for hunk in hunks {
+        let target_idx = if hunk.old_start == 0 {
+            0
+        } else {
+            hunk.old_start.saturating_sub(1)
+        };
+
+        if target_idx < curr_orig_idx {
+            return Err("Hunk overlaps with previously applied lines".into());
+        }
+
+        if target_idx > active_orig.len() {
+            return Err(format!(
+                "Hunk start line {} exceeds original file length {}",
+                hunk.old_start,
+                active_orig.len()
+            ));
+        }
+
+        while curr_orig_idx < target_idx {
+            output_lines.push(active_orig[curr_orig_idx].to_string());
+            curr_orig_idx += 1;
+        }
+
+        for line in hunk.lines {
+            match line {
+                DiffLine::Context(expected) => {
+                    if curr_orig_idx >= active_orig.len() {
+                        return Err(format!(
+                            "Patch context mismatch: expected '{}' at line {}, but reached end of file",
+                            expected,
+                            curr_orig_idx + 1
+                        ));
+                    }
+                    if active_orig[curr_orig_idx] != expected {
+                        return Err(format!(
+                            "Patch context mismatch at line {}: expected '{}', found '{}'",
+                            curr_orig_idx + 1,
+                            expected,
+                            active_orig[curr_orig_idx]
+                        ));
+                    }
+                    output_lines.push(expected);
+                    curr_orig_idx += 1;
+                }
+                DiffLine::Delete(expected) => {
+                    if curr_orig_idx >= active_orig.len() {
+                        return Err(format!(
+                            "Patch delete mismatch: expected '{}' at line {}, but reached end of file",
+                            expected,
+                            curr_orig_idx + 1
+                        ));
+                    }
+                    if active_orig[curr_orig_idx] != expected {
+                        return Err(format!(
+                            "Patch delete mismatch at line {}: expected '{}', found '{}'",
+                            curr_orig_idx + 1,
+                            expected,
+                            active_orig[curr_orig_idx]
+                        ));
+                    }
+                    curr_orig_idx += 1;
+                }
+                DiffLine::Insert(added) => {
+                    output_lines.push(added);
+                }
+            }
+        }
+    }
+
+    while curr_orig_idx < active_orig.len() {
+        output_lines.push(active_orig[curr_orig_idx].to_string());
+        curr_orig_idx += 1;
+    }
+
+    let line_sep = if is_crlf { "\r\n" } else { "\n" };
+    let mut result = output_lines.join(line_sep);
+    if has_trailing_newline {
+        result.push_str(line_sep);
+    }
+    Ok(result)
+}
+
 #[tauri::command]
 pub async fn ai_preview_proposal(
     app: AppHandle,
@@ -355,6 +578,18 @@ pub async fn ai_preview_proposal(
         false
     };
 
+    let proposed_preview_content = if proposal.operation == "apply_patch" {
+        if !full_path.exists() {
+            return Err(format!(
+                "Cannot preview patch on non-existent file '{}'. Use create_file instead.",
+                rel_path
+            ));
+        }
+        apply_unified_diff(&original_content, &proposal.proposed_content)?
+    } else {
+        proposal.proposed_content.clone()
+    };
+
     Ok(ProposalReviewPreview {
         proposal_id: proposal.proposal_id,
         relative_path: rel_path,
@@ -363,16 +598,17 @@ pub async fn ai_preview_proposal(
         current_disk_hash,
         has_conflict,
         original_content,
-        proposed_content: proposal.proposed_content,
+        proposed_content: proposed_preview_content,
         unified_diff: proposal.unified_diff,
     })
 }
 
-#[tauri::command]
-pub async fn ai_apply_proposal(
-    app: AppHandle,
-    proposal: StructuredProposal,
-    _force: Option<bool>,
+/// Core production execution logic for applying AI proposals.
+/// Shared across Tauri command dispatch and real adversarial integration verification.
+pub fn execute_proposal_internal(
+    ws: &crate::workspace_bridge::WorkspaceSession,
+    ckpt_engine: Option<&checkpoint_engine::CheckpointEngine>,
+    proposal: &StructuredProposal,
 ) -> Result<ApplyProposalResult, String> {
     // 0. Operation contract validation
     let valid_ops = [
@@ -390,11 +626,8 @@ pub async fn ai_apply_proposal(
         ));
     }
 
-    let ws_arc = app.state::<SharedWorkspace>();
-    let ws = ws_arc.lock();
     let (cap, root, rel_path) = ws.resolve_in_workspace(&proposal.relative_path)?;
     let ws_id = ws.workspace_id();
-    drop(ws);
 
     let full_path = root.join(&rel_path);
     let target_exists = full_path.exists();
@@ -440,30 +673,35 @@ pub async fn ai_apply_proposal(
     // 2. Mandatory Pre-Edit Checkpoint for modifications to existing files (MANDATORY FAIL-CLOSED)
     let mut backup_ckpt_id = None;
     if target_exists {
-        let ckpt_engine_arc = app.state::<SharedCheckpointEngine>();
-        let ckpt_engine = ckpt_engine_arc.lock();
-        let desc = format!("Pre-AI edit backup for {}", rel_path);
-        let ckpt = ckpt_engine
-            .create_checkpoint_with_root(
-                &desc,
-                &ws_id,
-                &root,
-                Some(std::slice::from_ref(&full_path)),
-            )
-            .map_err(|e| {
-                format!(
-                    "Mandatory pre-edit checkpoint failed for '{}': {}. Write aborted to prevent unrecoverable data loss.",
-                    rel_path, e
+        if let Some(engine) = ckpt_engine {
+            let desc = format!("Pre-AI edit backup for {}", rel_path);
+            let ckpt = engine
+                .create_checkpoint_with_root(
+                    &desc,
+                    &ws_id,
+                    &root,
+                    Some(std::slice::from_ref(&full_path)),
                 )
-            })?;
-        backup_ckpt_id = Some(ckpt.checkpoint_id);
+                .map_err(|e| {
+                    format!(
+                        "Mandatory pre-edit checkpoint failed for '{}': {}. Write aborted to prevent unrecoverable data loss.",
+                        rel_path, e
+                    )
+                })?;
+            backup_ckpt_id = Some(ckpt.checkpoint_id);
+        } else {
+            return Err(format!(
+                "Mandatory pre-edit checkpoint failed for '{}': Checkpoint engine not available. Write aborted.",
+                rel_path
+            ));
+        }
     }
 
     // 3. Compute final content based on operation
     let final_content = match proposal.operation.as_str() {
         "delete_file" => {
             cap.delete_file_conditional(&rel_path, &proposal.base_hash)
-                .map_err(|e| format!("Failed to delete file '{}': {}", rel_path, e))?;
+                .map_err(|e| format!("Conditional deletion failed for '{}': {}", rel_path, e))?;
             return Ok(ApplyProposalResult {
                 success: true,
                 relative_path: rel_path.clone(),
@@ -471,6 +709,19 @@ pub async fn ai_apply_proposal(
                 message: format!("File '{}' safely deleted", rel_path),
                 backup_checkpoint_id: backup_ckpt_id,
             });
+        }
+        "apply_patch" => {
+            if !target_exists {
+                return Err(format!(
+                    "Cannot apply patch to non-existent file '{}'. Use create_file instead.",
+                    rel_path
+                ));
+            }
+            let original_bytes = std::fs::read(&full_path)
+                .map_err(|e| format!("Failed to read target file '{:?}': {}", full_path, e))?;
+            let original_str = String::from_utf8(original_bytes)
+                .map_err(|e| format!("Target file '{}' is not valid UTF-8: {}", rel_path, e))?;
+            apply_unified_diff(&original_str, &proposal.proposed_content)?
         }
         "insert_at" => {
             let original_bytes = std::fs::read(&full_path).map_err(|e| {
@@ -506,13 +757,24 @@ pub async fn ai_apply_proposal(
             }
             proposal.proposed_content.clone()
         }
-        "apply_patch" => proposal.proposed_content.clone(),
         _ => proposal.proposed_content.clone(),
     };
 
-    // 4. Atomically write proposed content via capability
-    cap.write_file_atomic(&rel_path, &final_content)
-        .map_err(|e| format!("Atomic write failed for '{}': {}", rel_path, e))?;
+    // 4. Atomically & conditionally write proposed content via capability
+    // Eliminates TOCTOU race: replace_file_bytes_conditional verifies identity & hash at commit point.
+    let expected_hash_opt = if target_exists {
+        Some(proposal.base_hash.as_str())
+    } else {
+        None
+    };
+
+    cap.replace_file_bytes_conditional(&rel_path, final_content.as_bytes(), expected_hash_opt, None)
+        .map_err(|e| {
+            format!(
+                "Conditional replacement failed for '{}': {}. File identity or hash mismatch at point of write.",
+                rel_path, e
+            )
+        })?;
 
     // 5. Verify resulting written file
     let final_bytes = std::fs::read(&full_path)
@@ -531,6 +793,19 @@ pub async fn ai_apply_proposal(
         message: format!("Changes safely applied to {}", rel_path),
         backup_checkpoint_id: backup_ckpt_id,
     })
+}
+
+#[tauri::command]
+pub async fn ai_apply_proposal(
+    app: AppHandle,
+    proposal: StructuredProposal,
+    _force: Option<bool>,
+) -> Result<ApplyProposalResult, String> {
+    let ws_arc = app.state::<SharedWorkspace>();
+    let ws = ws_arc.lock();
+    let ckpt_engine_arc = app.state::<SharedCheckpointEngine>();
+    let ckpt_engine = ckpt_engine_arc.lock();
+    execute_proposal_internal(&ws, Some(&ckpt_engine), &proposal)
 }
 
 #[cfg(test)]
@@ -652,132 +927,302 @@ mod tests {
         assert_eq!(registry.entry_count(), 0);
     }
 
+    use crate::workspace_bridge::WorkspaceSession;
+    use checkpoint_engine::CheckpointEngine;
+
+    fn setup_test_workspace() -> (tempfile::TempDir, WorkspaceSession, CheckpointEngine) {
+        let temp = tempfile::tempdir().unwrap();
+        let session = WorkspaceSession::new(temp.path().join(".aether-data"));
+        session.set_single_root(temp.path().to_path_buf()).unwrap();
+
+        let ckpt_engine = CheckpointEngine::new(temp.path().join(".quarantine"));
+        (temp, session, ckpt_engine)
+    }
+
     #[test]
     fn test_ai_safety_empty_base_hash_rejected_for_existing_file() {
+        let (temp, session, ckpt) = setup_test_workspace();
+        let file_path = temp.path().join("main.rs");
+        std::fs::write(&file_path, "initial content").unwrap();
+
         let proposal = StructuredProposal {
-            proposal_id: "prop-1".into(),
-            workspace_id: "ws-1".into(),
-            relative_path: "src/main.rs".into(),
+            proposal_id: "prop-empty-hash".into(),
+            workspace_id: session.workspace_id(),
+            relative_path: "main.rs".into(),
             operation: "replace_file".into(),
             base_hash: "".into(),
             unified_diff: "".into(),
-            proposed_content: "fn main() {}".into(),
+            proposed_content: "replaced content".into(),
             insertion_line: None,
         };
-        let target_exists = true;
-        let res: Result<(), String> = if target_exists && proposal.base_hash.trim().is_empty() {
-            Err(
-                "Safety Violation: Proposal base_hash cannot be empty when modifying existing file"
-                    .into(),
-            )
-        } else {
-            Ok(())
-        };
-        assert!(
-            res.is_err(),
-            "Empty base hash on existing file must be rejected"
+
+        let res = execute_proposal_internal(&session, Some(&ckpt), &proposal);
+        assert!(res.is_err(), "Empty base hash must be rejected");
+        assert!(res
+            .unwrap_err()
+            .contains("Safety Violation: Proposal base_hash cannot be empty"));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "initial content"
         );
     }
 
     #[test]
-    fn test_ai_safety_stale_base_hash_and_external_modification_rejected() {
-        let initial_bytes = b"fn main() { println!(\"v1\"); }";
-        let initial_hash = compute_sha256(initial_bytes);
-
-        let external_edit_bytes = b"fn main() { println!(\"v2-external\"); }";
-        let external_hash = compute_sha256(external_edit_bytes);
-
-        assert_ne!(initial_hash, external_hash);
+    fn test_ai_safety_stale_hash_rejected() {
+        let (temp, session, ckpt) = setup_test_workspace();
+        let file_path = temp.path().join("main.rs");
+        std::fs::write(&file_path, "v1 content").unwrap();
 
         let proposal = StructuredProposal {
-            proposal_id: "prop-conflict".into(),
-            workspace_id: "ws-1".into(),
-            relative_path: "src/main.rs".into(),
+            proposal_id: "prop-stale".into(),
+            workspace_id: session.workspace_id(),
+            relative_path: "main.rs".into(),
             operation: "replace_file".into(),
-            base_hash: initial_hash.clone(),
+            base_hash: "0000000000000000000000000000000000000000000000000000000000000000".into(),
             unified_diff: "".into(),
-            proposed_content: "fn main() { println!(\"v3-ai\"); }".into(),
+            proposed_content: "v2-replaced".into(),
             insertion_line: None,
         };
 
-        let conflict_detected = proposal.base_hash != external_hash;
-        assert!(
-            conflict_detected,
-            "External modification must trigger conflict detection"
+        let res = execute_proposal_internal(&session, Some(&ckpt), &proposal);
+        assert!(res.is_err(), "Stale hash must trigger conflict error");
+        assert!(res.unwrap_err().contains("Conflict detected"));
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "v1 content");
+    }
+
+    #[test]
+    fn test_ai_safety_checkpoint_failure_prevents_writes() {
+        let (temp, session, _ckpt) = setup_test_workspace();
+        let file_path = temp.path().join("main.rs");
+        std::fs::write(&file_path, "original before ckpt").unwrap();
+        let hash = compute_sha256(b"original before ckpt");
+
+        let proposal = StructuredProposal {
+            proposal_id: "prop-no-ckpt".into(),
+            workspace_id: session.workspace_id(),
+            relative_path: "main.rs".into(),
+            operation: "replace_file".into(),
+            base_hash: hash,
+            unified_diff: "".into(),
+            proposed_content: "should not be written".into(),
+            insertion_line: None,
+        };
+
+        // Pass None for ckpt_engine to simulate checkpoint backend failure/unavailability
+        let res = execute_proposal_internal(&session, None, &proposal);
+        assert!(res.is_err(), "Checkpoint failure must abort application");
+        assert!(res
+            .unwrap_err()
+            .contains("Mandatory pre-edit checkpoint failed"));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "original before ckpt"
         );
     }
 
     #[test]
-    fn test_ai_safety_checkpoint_creation_failure_aborts_application() {
-        let checkpoint_succeeded = false;
-        let rel_path = "src/main.rs";
-        let write_executed = std::sync::atomic::AtomicBool::new(false);
+    fn test_ai_safety_malformed_patch_rejected() {
+        let (temp, session, ckpt) = setup_test_workspace();
+        let file_path = temp.path().join("lib.rs");
+        std::fs::write(&file_path, "fn hello() {}\n").unwrap();
+        let hash = compute_sha256(b"fn hello() {}\n");
 
-        let result: Result<String, String> = if !checkpoint_succeeded {
-            Err(format!(
-                "Mandatory pre-edit checkpoint failed for '{}': Simulated checkpoint failure. Write aborted.",
-                rel_path
-            ))
-        } else {
-            write_executed.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok("Success".into())
+        let proposal = StructuredProposal {
+            proposal_id: "prop-malformed".into(),
+            workspace_id: session.workspace_id(),
+            relative_path: "lib.rs".into(),
+            operation: "apply_patch".into(),
+            base_hash: hash,
+            unified_diff: "".into(),
+            proposed_content: "this is completely invalid patch without hunk headers\n+foo\n"
+                .into(),
+            insertion_line: None,
         };
 
-        assert!(result.is_err());
-        assert!(!write_executed.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(result
-            .unwrap_err()
-            .contains("Mandatory pre-edit checkpoint failed"));
+        let res = execute_proposal_internal(&session, Some(&ckpt), &proposal);
+        assert!(res.is_err(), "Malformed patch must be rejected");
+        assert!(res.unwrap_err().contains("Malformed patch"));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "fn hello() {}\n"
+        );
     }
 
     #[test]
-    fn test_ai_safety_empty_content_wipes_rejected() {
-        let target_exists = true;
-        let proposed_content = "   ";
-        let res: Result<(), String> = if target_exists && proposed_content.trim().is_empty() {
-            Err("Safety Violation: Refusing to replace non-empty file with empty content".into())
-        } else {
-            Ok(())
+    fn test_ai_safety_patch_context_mismatch_rejected() {
+        let (temp, session, ckpt) = setup_test_workspace();
+        let file_path = temp.path().join("lib.rs");
+        std::fs::write(&file_path, "fn alpha() {}\nfn beta() {}\n").unwrap();
+        let hash = compute_sha256(b"fn alpha() {}\nfn beta() {}\n");
+
+        // Patch expects fn gamma() instead of fn beta()
+        let patch = "@@ -1,2 +1,2 @@\n fn alpha() {}\n-fn gamma() {}\n+fn delta() {}\n";
+
+        let proposal = StructuredProposal {
+            proposal_id: "prop-mismatch".into(),
+            workspace_id: session.workspace_id(),
+            relative_path: "lib.rs".into(),
+            operation: "apply_patch".into(),
+            base_hash: hash,
+            unified_diff: "".into(),
+            proposed_content: patch.into(),
+            insertion_line: None,
         };
-        assert!(res.is_err(), "Empty content replacement must be rejected");
+
+        let res = execute_proposal_internal(&session, Some(&ckpt), &proposal);
+        assert!(res.is_err(), "Patch context mismatch must be rejected");
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("context mismatch") || err.contains("delete mismatch"),
+            "Error was: {}",
+            err
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "fn alpha() {}\nfn beta() {}\n"
+        );
     }
 
     #[test]
-    fn test_ai_safety_operation_contract_validation() {
-        let valid_ops = [
-            "replace_file",
-            "apply_patch",
-            "insert_at",
-            "create_file",
-            "delete_file",
-            "modify",
-        ];
-        assert!(valid_ops.contains(&"replace_file"));
-        assert!(valid_ops.contains(&"insert_at"));
-        assert!(valid_ops.contains(&"create_file"));
-        assert!(valid_ops.contains(&"delete_file"));
-        assert!(!valid_ops.contains(&"arbitrary_code_block"));
+    fn test_ai_safety_valid_patch_changes_only_intended_lines() {
+        let (temp, session, ckpt) = setup_test_workspace();
+        let file_path = temp.path().join("lib.rs");
+        let orig = "line 1\nline 2\nline 3\nline 4\nline 5\n";
+        std::fs::write(&file_path, orig).unwrap();
+        let hash = compute_sha256(orig.as_bytes());
+
+        let patch = "@@ -2,3 +2,3 @@\n line 2\n-line 3\n+line 3 MODIFIED\n line 4\n";
+
+        let proposal = StructuredProposal {
+            proposal_id: "prop-valid-patch".into(),
+            workspace_id: session.workspace_id(),
+            relative_path: "lib.rs".into(),
+            operation: "apply_patch".into(),
+            base_hash: hash,
+            unified_diff: "".into(),
+            proposed_content: patch.into(),
+            insertion_line: None,
+        };
+
+        let res = execute_proposal_internal(&session, Some(&ckpt), &proposal);
+        assert!(
+            res.is_ok(),
+            "Valid patch application must succeed: {:?}",
+            res.err()
+        );
+        let expected = "line 1\nline 2\nline 3 MODIFIED\nline 4\nline 5\n";
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), expected);
     }
 
     #[test]
-    fn test_ai_safety_path_traversal_and_symlink_escape_rejected() {
-        let bad_paths = [
-            "../secret.txt",
-            "foo/../../etc/passwd",
-            "..\\windows\\system32",
-            "/absolute/root/file",
-            "C:\\windows\\win.ini",
-        ];
-        for bad in bad_paths {
-            let has_escape = bad.contains("..")
-                || bad.starts_with('/')
-                || bad.starts_with('\\')
-                || (bad.len() > 1 && bad.chars().nth(1) == Some(':'));
-            assert!(
-                has_escape,
-                "Path traversal/escape sequence must be flagged: {}",
-                bad
+    fn test_ai_safety_external_modification_between_preview_and_apply_rejected() {
+        let (temp, session, ckpt) = setup_test_workspace();
+        let file_path = temp.path().join("concurrent.rs");
+        std::fs::write(&file_path, "initial state").unwrap();
+        let preview_hash = compute_sha256(b"initial state");
+
+        // Concurrent modification occurs on disk before application
+        std::fs::write(&file_path, "external concurrent modification").unwrap();
+
+        let proposal = StructuredProposal {
+            proposal_id: "prop-race".into(),
+            workspace_id: session.workspace_id(),
+            relative_path: "concurrent.rs".into(),
+            operation: "replace_file".into(),
+            base_hash: preview_hash,
+            unified_diff: "".into(),
+            proposed_content: "ai overwrite attempt".into(),
+            insertion_line: None,
+        };
+
+        let res = execute_proposal_internal(&session, Some(&ckpt), &proposal);
+        assert!(
+            res.is_err(),
+            "Concurrent modification before apply must be rejected"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "external concurrent modification"
+        );
+    }
+
+    #[test]
+    fn test_ai_safety_path_traversal_rejected() {
+        let (_temp, session, ckpt) = setup_test_workspace();
+        let proposal = StructuredProposal {
+            proposal_id: "prop-traversal".into(),
+            workspace_id: session.workspace_id(),
+            relative_path: "../../outside_target.txt".into(),
+            operation: "create_file".into(),
+            base_hash: "".into(),
+            unified_diff: "".into(),
+            proposed_content: "malicious escape".into(),
+            insertion_line: None,
+        };
+
+        let res = execute_proposal_internal(&session, Some(&ckpt), &proposal);
+        assert!(res.is_err(), "Path traversal proposal must be rejected");
+    }
+
+    #[test]
+    fn test_ai_safety_symlink_escape_rejected() {
+        let (temp, session, ckpt) = setup_test_workspace();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_target = outside.path().join("external_secret.txt");
+        std::fs::write(&outside_target, "secret data").unwrap();
+
+        let link_path = temp.path().join("symlink_target.txt");
+        #[cfg(windows)]
+        {
+            let _ = std::os::windows::fs::symlink_file(&outside_target, &link_path);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = std::os::unix::fs::symlink(&outside_target, &link_path);
+        }
+
+        if link_path.exists() {
+            let hash = compute_sha256(b"secret data");
+            let proposal = StructuredProposal {
+                proposal_id: "prop-symlink".into(),
+                workspace_id: session.workspace_id(),
+                relative_path: "symlink_target.txt".into(),
+                operation: "replace_file".into(),
+                base_hash: hash,
+                unified_diff: "".into(),
+                proposed_content: "pwned".into(),
+                insertion_line: None,
+            };
+            let res = execute_proposal_internal(&session, Some(&ckpt), &proposal);
+            assert!(res.is_err(), "Symlink escape modification must fail closed");
+            assert_eq!(
+                std::fs::read_to_string(&outside_target).unwrap(),
+                "secret data"
             );
         }
+    }
+
+    #[test]
+    fn test_ai_safety_failed_write_preserves_original_content() {
+        let (temp, session, ckpt) = setup_test_workspace();
+        let file_path = temp.path().join("important.rs");
+        let original = "const IMPORTANT: u32 = 42;\n";
+        std::fs::write(&file_path, original).unwrap();
+        let hash = compute_sha256(original.as_bytes());
+
+        let proposal = StructuredProposal {
+            proposal_id: "prop-wipe".into(),
+            workspace_id: session.workspace_id(),
+            relative_path: "important.rs".into(),
+            operation: "replace_file".into(),
+            base_hash: hash,
+            unified_diff: "".into(),
+            proposed_content: "   ".into(), // Empty content rejected
+            insertion_line: None,
+        };
+
+        let res = execute_proposal_internal(&session, Some(&ckpt), &proposal);
+        assert!(res.is_err(), "Safety guard must reject empty file wipe");
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), original);
     }
 }

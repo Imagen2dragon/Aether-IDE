@@ -192,26 +192,35 @@ export const BottomPanel: React.FC<BottomPanelProps> = ({
     }
   };
 
-  // Initialize first terminal session on mount and listen to events
+  // Initialize listener FIRST, then spawn first terminal session
   useEffect(() => {
     let unlistenFn: (() => void) | null = null;
+    let isCancelled = false;
 
-    spawnNewTerminalSession().then(() => {
-      // Listen for backend terminal output events routed by session id
-      TauriService.onEvent<string | { id?: number; data?: string }>("terminal-output", (payload) => {
-        if (typeof payload === "string") {
-          const active = sessionsRef.current.find((s) => s.id === activeSessionIdRef.current);
-          if (active) active.term.write(payload);
-        } else if (payload && typeof payload === "object") {
-          const targetSession = sessionsRef.current.find((s) => s.id === payload.id);
-          if (targetSession && payload.data) {
-            targetSession.term.write(payload.data);
+    const setupTerminal = async () => {
+      // Register event listener BEFORE spawning any session so early output is never dropped
+      const fn = await TauriService.onEvent<string | { id?: number; data?: string }>(
+        "terminal-output",
+        (payload) => {
+          if (typeof payload === "string") {
+            const active = sessionsRef.current.find((s) => s.id === activeSessionIdRef.current);
+            if (active) active.term.write(payload);
+          } else if (payload && typeof payload === "object") {
+            const targetSession = sessionsRef.current.find((s) => s.id === payload.id);
+            if (targetSession && payload.data) {
+              targetSession.term.write(payload.data);
+            }
           }
         }
-      }).then((fn) => {
-        unlistenFn = fn;
-      });
-    });
+      );
+      unlistenFn = fn;
+
+      if (!isCancelled) {
+        await spawnNewTerminalSession();
+      }
+    };
+
+    setupTerminal();
 
     const handleResize = () => {
       const active = sessionsRef.current.find((s) => s.id === activeSessionIdRef.current);
@@ -223,6 +232,7 @@ export const BottomPanel: React.FC<BottomPanelProps> = ({
     window.addEventListener("resize", handleResize);
 
     return () => {
+      isCancelled = true;
       window.removeEventListener("resize", handleResize);
       if (unlistenFn) unlistenFn();
       // Clean up all running terminal processes on unmount

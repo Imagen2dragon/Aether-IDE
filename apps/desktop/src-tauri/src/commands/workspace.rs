@@ -296,8 +296,10 @@ pub async fn workspace_search(
     };
 
     let query_lower = query.to_lowercase();
-    let max = max_results.unwrap_or(300);
+    let max = max_results.unwrap_or(500);
     let mut matches = Vec::new();
+    let max_traversal_files = 10_000;
+    let mut files_traversed = 0;
 
     let skip_dirs = [
         ".git",
@@ -319,23 +321,59 @@ pub async fn workspace_search(
     ];
 
     for root in roots {
-        let mut stack = vec![root.clone()];
+        let canonical_root = match root.canonicalize() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let mut stack = vec![canonical_root.clone()];
+        let mut visited_dirs = std::collections::HashSet::new();
+        visited_dirs.insert(canonical_root.clone());
+
         while let Some(dir) = stack.pop() {
             let entries = match std::fs::read_dir(&dir) {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(_) => continue, // Safely handle unreadable directories
             };
 
             for entry in entries.flatten() {
+                if files_traversed >= max_traversal_files || matches.len() >= max {
+                    break;
+                }
+
                 let path = entry.path();
+                let file_type = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
                 let file_name = entry.file_name().to_string_lossy().to_string();
 
-                if path.is_dir() {
+                if file_type.is_dir() {
+                    // Critical security: Never follow directory symlinks/junctions to prevent escape/loops
+                    if file_type.is_symlink() {
+                        continue;
+                    }
                     if !skip_dirs.contains(&file_name.as_str()) && !file_name.starts_with('.') {
-                        stack.push(path);
+                        if let Ok(canon) = path.canonicalize() {
+                            if canon.starts_with(&canonical_root)
+                                && visited_dirs.insert(canon.clone())
+                            {
+                                stack.push(canon);
+                            }
+                        }
                     }
                     continue;
                 }
+
+                // File symlink security containment check
+                if file_type.is_symlink() {
+                    match path.canonicalize() {
+                        Ok(canon) if canon.starts_with(&canonical_root) => {}
+                        _ => continue, // Reject symlink pointing outside authorized root
+                    }
+                }
+
+                files_traversed += 1;
 
                 if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
                     if binary_exts.contains(&ext.to_lowercase().as_str()) {
@@ -349,13 +387,23 @@ pub async fn workspace_search(
                     }
                 }
 
-                let content = match std::fs::read_to_string(&path) {
-                    Ok(c) => c,
+                // Binary content detection: check initial bytes for null byte (0x00)
+                let raw_bytes = match std::fs::read(&path) {
+                    Ok(b) => b,
                     Err(_) => continue,
+                };
+                let check_len = raw_bytes.len().min(1024);
+                if raw_bytes[..check_len].contains(&0) {
+                    continue; // Skip binary content
+                }
+
+                let content = match String::from_utf8(raw_bytes) {
+                    Ok(s) => s,
+                    Err(_) => continue, // Skip non-UTF-8 content
                 };
 
                 let rel_file = path
-                    .strip_prefix(&root)
+                    .strip_prefix(&canonical_root)
                     .map(|p| p.to_string_lossy().replace('\\', "/"))
                     .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"));
 
@@ -442,6 +490,13 @@ pub async fn workspace_replace_in_file(
         .read_file(&rel_path)
         .map_err(|e| format!("Failed to read file '{}': {}", rel_path, e))?;
 
+    let original_hash = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(original.as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
+
     let (new_content, count) = if is_regex || is_whole_word {
         let pattern = if is_regex {
             if is_whole_word {
@@ -475,8 +530,19 @@ pub async fn workspace_replace_in_file(
     };
 
     if count > 0 {
-        cap.write_file_atomic(&rel_path, &new_content)
-            .map_err(|e| format!("Failed to write replacement to '{}': {}", rel_path, e))?;
+        // Enforce conditional replacement bound to original_hash (eliminates TOCTOU overwrite race)
+        cap.replace_file_bytes_conditional(
+            &rel_path,
+            new_content.as_bytes(),
+            Some(&original_hash),
+            None,
+        )
+        .map_err(|e| {
+            format!(
+                "Conditional replacement failed for '{}': {}. Target file was modified on disk since search results were generated.",
+                rel_path, e
+            )
+        })?;
     }
 
     Ok(json!({
@@ -484,4 +550,89 @@ pub async fn workspace_replace_in_file(
         "file": rel_path,
         "replacements_count": count
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_search_regex_invalid_pattern_rejected() {
+        let pattern = "[unclosed_regex_class";
+        let res = regex::RegexBuilder::new(pattern).build();
+        assert!(
+            res.is_err(),
+            "Invalid regular expression must fail compilation"
+        );
+    }
+
+    #[test]
+    fn test_replace_with_group_captures() {
+        let original = "Hello foo-123 and foo-456 world";
+        let pattern = r"foo-(\d+)";
+        let replacement = "bar-$1";
+        let re = regex::Regex::new(pattern).unwrap();
+        let replaced = re.replace_all(original, replacement).to_string();
+        assert_eq!(replaced, "Hello bar-123 and bar-456 world");
+    }
+
+    #[test]
+    fn test_unicode_and_case_insensitive_matching() {
+        let original = "AetherIDE supports Rust, 🦀 Unicode, and Case-Insensitive matching.";
+        let query = "rust";
+        let query_lower = query.to_lowercase();
+        let line_lower = original.to_lowercase();
+        assert!(line_lower.contains(&query_lower));
+
+        // Exact Unicode match
+        assert!(original.contains('🦀'));
+    }
+
+    #[test]
+    fn test_whole_word_boundary_matching() {
+        let original = "cat scatter concatenate cat";
+        let pattern = r"\bcat\b";
+        let re = regex::Regex::new(pattern).unwrap();
+        let matches: Vec<_> = re.find_iter(original).map(|m| m.start()).collect();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0], 0);
+        assert_eq!(matches[1], 24);
+    }
+
+    #[test]
+    fn test_binary_null_byte_detection() {
+        let text_bytes = b"Hello plain text file without nulls";
+        assert!(!text_bytes[..text_bytes.len().min(1024)].contains(&0));
+
+        let mut bin_bytes = b"ELF\0fake_binary_payload".to_vec();
+        bin_bytes.resize(2048, 0);
+        assert!(bin_bytes[..bin_bytes.len().min(1024)].contains(&0));
+    }
+
+    #[test]
+    fn test_symlink_containment_verification() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("escaped.txt");
+        std::fs::write(&outside_file, "escaped content").unwrap();
+
+        let link_path = root.join("link_to_outside.txt");
+        #[cfg(windows)]
+        {
+            let _ = std::os::windows::fs::symlink_file(&outside_file, &link_path);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = std::os::unix::fs::symlink(&outside_file, &link_path);
+        }
+
+        if link_path.exists() {
+            let canon = link_path.canonicalize().unwrap();
+            let canonical_root = root.canonicalize().unwrap();
+            // Boundary assertion: symlink outside root must NOT start with canonical root
+            assert!(!canon.starts_with(&canonical_root));
+        }
+    }
 }
