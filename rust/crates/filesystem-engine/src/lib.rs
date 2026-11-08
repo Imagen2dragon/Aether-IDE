@@ -823,7 +823,7 @@ pub fn pin_created_directory(path: &Path) -> Result<PinnedDirectoryHandle> {
 #[cfg(unix)]
 fn clean_dir_descriptor(dir_fd: libc::c_int) -> Result<()> {
     use std::ffi::CStr;
-    use std::os::unix::io::{FromRawFd, OwnedFd};
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
     let dup_fd = unsafe { libc::dup(dir_fd) };
     if dup_fd < 0 {
@@ -909,6 +909,7 @@ fn clean_dir_descriptor(dir_fd: libc::c_int) -> Result<()> {
             }
             let child_fd = unsafe { OwnedFd::from_raw_fd(child_fd_raw) };
             clean_dir_descriptor(child_fd.as_raw_fd())?;
+            drop(child_fd);
             if unsafe { libc::unlinkat(dir_fd, c_name, libc::AT_REMOVEDIR) } != 0 {
                 let err = std::io::Error::last_os_error();
                 unsafe {
