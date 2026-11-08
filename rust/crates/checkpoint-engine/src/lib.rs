@@ -295,6 +295,11 @@ pub struct CheckpointEngine {
     fault_inject_snapshot_dir_creation: std::sync::atomic::AtomicBool,
     fault_inject_blob_dir_creation: std::sync::atomic::AtomicBool,
     fault_inject_cleanup_failure: std::sync::atomic::AtomicBool,
+    fault_inject_cleanup_identity_mismatch: std::sync::atomic::AtomicBool,
+    fault_inject_cleanup_metadata_permission_denied: std::sync::atomic::AtomicBool,
+    fault_inject_cleanup_metadata_io_error: std::sync::atomic::AtomicBool,
+    post_snapshot_dir_create_hook: Arc<Mutex<Option<PreReplaceHook>>>,
+    next_checkpoint_id: Arc<Mutex<Option<String>>>,
     last_cleanup_error: Arc<Mutex<Option<String>>>,
     active_restore_paths: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
     pre_replace_hook: Arc<Mutex<Option<PreReplaceHook>>>,
@@ -359,6 +364,8 @@ pub struct SnapshotCleanupGuard<'a> {
     snapshot_dir: &'a Path,
     committed: bool,
     cleaned: bool,
+    created_by_op: bool,
+    expected_identity: Option<filesystem_engine::FileObjectIdentity>,
     engine: Option<&'a CheckpointEngine>,
 }
 
@@ -373,8 +380,27 @@ impl<'a> SnapshotCleanupGuard<'a> {
             snapshot_dir,
             committed: false,
             cleaned: false,
+            created_by_op: false,
+            expected_identity: None,
             engine,
         }
+    }
+
+    /// Arms the cleanup guard once the current operation has successfully created
+    /// the snapshot directory and captured its filesystem identity.
+    pub fn arm(&mut self, identity: filesystem_engine::FileObjectIdentity) {
+        self.created_by_op = true;
+        self.expected_identity = Some(identity);
+    }
+
+    /// Returns true if the cleanup guard has been armed following directory creation.
+    pub fn is_armed(&self) -> bool {
+        self.created_by_op
+    }
+
+    /// Returns the captured directory identity if armed.
+    pub fn expected_identity(&self) -> Option<filesystem_engine::FileObjectIdentity> {
+        self.expected_identity
     }
 
     /// Disarms the cleanup guard only upon successful metadata publication.
@@ -388,7 +414,13 @@ impl<'a> SnapshotCleanupGuard<'a> {
             return Ok(());
         }
         self.cleaned = true;
-        Self::execute_cleanup(self.storage_dir, self.snapshot_dir, self.engine)
+        Self::execute_cleanup(
+            self.storage_dir,
+            self.snapshot_dir,
+            self.created_by_op,
+            self.expected_identity,
+            self.engine,
+        )
     }
 
     /// Helper to fail an operation while guaranteeing that cleanup is executed and observable.
@@ -405,6 +437,8 @@ impl<'a> SnapshotCleanupGuard<'a> {
     fn execute_cleanup(
         storage_dir: &Path,
         snapshot_dir: &Path,
+        created_by_op: bool,
+        expected_identity: Option<filesystem_engine::FileObjectIdentity>,
         engine: Option<&CheckpointEngine>,
     ) -> Result<()> {
         // Defensive check: Do not delete unrelated directories or follow untrusted paths.
@@ -423,12 +457,112 @@ impl<'a> SnapshotCleanupGuard<'a> {
             return Err(AetherError::PermissionDenied(msg));
         }
 
-        // Defensive check: Do not follow directory symlinks during cleanup
-        if let Ok(meta) = std::fs::symlink_metadata(snapshot_dir) {
-            if meta.file_type().is_symlink() {
+        // Snapshot directory ownership:
+        // If this operation did not successfully create the snapshot directory,
+        // cleanup is not armed. Do not touch or delete pre-existing or colliding directories!
+        if !created_by_op {
+            return Ok(());
+        }
+
+        // Fault injection for metadata inspection (simulated PermissionDenied or I/O errors)
+        if let Some(eng) = engine {
+            if eng
+                .fault_inject_cleanup_metadata_permission_denied
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
                 let msg = format!(
-                    "Refusing recursive cleanup: snapshot directory '{:?}' is a symlink",
+                    "Injected PermissionDenied during metadata inspection for snapshot directory '{:?}'",
                     snapshot_dir
+                );
+                eng.record_cleanup_error(&msg);
+                return Err(AetherError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    msg,
+                )));
+            }
+            if eng
+                .fault_inject_cleanup_metadata_io_error
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                let msg = format!(
+                    "Injected I/O error during metadata inspection for snapshot directory '{:?}'",
+                    snapshot_dir
+                );
+                eng.record_cleanup_error(&msg);
+                return Err(AetherError::Io(std::io::Error::other(msg)));
+            }
+        }
+
+        // Metadata inspection & error classification:
+        // - std::io::ErrorKind::NotFound is treated as confirmed absence (success)
+        // - std::io::ErrorKind::PermissionDenied or other I/O errors are cleanup failures
+        let meta = match std::fs::symlink_metadata(snapshot_dir) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Confirmed absence: directory is already gone, cleanup is satisfied
+                return Ok(());
+            }
+            Err(e) => {
+                let msg = format!(
+                    "Metadata inspection failed for snapshot directory '{:?}': {}",
+                    snapshot_dir, e
+                );
+                if let Some(eng) = engine {
+                    eng.record_cleanup_error(&msg);
+                }
+                return Err(AetherError::Io(std::io::Error::new(e.kind(), msg)));
+            }
+        };
+
+        // Defensive check: Do not follow directory symlinks during cleanup
+        if meta.file_type().is_symlink() {
+            let msg = format!(
+                "Refusing recursive cleanup: snapshot directory '{:?}' is a symlink",
+                snapshot_dir
+            );
+            if let Some(eng) = engine {
+                eng.record_cleanup_error(&msg);
+            }
+            return Err(AetherError::PermissionDenied(msg));
+        }
+
+        // Snapshot directory ownership verification:
+        // Before recursive cleanup, verify that the current path still identifies the directory
+        // owned by this operation. Refuse cleanup and report a conflict if the directory has been
+        // replaced or its identity cannot be verified.
+        if let Some(expected_id) = expected_identity {
+            if let Some(eng) = engine {
+                if eng
+                    .fault_inject_cleanup_identity_mismatch
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    let msg = format!(
+                        "Snapshot directory '{:?}' identity conflict: injected replacement mismatch",
+                        snapshot_dir
+                    );
+                    eng.record_cleanup_error(&msg);
+                    return Err(AetherError::PermissionDenied(msg));
+                }
+            }
+
+            let current_id = match filesystem_engine::query_directory_identity(snapshot_dir) {
+                Ok(id) => id,
+                Err(e) => {
+                    let msg = format!(
+                        "Refusing cleanup: failed to verify directory identity for '{:?}': {}",
+                        snapshot_dir, e
+                    );
+                    if let Some(eng) = engine {
+                        eng.record_cleanup_error(&msg);
+                    }
+                    return Err(AetherError::PermissionDenied(msg));
+                }
+            };
+
+            if current_id != expected_id {
+                let msg = format!(
+                    "Snapshot directory '{:?}' identity conflict: directory was replaced after creation (expected {:?}, found {:?}); refusing cleanup to prevent deleting replaced object",
+                    snapshot_dir, expected_id, current_id
                 );
                 if let Some(eng) = engine {
                     eng.record_cleanup_error(&msg);
@@ -452,20 +586,25 @@ impl<'a> SnapshotCleanupGuard<'a> {
             }
         }
 
-        if snapshot_dir.exists() {
-            if let Err(e) = std::fs::remove_dir_all(snapshot_dir) {
-                let msg = format!(
-                    "Failed to remove snapshot directory '{:?}': {}",
-                    snapshot_dir, e
-                );
-                if let Some(eng) = engine {
-                    eng.record_cleanup_error(&msg);
-                }
-                return Err(AetherError::Io(std::io::Error::new(e.kind(), msg)));
+        // Recursive removal of incomplete snapshot directory
+        if let Err(e) = std::fs::remove_dir_all(snapshot_dir) {
+            let msg = format!(
+                "Failed to remove snapshot directory '{:?}': {}",
+                snapshot_dir, e
+            );
+            if let Some(eng) = engine {
+                eng.record_cleanup_error(&msg);
             }
+            return Err(AetherError::Io(std::io::Error::new(e.kind(), msg)));
+        }
 
-            // Verification check: Never report that cleanup succeeded when the directory still exists
-            if snapshot_dir.exists() {
+        // Absence verification after removal using explicit metadata-result classification:
+        // - NotFound -> confirmed absent (Ok)
+        // - Ok(_) -> still exists (Internal error)
+        // - Err(e) -> error checking absence (Io error)
+        match std::fs::symlink_metadata(snapshot_dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => {
                 let msg = format!(
                     "Cleanup verification failed: snapshot directory '{:?}' still exists after remove_dir_all",
                     snapshot_dir
@@ -473,19 +612,32 @@ impl<'a> SnapshotCleanupGuard<'a> {
                 if let Some(eng) = engine {
                     eng.record_cleanup_error(&msg);
                 }
-                return Err(AetherError::Internal(msg));
+                Err(AetherError::Internal(msg))
+            }
+            Err(e) => {
+                let msg = format!(
+                    "Cleanup verification failed: error checking absence of snapshot directory '{:?}': {}",
+                    snapshot_dir, e
+                );
+                if let Some(eng) = engine {
+                    eng.record_cleanup_error(&msg);
+                }
+                Err(AetherError::Io(std::io::Error::new(e.kind(), msg)))
             }
         }
-
-        Ok(())
     }
 }
 
 impl<'a> Drop for SnapshotCleanupGuard<'a> {
     fn drop(&mut self) {
-        if !self.committed && !self.cleaned && self.snapshot_dir.exists() {
-            if let Err(e) = Self::execute_cleanup(self.storage_dir, self.snapshot_dir, self.engine)
-            {
+        if !self.committed && !self.cleaned && self.created_by_op {
+            if let Err(e) = Self::execute_cleanup(
+                self.storage_dir,
+                self.snapshot_dir,
+                self.created_by_op,
+                self.expected_identity,
+                self.engine,
+            ) {
                 warn!(
                     "Snapshot cleanup guard fallback failed for {:?}: {}",
                     self.snapshot_dir, e
@@ -509,6 +661,13 @@ impl CheckpointEngine {
             fault_inject_snapshot_dir_creation: std::sync::atomic::AtomicBool::new(false),
             fault_inject_blob_dir_creation: std::sync::atomic::AtomicBool::new(false),
             fault_inject_cleanup_failure: std::sync::atomic::AtomicBool::new(false),
+            fault_inject_cleanup_identity_mismatch: std::sync::atomic::AtomicBool::new(false),
+            fault_inject_cleanup_metadata_permission_denied: std::sync::atomic::AtomicBool::new(
+                false,
+            ),
+            fault_inject_cleanup_metadata_io_error: std::sync::atomic::AtomicBool::new(false),
+            post_snapshot_dir_create_hook: Arc::new(Mutex::new(None)),
+            next_checkpoint_id: Arc::new(Mutex::new(None)),
             last_cleanup_error: Arc::new(Mutex::new(None)),
             active_restore_paths: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pre_replace_hook: Arc::new(Mutex::new(None)),
@@ -625,6 +784,38 @@ impl CheckpointEngine {
     pub fn set_fault_inject_cleanup_failure(&self, inject: bool) {
         self.fault_inject_cleanup_failure
             .store(inject, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn set_fault_inject_cleanup_identity_mismatch(&self, inject: bool) {
+        self.fault_inject_cleanup_identity_mismatch
+            .store(inject, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn set_fault_inject_cleanup_metadata_permission_denied(&self, inject: bool) {
+        self.fault_inject_cleanup_metadata_permission_denied
+            .store(inject, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn set_fault_inject_cleanup_metadata_io_error(&self, inject: bool) {
+        self.fault_inject_cleanup_metadata_io_error
+            .store(inject, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn set_post_snapshot_dir_create_hook<F>(&self, hook: Option<F>)
+    where
+        F: Fn(&Path) + Send + Sync + 'static,
+    {
+        let mut guard = self.post_snapshot_dir_create_hook.lock();
+        *guard = hook.map(|h| Arc::new(h) as PreReplaceHook);
+    }
+
+    #[doc(hidden)]
+    pub fn set_next_checkpoint_id(&self, id: impl Into<String>) {
+        *self.next_checkpoint_id.lock() = Some(id.into());
     }
 
     #[doc(hidden)]
@@ -4033,7 +4224,11 @@ impl CheckpointEngine {
             )));
         }
 
-        let checkpoint_id = format!("ckpt-{}", uuid::Uuid::new_v4().simple());
+        let checkpoint_id = self
+            .next_checkpoint_id
+            .lock()
+            .take()
+            .unwrap_or_else(|| format!("ckpt-{}", uuid::Uuid::new_v4().simple()));
         let snapshot_dir = self.storage_dir.join(&checkpoint_id);
         let blobs_dir = snapshot_dir.join("blobs");
 
@@ -4064,6 +4259,26 @@ impl CheckpointEngine {
                     snapshot_dir, e
                 ),
             )));
+        }
+
+        // Capture filesystem identity of the newly created snapshot directory
+        let dir_identity = match filesystem_engine::query_directory_identity(&snapshot_dir) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = std::fs::remove_dir(&snapshot_dir);
+                return Err(AetherError::Internal(format!(
+                    "Failed to capture filesystem identity of created snapshot directory '{:?}': {}",
+                    snapshot_dir, e
+                )));
+            }
+        };
+
+        // Arm the cleanup guard with the captured identity now that this operation successfully created the directory
+        cleanup_guard.arm(dir_identity);
+
+        let post_create_hook = self.post_snapshot_dir_create_hook.lock().clone();
+        if let Some(hook) = post_create_hook {
+            hook(&snapshot_dir);
         }
 
         // 2. Blob directory initialization after snapshot directory has been created
@@ -4151,7 +4366,21 @@ impl CheckpointEngine {
             let blob_path = blobs_dir.join(&hash);
 
             // Content-addressed write: deduplicate if blob already exists
-            if !blob_path.exists() {
+            let blob_exists = match std::fs::symlink_metadata(&blob_path) {
+                Ok(_) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => {
+                    return cleanup_guard.fail_with_cleanup(AetherError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "Failed to inspect blob metadata for '{:?}': {}",
+                            blob_path, e
+                        ),
+                    )));
+                }
+            };
+
+            if !blob_exists {
                 // Injected storage failure before blob write
                 if self
                     .fault_inject_blob_storage_failure
@@ -4251,10 +4480,20 @@ impl CheckpointEngine {
             return cleanup_guard.fail_with_cleanup(e);
         }
 
-        if !meta_file.is_file() {
-            return cleanup_guard.fail_with_cleanup(AetherError::Internal(
-                "Checkpoint metadata verification failed: metadata.json does not exist after atomic write".into(),
-            ));
+        match std::fs::symlink_metadata(&meta_file) {
+            Ok(m) if m.file_type().is_file() => {}
+            Ok(_) => {
+                return cleanup_guard.fail_with_cleanup(AetherError::Internal(
+                    "Checkpoint metadata verification failed: metadata.json is not a regular file"
+                        .into(),
+                ));
+            }
+            Err(e) => {
+                return cleanup_guard.fail_with_cleanup(AetherError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("Failed to verify metadata.json for checkpoint: {}", e),
+                )));
+            }
         }
 
         // Disarm cleanup guard only upon successful metadata publication
@@ -15504,6 +15743,369 @@ mod tests {
             storage_dir.exists(),
             "Storage directory itself must NOT be deleted"
         );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_7_preexisting_snapshot_directory_collision_preserves_sentinel_data() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_7_collision_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let ws_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let file = ws_dir.join("file.txt");
+        std::fs::write(&file, "test data").unwrap();
+
+        // 1. Create a colliding pre-existing snapshot directory with sentinel content
+        let collision_id = "ckpt-collision-sentinel-123";
+        let colliding_dir = storage_dir.join(collision_id);
+        std::fs::create_dir_all(&colliding_dir).unwrap();
+        let sentinel_file = colliding_dir.join("sentinel.txt");
+        let sentinel_bytes = b"CRITICAL_PRE_EXISTING_SENTINEL_DATA_MUST_SURVIVE_COLLISION";
+        std::fs::write(&sentinel_file, sentinel_bytes).unwrap();
+
+        // Capture initial directory identity
+        let initial_identity = filesystem_engine::query_directory_identity(&colliding_dir)
+            .expect("query initial colliding dir identity");
+
+        // Instruct engine to use this exact checkpoint ID for the next creation attempt
+        engine.set_next_checkpoint_id(collision_id);
+
+        let res =
+            engine.create_checkpoint_with_root("test_collision", "ws-1", &ws_dir, Some(&[file]));
+
+        // Verification:
+        // - Creation must fail closed because create_dir fails with AlreadyExists
+        assert!(
+            res.is_err(),
+            "create_checkpoint must fail on directory collision"
+        );
+        let err_str = res.unwrap_err().to_string();
+        assert!(
+            err_str.contains("Failed to create snapshot directory")
+                || err_str.to_lowercase().contains("already exists"),
+            "Error must indicate directory creation failure: {}",
+            err_str
+        );
+
+        // - Cleanup was never armed, so engine.last_cleanup_error must be None
+        assert!(
+            engine.last_cleanup_error().is_none(),
+            "Cleanup must NOT be attempted or armed for un-created directory: {:?}",
+            engine.last_cleanup_error()
+        );
+
+        // - Sentinel directory and its contents must survive byte-for-byte
+        assert!(
+            colliding_dir.exists(),
+            "Colliding snapshot directory must still exist"
+        );
+        let surviving_content = std::fs::read(&sentinel_file).expect("read sentinel file");
+        assert_eq!(
+            surviving_content, sentinel_bytes,
+            "Pre-existing sentinel file must be preserved byte-for-byte"
+        );
+
+        // - Directory identity must be intact (same directory, not recreated)
+        let surviving_identity = filesystem_engine::query_directory_identity(&colliding_dir)
+            .expect("query surviving dir identity");
+        assert_eq!(
+            initial_identity, surviving_identity,
+            "Colliding directory identity must remain unchanged"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_7_replacement_after_creation_refuses_cleanup_and_preserves_object() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_7_replace_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let ws_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let file = ws_dir.join("file.txt");
+        std::fs::write(&file, "test data").unwrap();
+
+        // PART A: Physical replacement of created snapshot directory with a new directory containing sentinel
+        let replacement_sentinel_data = b"REPLACEMENT_ADVERSARY_SENTINEL_DATA_MUST_SURVIVE";
+        engine.set_post_snapshot_dir_create_hook(Some(move |snapshot_path: &Path| {
+            // Remove the created directory and replace it with a new one
+            let _ = std::fs::remove_dir(snapshot_path);
+            std::fs::create_dir(snapshot_path).unwrap();
+            let marker = snapshot_path.join("replacement_marker.txt");
+            std::fs::write(&marker, replacement_sentinel_data).unwrap();
+        }));
+
+        // Trigger a failure after creation (during blob dir creation) to invoke cleanup
+        engine.set_fault_inject_blob_dir_creation(true);
+
+        let res = engine.create_checkpoint_with_root(
+            "test_replacement",
+            "ws-1",
+            &ws_dir,
+            Some(&[file.clone()]),
+        );
+
+        assert!(
+            res.is_err(),
+            "Operation must fail when directory was replaced and blob creation failed"
+        );
+        let err_str = res.unwrap_err().to_string();
+        assert!(
+            err_str.contains("cleanup of incomplete snapshot failed"),
+            "Error must observe cleanup refusal: {}",
+            err_str
+        );
+        assert!(
+            engine.last_cleanup_error().is_some(),
+            "Engine must record the conflict error: {:?}",
+            engine.last_cleanup_error()
+        );
+        let recorded = engine.last_cleanup_error().unwrap();
+        assert!(
+            recorded.contains("identity conflict") || recorded.contains("refusing cleanup"),
+            "Recorded error must report identity conflict: {}",
+            recorded
+        );
+
+        // Verify the replaced directory still exists and its sentinel survived byte-for-byte
+        let subdirs: Vec<_> = std::fs::read_dir(&storage_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(subdirs.len(), 1, "Replaced directory must NOT be deleted");
+        let marker = subdirs[0].join("replacement_marker.txt");
+        assert!(marker.exists(), "Replacement marker file must survive");
+        let content = std::fs::read(&marker).unwrap();
+        assert_eq!(content, replacement_sentinel_data);
+
+        // PART B: Simulated identity mismatch via atomic fault injection
+        engine.clear_last_cleanup_error();
+        engine.set_post_snapshot_dir_create_hook::<fn(&Path)>(None);
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        engine.set_fault_inject_blob_dir_creation(true);
+        engine.set_fault_inject_cleanup_identity_mismatch(true);
+
+        let res_b = engine.create_checkpoint_with_root(
+            "test_replacement_b",
+            "ws-1",
+            &ws_dir,
+            Some(&[file]),
+        );
+
+        assert!(res_b.is_err());
+        assert!(
+            engine.last_cleanup_error().is_some(),
+            "Cleanup error must be recorded for injected identity mismatch"
+        );
+        assert!(engine
+            .last_cleanup_error()
+            .unwrap()
+            .contains("identity conflict: injected replacement mismatch"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_7_metadata_permission_denied_returns_observable_error() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_7_perm_denied_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let ws_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let file = ws_dir.join("file.txt");
+        std::fs::write(&file, "test data").unwrap();
+
+        // Inject PermissionDenied during metadata inspection during cleanup
+        engine.set_fault_inject_blob_dir_creation(true);
+        engine.set_fault_inject_cleanup_metadata_permission_denied(true);
+
+        let res =
+            engine.create_checkpoint_with_root("test_perm_denied", "ws-1", &ws_dir, Some(&[file]));
+
+        assert!(res.is_err());
+        let err_str = res.unwrap_err().to_string();
+        assert!(
+            err_str.contains("cleanup of incomplete snapshot failed"),
+            "Error must observe cleanup failure: {}",
+            err_str
+        );
+        assert!(
+            err_str.contains("PermissionDenied") || err_str.contains("Access is denied"),
+            "Error must reflect PermissionDenied: {}",
+            err_str
+        );
+        assert!(
+            engine.last_cleanup_error().is_some(),
+            "Engine must record the metadata PermissionDenied error"
+        );
+        assert!(engine
+            .last_cleanup_error()
+            .unwrap()
+            .contains("Injected PermissionDenied during metadata inspection"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_7_metadata_io_error_does_not_report_success() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_7_io_err_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let ws_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let file = ws_dir.join("file.txt");
+        std::fs::write(&file, "test data").unwrap();
+
+        // Inject I/O error during metadata inspection during cleanup
+        engine.set_fault_inject_blob_dir_creation(true);
+        engine.set_fault_inject_cleanup_metadata_io_error(true);
+
+        let res =
+            engine.create_checkpoint_with_root("test_io_error", "ws-1", &ws_dir, Some(&[file]));
+
+        assert!(res.is_err());
+        let err_str = res.unwrap_err().to_string();
+        assert!(
+            err_str.contains("cleanup of incomplete snapshot failed"),
+            "Cleanup must not report success on metadata I/O error: {}",
+            err_str
+        );
+        assert!(
+            engine.last_cleanup_error().is_some(),
+            "Engine must record the metadata I/O error"
+        );
+        assert!(engine
+            .last_cleanup_error()
+            .unwrap()
+            .contains("Injected I/O error during metadata inspection"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_7_confirmed_not_found_cleanup_succeeds_without_error() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_7_not_found_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let non_existent_snapshot = storage_dir.join("ckpt-already-gone");
+
+        // Verify that symlink_metadata returns NotFound
+        let meta_res = std::fs::symlink_metadata(&non_existent_snapshot);
+        assert!(meta_res.is_err());
+        assert_eq!(meta_res.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+
+        // Construct guard for non-existent path and arm it
+        let mut guard =
+            SnapshotCleanupGuard::new(&storage_dir, &non_existent_snapshot, Some(&engine));
+        let dummy_id = filesystem_engine::FileObjectIdentity {
+            volume_serial_number: 1,
+            file_index_high: 2,
+            file_index_low: 3,
+        };
+        guard.arm(dummy_id);
+
+        let res = guard.explicit_cleanup();
+        assert!(
+            res.is_ok(),
+            "Cleanup must succeed without error when snapshot directory is confirmed absent (NotFound)"
+        );
+        assert!(
+            engine.last_cleanup_error().is_none(),
+            "No cleanup error must be recorded for confirmed absence"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_7_snapshot_cleanup_guard_rejects_symlink_directory() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_7_symlink_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let external_target = temp_dir.join("external_target");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        std::fs::create_dir_all(&external_target).unwrap();
+
+        let target_file = external_target.join("important_user_file.txt");
+        std::fs::write(&target_file, b"DO_NOT_DELETE_USER_FILE").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let symlink_snapshot = storage_dir.join("ckpt-symlink");
+
+        // Create directory symlink (or junction on Windows if privileged, else skip symlink creation)
+        #[cfg(windows)]
+        let symlink_created =
+            std::os::windows::fs::symlink_dir(&external_target, &symlink_snapshot).is_ok();
+        #[cfg(unix)]
+        let symlink_created =
+            std::os::unix::fs::symlink(&external_target, &symlink_snapshot).is_ok();
+        #[cfg(not(any(windows, unix)))]
+        let symlink_created = false;
+
+        if symlink_created {
+            let mut guard =
+                SnapshotCleanupGuard::new(&storage_dir, &symlink_snapshot, Some(&engine));
+            let dummy_id = filesystem_engine::FileObjectIdentity {
+                volume_serial_number: 99,
+                file_index_high: 88,
+                file_index_low: 77,
+            };
+            guard.arm(dummy_id);
+
+            let res = guard.explicit_cleanup();
+            assert!(
+                res.is_err(),
+                "Cleanup must refuse to recursively clean a symlink directory"
+            );
+            let err_str = res.unwrap_err().to_string();
+            assert!(
+                err_str.contains("is a symlink"),
+                "Error must indicate symlink refusal: {}",
+                err_str
+            );
+            assert!(
+                external_target.exists(),
+                "External target directory must NOT be deleted"
+            );
+            assert!(
+                target_file.exists(),
+                "Important user file inside target must NOT be deleted"
+            );
+            let content = std::fs::read(&target_file).unwrap();
+            assert_eq!(content, b"DO_NOT_DELETE_USER_FILE");
+        }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

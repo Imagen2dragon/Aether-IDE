@@ -278,6 +278,122 @@ pub fn query_file_object_identity(_path: &Path) -> Result<FileObjectIdentity> {
 }
 
 #[cfg(windows)]
+pub fn query_directory_identity(path: &Path) -> Result<FileObjectIdentity> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+    const FILE_SHARE_READ: u32 = 0x00000001;
+    const FILE_SHARE_WRITE: u32 = 0x00000002;
+    const FILE_SHARE_DELETE: u32 = 0x00000004;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
+    const FILE_TYPE_DISK: u32 = 0x0001;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(AetherError::Io)?;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct BY_HANDLE_FILE_INFORMATION {
+        dwFileAttributes: u32,
+        ftCreationTime: [u32; 2],
+        ftLastAccessTime: [u32; 2],
+        ftLastWriteTime: [u32; 2],
+        dwVolumeSerialNumber: u32,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+        nNumberOfLinks: u32,
+        nFileIndexHigh: u32,
+        nFileIndexLow: u32,
+    }
+    extern "system" {
+        fn GetFileType(hFile: *mut std::ffi::c_void) -> u32;
+        fn GetFileInformationByHandle(
+            hFile: *mut std::ffi::c_void,
+            lpFileInformation: *mut BY_HANDLE_FILE_INFORMATION,
+        ) -> i32;
+    }
+
+    let file_type = unsafe { GetFileType(file.as_raw_handle()) };
+    if file_type != FILE_TYPE_DISK {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is not a standard disk directory (file type: 0x{:x})",
+            path.display(),
+            file_type
+        )));
+    }
+
+    let mut by_handle_info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    let info_res =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), by_handle_info.as_mut_ptr()) };
+    if info_res == 0 {
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+    let file_info = unsafe { by_handle_info.assume_init() };
+
+    let is_reparse = (file_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    let is_dir = (file_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    if is_reparse {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is a reparse point (attributes: 0x{:x}); refusing directory identity query",
+            path.display(),
+            file_info.dwFileAttributes
+        )));
+    }
+    if !is_dir {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is not a directory (attributes: 0x{:x}); refusing directory identity query",
+            path.display(),
+            file_info.dwFileAttributes
+        )));
+    }
+
+    Ok(FileObjectIdentity {
+        volume_serial_number: file_info.dwVolumeSerialNumber as u64,
+        file_index_high: file_info.nFileIndexHigh as u64,
+        file_index_low: file_info.nFileIndexLow as u64,
+    })
+}
+
+#[cfg(unix)]
+pub fn query_directory_identity(path: &Path) -> Result<FileObjectIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).map_err(AetherError::Io)?;
+    if meta.file_type().is_symlink() {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is a symlink; refusing directory identity query",
+            path.display()
+        )));
+    }
+    if !meta.is_dir() {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is not a directory; refusing directory identity query",
+            path.display()
+        )));
+    }
+    let ino = meta.ino();
+    Ok(FileObjectIdentity {
+        volume_serial_number: meta.dev(),
+        file_index_high: (ino >> 32) as u64,
+        file_index_low: (ino & 0xFFFFFFFF) as u64,
+    })
+}
+
+#[cfg(not(any(windows, unix)))]
+pub fn query_directory_identity(_path: &Path) -> Result<FileObjectIdentity> {
+    Ok(FileObjectIdentity {
+        volume_serial_number: 0,
+        file_index_high: 0,
+        file_index_low: 0,
+    })
+}
+
+#[cfg(windows)]
 pub fn remove_file_windows_exclusive(
     path: &Path,
     expected_hash: &str,
@@ -2502,6 +2618,50 @@ impl FilesystemEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_query_directory_identity_valid_and_rejections() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_fs_dir_id_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let dir_a = temp_dir.join("dir_a");
+        let dir_b = temp_dir.join("dir_b");
+        let file_a = temp_dir.join("file_a.txt");
+        let non_existent = temp_dir.join("non_existent");
+
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+        fs::write(&file_a, b"regular file content").unwrap();
+
+        // 1. Valid directories return unique identities
+        let id_a = query_directory_identity(&dir_a).expect("query_directory_identity on dir_a");
+        let id_b = query_directory_identity(&dir_b).expect("query_directory_identity on dir_b");
+        assert_ne!(
+            id_a, id_b,
+            "Different directories must have distinct identities"
+        );
+
+        // Querying dir_a again returns the same identity
+        let id_a_second = query_directory_identity(&dir_a).expect("second query on dir_a");
+        assert_eq!(id_a, id_a_second);
+
+        // 2. Reject regular file
+        let file_err = query_directory_identity(&file_a);
+        assert!(
+            file_err.is_err(),
+            "query_directory_identity must reject regular files"
+        );
+
+        // 3. Non-existent path returns error
+        let missing_err = query_directory_identity(&non_existent);
+        assert!(
+            missing_err.is_err(),
+            "query_directory_identity must fail for non-existent path"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 
     #[test]
     fn test_atomic_write_and_read() {
