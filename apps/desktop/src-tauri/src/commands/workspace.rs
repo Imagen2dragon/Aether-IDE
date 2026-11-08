@@ -244,6 +244,17 @@ pub struct WorkspaceSearchMatch {
     pub line_content: String,
 }
 
+thread_local! {
+    static INJECT_UNREADABLE_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[doc(hidden)]
+pub fn set_inject_unreadable_dir(path: Option<PathBuf>) {
+    INJECT_UNREADABLE_DIR.with(|cell| {
+        *cell.borrow_mut() = path;
+    });
+}
+
 pub fn execute_workspace_search(
     root: &Path,
     query: &str,
@@ -319,9 +330,21 @@ pub fn execute_workspace_search(
     visited_dirs.insert(canonical_root.clone());
 
     while let Some(dir) = stack.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(_) => continue, // Safely handle unreadable directories
+        let is_injected_unreadable = INJECT_UNREADABLE_DIR.with(|cell| {
+            if let Some(ref target) = *cell.borrow() {
+                &dir == target || dir.ends_with(target)
+            } else {
+                false
+            }
+        });
+
+        let entries = if is_injected_unreadable {
+            continue; // Emulate genuine OS permission denied error on unreadable directory
+        } else {
+            match std::fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(_) => continue, // Safely handle unreadable directories
+            }
         };
 
         for entry in entries.flatten() {
@@ -860,18 +883,55 @@ mod tests {
     #[test]
     fn test_workspace_search_unreadable_directory_handled_gracefully() {
         let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("accessible.txt"), "ACCESSIBLE_KEYWORD\n").unwrap();
 
-        let matches = super::execute_workspace_search(
+        // Accessible sibling directory and file
+        let accessible_dir = temp.path().join("accessible_dir");
+        std::fs::create_dir_all(&accessible_dir).unwrap();
+        std::fs::write(
+            accessible_dir.join("sibling.txt"),
+            "ACCESSIBLE_KEYWORD found in sibling\n",
+        )
+        .unwrap();
+
+        // Locked/unreadable child directory with match that must be skipped
+        let locked_dir = temp.path().join("locked_dir");
+        std::fs::create_dir_all(&locked_dir).unwrap();
+        std::fs::write(
+            locked_dir.join("hidden.txt"),
+            "ACCESSIBLE_KEYWORD in unreadable child directory\n",
+        )
+        .unwrap();
+
+        let locked_canon = locked_dir.canonicalize().unwrap();
+        super::set_inject_unreadable_dir(Some(locked_canon));
+
+        let matches_res = super::execute_workspace_search(
             temp.path(),
             "ACCESSIBLE_KEYWORD",
             false,
             false,
             false,
             None,
-        )
-        .unwrap();
-        assert_eq!(matches.len(), 1);
+        );
+
+        // Always clean up injected state
+        super::set_inject_unreadable_dir(None);
+
+        assert!(
+            matches_res.is_ok(),
+            "Search must succeed even when child directory is unreadable"
+        );
+        let matches = matches_res.unwrap();
+        assert_eq!(
+            matches.len(),
+            1,
+            "Only accessible sibling file should match; unreadable child directory must be skipped"
+        );
+        assert!(
+            matches[0].file.contains("sibling.txt"),
+            "Matched file must be accessible sibling: {}",
+            matches[0].file
+        );
     }
 
     #[test]
@@ -879,7 +939,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cap = filesystem_engine::WorkspaceCapability::open(temp.path()).unwrap();
         let file = temp.path().join("target.txt");
-        let initial_bytes = b"Hello old world\n";
+        let initial_bytes = b"Hello original world\n";
         std::fs::write(&file, initial_bytes).unwrap();
 
         let initial_hash = {
@@ -889,25 +949,64 @@ mod tests {
             format!("{:x}", hasher.finalize())
         };
 
-        // Simulate concurrent modification between search hash calculation and replacement execution
-        std::fs::write(&file, b"Concurrent modification happened!\n").unwrap();
+        let competing_bytes = b"COMPETING_MODIFICATION_AT_COMMIT_BOUNDARY\n";
+        let pre_publish = |dest: &std::path::Path| {
+            // Adversary / concurrent worker recreates target at the commit boundary
+            // after initial verification passes but before stage publication
+            std::fs::write(dest, competing_bytes).unwrap();
+        };
 
-        let new_content = b"Hello new world\n";
-        let res = cap.replace_file_bytes_conditional(
+        let hooks = filesystem_engine::ConditionalReplaceHooks {
+            pre_publish_hook: Some(&pre_publish),
+            ..Default::default()
+        };
+
+        let res = cap.replace_file_bytes_conditional_with_hooks(
             "target.txt",
-            new_content,
+            b"Hello proposed replacement\n",
             Some(&initial_hash),
-            None,
+            hooks,
         );
 
         assert!(
             res.is_err(),
-            "Replacement must fail closed when file was modified concurrently"
+            "Replacement must fail closed when target was modified at commit boundary"
         );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Commit boundary conflict"),
+            "Error must report commit boundary conflict: {}",
+            err_msg
+        );
+
+        // Competing modification must remain byte-for-byte intact
         assert_eq!(
             std::fs::read(&file).unwrap(),
-            b"Concurrent modification happened!\n",
-            "Target file must not be overwritten"
+            competing_bytes,
+            "Competing modification must not be overwritten"
+        );
+
+        // Original backup must be preserved in conflict artifact
+        let mut conflict_found = false;
+        for entry in std::fs::read_dir(temp.path()).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".aether-conflict-") {
+                conflict_found = true;
+                let conflict_data = std::fs::read(entry.path()).unwrap();
+                assert_eq!(
+                    conflict_data, initial_bytes,
+                    "Conflict file must preserve original content"
+                );
+            }
+            assert!(
+                !name.starts_with(".aether-stage-"),
+                "No temporary stage files should remain in workspace: {}",
+                name
+            );
+        }
+        assert!(
+            conflict_found,
+            "Conflict artifact must be created to preserve original content"
         );
     }
 }

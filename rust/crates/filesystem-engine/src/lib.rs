@@ -32,6 +32,14 @@ pub fn is_cross_device_error(err: &std::io::Error) -> bool {
     false
 }
 
+#[derive(Debug)]
+pub enum AtomicPublishError {
+    DestinationExists,
+    CrossDevice,
+    Unsupported,
+    Io(std::io::Error),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileObjectIdentity {
     pub volume_serial_number: u64,
@@ -743,6 +751,12 @@ pub struct ConditionalReplaceHooks<'a> {
     pub fault_inject_conflict_rename: bool,
     /// Injected fault: simulate failure during backup removal.
     pub fault_inject_backup_removal: bool,
+    /// Injected immediately before primary atomic publication (pre-hard-link / pre-publish).
+    pub pre_publish_hook: Option<&'a (dyn Fn(&Path) + 'a)>,
+    /// Injected immediately before platform-specific fallback publication primitive.
+    pub pre_fallback_publish_hook: Option<&'a (dyn Fn(&Path) + 'a)>,
+    /// Injected fault: simulate non-AlreadyExists hard-link failure (forcing the fallback publication path).
+    pub fault_inject_hard_link_failure: bool,
 }
 
 /// Final disposition of a conditional file deletion attempt.
@@ -982,6 +996,188 @@ impl WorkspaceCapability {
                 ))
             }
         }
+    }
+
+    fn atomic_publish_fallback(
+        stage_abs: &Path,
+        dest_abs: &Path,
+    ) -> std::result::Result<(), AtomicPublishError> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            let wide_stage: Vec<u16> = stage_abs
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let wide_dest: Vec<u16> = dest_abs
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+
+            extern "system" {
+                fn MoveFileExW(
+                    lpExistingFileName: *const u16,
+                    lpNewFileName: *const u16,
+                    dwFlags: u32,
+                ) -> i32;
+                fn GetLastError() -> u32;
+            }
+
+            const MOVEFILE_WRITE_THROUGH: u32 = 0x00000008;
+            // CRITICAL: MOVEFILE_REPLACE_EXISTING (0x1) is deliberately omitted to enforce no-overwrite semantics!
+            let ret = unsafe {
+                MoveFileExW(
+                    wide_stage.as_ptr(),
+                    wide_dest.as_ptr(),
+                    MOVEFILE_WRITE_THROUGH,
+                )
+            };
+
+            if ret != 0 {
+                return Ok(());
+            }
+
+            let err = unsafe { GetLastError() };
+            if err == 183 || err == 80 {
+                // ERROR_ALREADY_EXISTS (183) or ERROR_FILE_EXISTS (80)
+                return Err(AtomicPublishError::DestinationExists);
+            }
+
+            Err(AtomicPublishError::Io(std::io::Error::from_raw_os_error(
+                err as i32,
+            )))
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let c_stage = std::ffi::CString::new(stage_abs.as_os_str().as_bytes())
+                .map_err(|_| AtomicPublishError::Unsupported)?;
+            let c_dest = std::ffi::CString::new(dest_abs.as_os_str().as_bytes())
+                .map_err(|_| AtomicPublishError::Unsupported)?;
+
+            const RENAME_NOREPLACE: libc::c_uint = 1;
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    libc::AT_FDCWD,
+                    c_stage.as_ptr(),
+                    libc::AT_FDCWD,
+                    c_dest.as_ptr(),
+                    RENAME_NOREPLACE,
+                )
+            };
+
+            if ret == 0 {
+                return Ok(());
+            }
+
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if errno == libc::EEXIST {
+                return Err(AtomicPublishError::DestinationExists);
+            }
+            if errno == libc::EINVAL || errno == libc::ENOSYS {
+                return Err(AtomicPublishError::Unsupported);
+            }
+
+            Err(AtomicPublishError::Io(std::io::Error::from_raw_os_error(
+                errno,
+            )))
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let c_stage = std::ffi::CString::new(stage_abs.as_os_str().as_bytes())
+                .map_err(|_| AtomicPublishError::Unsupported)?;
+            let c_dest = std::ffi::CString::new(dest_abs.as_os_str().as_bytes())
+                .map_err(|_| AtomicPublishError::Unsupported)?;
+
+            extern "C" {
+                fn renamex_np(
+                    oldpath: *const libc::c_char,
+                    newpath: *const libc::c_char,
+                    flags: libc::c_uint,
+                ) -> libc::c_int;
+            }
+            const RENAME_EXCL: libc::c_uint = 0x00000004;
+
+            let ret = unsafe { renamex_np(c_stage.as_ptr(), c_dest.as_ptr(), RENAME_EXCL) };
+
+            if ret == 0 {
+                return Ok(());
+            }
+
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if errno == libc::EEXIST {
+                return Err(AtomicPublishError::DestinationExists);
+            }
+            if errno == libc::ENOTSUP {
+                return Err(AtomicPublishError::Unsupported);
+            }
+
+            Err(AtomicPublishError::Io(std::io::Error::from_raw_os_error(
+                errno,
+            )))
+        }
+
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+        {
+            Err(AtomicPublishError::Unsupported)
+        }
+    }
+
+    fn atomic_publish_no_replace(
+        &self,
+        stage_rel: &Path,
+        rel: &Path,
+        stage_abs: &Path,
+        dest_abs: &Path,
+        hooks: &ConditionalReplaceHooks,
+    ) -> std::result::Result<(), AtomicPublishError> {
+        if let Some(hook) = hooks.pre_publish_hook {
+            hook(dest_abs);
+        }
+
+        // Try hard_link as primary atomic no-replace publication where supported
+        let link_res = if hooks.fault_inject_hard_link_failure {
+            Err(std::io::Error::other(
+                "Injected hard-link non-AlreadyExists failure",
+            ))
+        } else {
+            self.dir.hard_link(stage_rel, &self.dir, rel)
+        };
+
+        match link_res {
+            Ok(()) => {
+                let _ = self.dir.remove_file(stage_rel);
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(AtomicPublishError::DestinationExists);
+            }
+            #[cfg(windows)]
+            Err(e) if e.raw_os_error() == Some(183) || e.raw_os_error() == Some(80) => {
+                return Err(AtomicPublishError::DestinationExists);
+            }
+            #[cfg(unix)]
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                return Err(AtomicPublishError::DestinationExists);
+            }
+            Err(_) => {
+                // Hard-link failed for other reasons (e.g. cross-device, unsupported, or fault-injected).
+                // Proceed to platform-specific atomic no-replace fallback.
+            }
+        }
+
+        // Invoke fallback pre-publish hook if provided (deterministic adversarial race testing)
+        if let Some(fb_hook) = hooks.pre_fallback_publish_hook {
+            fb_hook(dest_abs);
+        }
+
+        Self::atomic_publish_fallback(stage_abs, dest_abs)
     }
 
     /// Conditionally replaces or creates a file inside workspace capability with full hook support.
@@ -1262,28 +1458,13 @@ impl WorkspaceCapability {
         }
 
         // 7. Hash verified! Commit replacement: move stage to target
-        // First check if a competing destination object was created at the commit boundary.
-        if self.dir.symlink_metadata(&rel).is_ok() {
-            return Err(self.perform_rollback(
-                &backup_rel,
-                &rel,
-                Some(&stage_rel),
-                user_path,
-                "competing destination object was concurrently created at commit boundary",
-                hooks.fault_inject_rollback_failure,
-            ));
-        }
+        let stage_abs = self.root_path.join(&stage_rel);
+        let publish_res =
+            self.atomic_publish_no_replace(&stage_rel, &rel, &stage_abs, &dest_abs, &hooks);
 
-        // Use hard_link for atomic no-overwrite publish where supported
-        let link_res = self.dir.hard_link(&stage_rel, &self.dir, &rel);
-        match link_res {
-            Ok(()) => {
-                let _ = self.dir.remove_file(&stage_rel);
-            }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::AlreadyExists
-                    || self.dir.symlink_metadata(&rel).is_ok() =>
-            {
+        match publish_res {
+            Ok(()) => {}
+            Err(AtomicPublishError::DestinationExists) => {
                 return Err(self.perform_rollback(
                     &backup_rel,
                     &rel,
@@ -1293,29 +1474,35 @@ impl WorkspaceCapability {
                     hooks.fault_inject_rollback_failure,
                 ));
             }
-            Err(_) => {
-                // Filesystem does not support hard links or hard_link failed for other reason.
-                // Re-verify destination does not exist before rename
-                if self.dir.symlink_metadata(&rel).is_ok() {
-                    return Err(self.perform_rollback(
-                        &backup_rel,
-                        &rel,
-                        Some(&stage_rel),
-                        user_path,
-                        "competing destination object was concurrently created at commit boundary",
-                        hooks.fault_inject_rollback_failure,
-                    ));
-                }
-                if let Err(e) = self.dir.rename(&stage_rel, &self.dir, &rel) {
-                    return Err(self.perform_rollback(
-                        &backup_rel,
-                        &rel,
-                        Some(&stage_rel),
-                        user_path,
-                        &format!("failed to commit replacement file ({})", e),
-                        hooks.fault_inject_rollback_failure,
-                    ));
-                }
+            Err(AtomicPublishError::Unsupported) => {
+                return Err(self.perform_rollback(
+                    &backup_rel,
+                    &rel,
+                    Some(&stage_rel),
+                    user_path,
+                    "filesystem does not support atomic no-replace publication; failed closed to prevent overwrite",
+                    hooks.fault_inject_rollback_failure,
+                ));
+            }
+            Err(AtomicPublishError::CrossDevice) => {
+                return Err(self.perform_rollback(
+                    &backup_rel,
+                    &rel,
+                    Some(&stage_rel),
+                    user_path,
+                    "cross-device link error during publication; failed closed to prevent overwrite",
+                    hooks.fault_inject_rollback_failure,
+                ));
+            }
+            Err(AtomicPublishError::Io(e)) => {
+                return Err(self.perform_rollback(
+                    &backup_rel,
+                    &rel,
+                    Some(&stage_rel),
+                    user_path,
+                    &format!("failed to commit replacement file atomically ({})", e),
+                    hooks.fault_inject_rollback_failure,
+                ));
             }
         }
 
@@ -3273,6 +3460,225 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(outside_dir);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_commit_boundary_primary_path_pre_publish_competing_file_never_overwritten() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_commit_pre_pub_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("service.rs");
+        let original_data = b"pub fn service() -> &'static str { \"PRIMARY_ORIGINAL\" }\n";
+        fs::write(&file_path, original_data).unwrap();
+
+        let initial_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(original_data);
+            format!("{:x}", hasher.finalize())
+        };
+
+        let competing_data = b"pub fn injected() -> &'static str { \"PRE_PUBLISH_INJECTION\" }\n";
+        let pre_pub_hook = |dest: &Path| {
+            // Adversary recreates destination immediately before atomic publication
+            fs::write(dest, competing_data).unwrap();
+        };
+
+        let hooks = ConditionalReplaceHooks {
+            pre_publish_hook: Some(&pre_pub_hook),
+            ..Default::default()
+        };
+
+        let res = cap.replace_file_bytes_conditional_with_hooks(
+            "service.rs",
+            b"pub fn service() -> &'static str { \"NEW_CONTENT\" }\n",
+            Some(&initial_hash),
+            hooks,
+        );
+
+        assert!(
+            res.is_err(),
+            "Primary atomic publication must fail closed when destination was recreated immediately before link"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Commit boundary conflict"),
+            "Error must report commit boundary conflict: {}",
+            err_msg
+        );
+
+        let dest_on_disk = fs::read(&file_path).unwrap();
+        assert_eq!(
+            dest_on_disk, competing_data,
+            "Competing destination file must remain byte-for-byte intact"
+        );
+
+        let mut conflict_found = false;
+        for entry in fs::read_dir(&temp_dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".aether-conflict-") {
+                conflict_found = true;
+                let conflict_data = fs::read(entry.path()).unwrap();
+                assert_eq!(
+                    conflict_data, original_data,
+                    "Conflict file must preserve original data"
+                );
+            }
+        }
+        assert!(
+            conflict_found,
+            "Original data must be preserved in conflict artifact"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_commit_boundary_fallback_path_competing_file_never_overwritten() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_commit_fallback_race_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("critical_service.rs");
+        let original_data = b"pub fn critical() -> &'static str { \"ORIGINAL_CORE\" }\n";
+        fs::write(&file_path, original_data).unwrap();
+
+        let initial_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(original_data);
+            format!("{:x}", hasher.finalize())
+        };
+
+        let competing_data =
+            b"pub fn injected() -> &'static str { \"FALLBACK_WINDOW_INJECTION\" }\n";
+        let pre_fallback_hook = |dest: &Path| {
+            // Adversary recreates destination file specifically at the fallback window
+            // immediately before the platform-specific atomic no-replace publication primitive runs!
+            fs::write(dest, competing_data).unwrap();
+        };
+
+        // Inject hard-link failure to force execution of the platform-specific atomic fallback path
+        let hooks = ConditionalReplaceHooks {
+            fault_inject_hard_link_failure: true,
+            pre_fallback_publish_hook: Some(&pre_fallback_hook),
+            ..Default::default()
+        };
+
+        let res = cap.replace_file_bytes_conditional_with_hooks(
+            "critical_service.rs",
+            b"pub fn critical() -> &'static str { \"PROPOSED_PAYLOAD\" }\n",
+            Some(&initial_hash),
+            hooks,
+        );
+
+        assert!(
+            res.is_err(),
+            "Fallback publication path must fail closed when competing file exists"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Commit boundary conflict"),
+            "Error must report commit boundary conflict on fallback path: {}",
+            err_msg
+        );
+
+        // Competing file must be completely untouched and byte-for-byte intact
+        let dest_on_disk = fs::read(&file_path).unwrap();
+        assert_eq!(
+            dest_on_disk, competing_data,
+            "Competing destination file must NEVER be overwritten on fallback path"
+        );
+
+        // Original data must be safely preserved in conflict file
+        let mut conflict_found = false;
+        for entry in fs::read_dir(&temp_dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".aether-conflict-") {
+                conflict_found = true;
+                let conflict_data = fs::read(entry.path()).unwrap();
+                assert_eq!(
+                    conflict_data, original_data,
+                    "Original data must be recovered in conflict file on fallback path"
+                );
+            }
+        }
+        assert!(
+            conflict_found,
+            "Conflict artifact must be created to preserve original data"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_commit_boundary_fallback_path_competing_directory_preserved() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_commit_fallback_dir_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        let target_path = temp_dir.join("module_target");
+        let original_data = b"pub fn initial_module() {}\n";
+        fs::write(&target_path, original_data).unwrap();
+
+        let initial_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(original_data);
+            format!("{:x}", hasher.finalize())
+        };
+
+        let pre_fallback_hook = |dest: &Path| {
+            // Adversary recreates destination as a directory at the fallback publication boundary
+            fs::create_dir_all(dest).unwrap();
+            fs::write(dest.join("subfile.txt"), b"directory content").unwrap();
+        };
+
+        let hooks = ConditionalReplaceHooks {
+            fault_inject_hard_link_failure: true,
+            pre_fallback_publish_hook: Some(&pre_fallback_hook),
+            ..Default::default()
+        };
+
+        let res = cap.replace_file_bytes_conditional_with_hooks(
+            "module_target",
+            b"pub fn new_module() {}\n",
+            Some(&initial_hash),
+            hooks,
+        );
+
+        assert!(
+            res.is_err(),
+            "Fallback publication must fail closed when competing directory is created"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Commit boundary conflict"),
+            "Error must report commit boundary conflict: {}",
+            err_msg
+        );
+
+        // Competing directory must be preserved
+        assert!(
+            target_path.is_dir(),
+            "Competing directory must remain structurally intact"
+        );
+        assert_eq!(
+            fs::read(target_path.join("subfile.txt")).unwrap(),
+            b"directory content"
+        );
+
         let _ = fs::remove_dir_all(temp_dir);
     }
 

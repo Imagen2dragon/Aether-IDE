@@ -481,6 +481,8 @@ pub fn parse_unified_diff_internal(patch: &str) -> Result<(Vec<DiffHunk>, bool),
 
     let mut last_old_end = 0;
     let mut last_new_end = 0;
+    let mut cumulative_delta: isize = 0;
+
     for (idx, hunk) in hunks.iter().enumerate() {
         let hunk_old_end = if hunk.old_count == 0 {
             hunk.old_start
@@ -517,6 +519,51 @@ pub fn parse_unified_diff_internal(patch: &str) -> Result<(Vec<DiffHunk>, bool),
             }
         }
 
+        // Validate expected new_start position based on preceding hunks and unchanged lines
+        let lines_before = if hunk.old_count == 0 {
+            (hunk.old_start as isize) + cumulative_delta
+        } else if hunk.old_start == 0 {
+            0isize
+        } else {
+            (hunk.old_start as isize - 1) + cumulative_delta
+        };
+
+        if lines_before < 0 {
+            return Err(format!(
+                "Malformed patch: Hunk {} implies negative output line count before hunk: {}",
+                idx + 1,
+                lines_before
+            ));
+        }
+
+        let lb = lines_before as usize;
+        if hunk.new_count > 0 {
+            let expected_new_start = lb + 1;
+            if hunk.new_start != expected_new_start {
+                return Err(format!(
+                    "Malformed patch: Hunk {} new_start ({}) does not match expected output position ({}) based on preceding hunks",
+                    idx + 1,
+                    hunk.new_start,
+                    expected_new_start
+                ));
+            }
+        } else {
+            // Zero-length produced lines (e.g. deletion hunk).
+            // In POSIX/GNU diff, new_start indicates the line after which the change occurs (or 0 if at start).
+            let is_valid_zero = hunk.new_start == lb
+                || (lb == 0 && hunk.new_start == 0)
+                || hunk.new_start == lb + 1;
+            if !is_valid_zero {
+                return Err(format!(
+                    "Malformed patch: Hunk {} zero-length new_start ({}) is inconsistent with expected output lines ({})",
+                    idx + 1,
+                    hunk.new_start,
+                    lb
+                ));
+            }
+        }
+
+        cumulative_delta += (hunk.new_count as isize) - (hunk.old_count as isize);
         last_old_end = hunk_old_end;
         last_new_end = hunk_new_end;
     }
@@ -581,6 +628,31 @@ pub fn apply_unified_diff(original: &str, patch: &str) -> Result<String, String>
         while curr_orig_idx < target_idx {
             output_lines.push(active_orig[curr_orig_idx].to_string());
             curr_orig_idx += 1;
+        }
+
+        let lines_before = output_lines.len();
+        if hunk.new_count > 0 {
+            let expected_new_start = lines_before + 1;
+            if hunk.new_start != expected_new_start {
+                return Err(format!(
+                    "Malformed patch: Hunk {} new_start ({}) does not match actual output line position ({})",
+                    hunk_idx + 1,
+                    hunk.new_start,
+                    expected_new_start
+                ));
+            }
+        } else {
+            let is_valid_zero = hunk.new_start == lines_before
+                || (lines_before == 0 && hunk.new_start == 0)
+                || hunk.new_start == lines_before + 1;
+            if !is_valid_zero {
+                return Err(format!(
+                    "Malformed patch: Hunk {} zero-length new_start ({}) is inconsistent with actual output lines ({})",
+                    hunk_idx + 1,
+                    hunk.new_start,
+                    lines_before
+                ));
+            }
         }
 
         for line in &hunk.lines {
@@ -1500,14 +1572,14 @@ mod tests {
     }
 
     #[test]
-    fn test_ai_safety_genuine_checkpoint_engine_failure_aborts_without_mutation() {
+    fn test_ai_safety_simulated_checkpoint_failure_aborts_without_mutation() {
         let (temp, session, ckpt) = setup_test_workspace();
         let file_path = temp.path().join("production.rs");
         let original_bytes = b"pub fn critical_system() -> bool { true }\n";
         std::fs::write(&file_path, original_bytes).unwrap();
         let hash = compute_sha256(original_bytes);
 
-        // Arm genuine failure in real checkpoint engine
+        // Arm simulated early pre-storage failure in checkpoint engine
         ckpt.set_simulate_backup_failure(true);
 
         let proposal = StructuredProposal {
@@ -1522,7 +1594,10 @@ mod tests {
         };
 
         let res = execute_proposal_internal(&session, Some(&ckpt), &proposal);
-        assert!(res.is_err(), "Genuine checkpoint failure must fail closed");
+        assert!(
+            res.is_err(),
+            "Simulated checkpoint failure must fail closed"
+        );
         let err = res.unwrap_err();
         assert!(
             err.contains("Mandatory pre-edit checkpoint failed"),
@@ -1547,5 +1622,152 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn test_ai_safety_genuine_checkpoint_blob_storage_write_failure_aborts_without_mutation() {
+        let (temp, session, ckpt) = setup_test_workspace();
+        let file_path = temp.path().join("core_database.rs");
+        let original_bytes = b"pub fn execute_transaction() -> Result<(), ()> { Ok(()) }\n";
+        std::fs::write(&file_path, original_bytes).unwrap();
+        let hash = compute_sha256(original_bytes);
+
+        // Arm deterministic failure at the genuine blob storage write operation
+        // (after snapshot directory creation, workspace file discovery, and hashing have begun)
+        ckpt.set_fault_inject_blob_storage_failure(true);
+
+        let proposal = StructuredProposal {
+            proposal_id: "prop-genuine-storage-fail".into(),
+            workspace_id: session.workspace_id(),
+            relative_path: "core_database.rs".into(),
+            operation: "replace_file".into(),
+            base_hash: hash,
+            unified_diff: "".into(),
+            proposed_content: "pub fn execute_transaction() -> Result<(), ()> { Err(()) }\n".into(),
+            insertion_line: None,
+        };
+
+        // Invoke the real production execute_proposal_internal path
+        let res = execute_proposal_internal(&session, Some(&ckpt), &proposal);
+        assert!(
+            res.is_err(),
+            "Proposal execution must fail closed on genuine checkpoint blob storage failure"
+        );
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("Mandatory pre-edit checkpoint failed"),
+            "Error must indicate mandatory pre-edit checkpoint failure: {}",
+            err
+        );
+
+        // Assert that the target file remains 100% byte-for-byte unchanged
+        assert_eq!(
+            std::fs::read(&file_path).unwrap(),
+            original_bytes,
+            "Target file must remain byte-for-byte unchanged"
+        );
+
+        // Assert that no replacement is published and zero staging artifacts remain
+        for entry in std::fs::read_dir(temp.path()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with(".aether-stage-"),
+                "No staging artifacts should remain: {}",
+                name
+            );
+        }
+
+        // Assert that no incomplete checkpoint is registered or treated as valid
+        let stored_checkpoints = ckpt.list_checkpoints().unwrap();
+        assert!(
+            stored_checkpoints.is_empty(),
+            "No incomplete checkpoint must be treated as valid or listed in metadata"
+        );
+    }
+
+    #[test]
+    fn test_diff_inconsistent_new_start_rejected() {
+        // Hunk claims to replace the first line of a one-line file at new_start 99
+        let patch = "@@ -1,1 +99,1 @@\n-old line\n+new line\n";
+        let res = parse_unified_diff(patch);
+        assert!(
+            res.is_err(),
+            "Hunk with inconsistent new_start (99) must be rejected"
+        );
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("new_start (99) does not match expected output position"),
+            "Error must identify inconsistent new_start: {}",
+            err
+        );
+
+        let apply_res = apply_unified_diff("old line\n", patch);
+        assert!(
+            apply_res.is_err(),
+            "apply_unified_diff must reject inconsistent new_start"
+        );
+    }
+
+    #[test]
+    fn test_diff_valid_insertions_and_deletions_start_middle_end() {
+        let base_content = "line 1\nline 2\nline 3\nline 4\n";
+
+        // 1. Beginning insertion
+        let patch_ins_start = "@@ -0,0 +1,1 @@\n+line 0\n";
+        let res_ins_start = apply_unified_diff(base_content, patch_ins_start).unwrap();
+        assert_eq!(
+            res_ins_start, "line 0\nline 1\nline 2\nline 3\nline 4\n",
+            "Beginning insertion failed"
+        );
+
+        // 2. Middle insertion (after line 2)
+        let patch_ins_mid = "@@ -2,0 +3,1 @@\n+line 2.5\n";
+        let res_ins_mid = apply_unified_diff(base_content, patch_ins_mid).unwrap();
+        assert_eq!(
+            res_ins_mid, "line 1\nline 2\nline 2.5\nline 3\nline 4\n",
+            "Middle insertion failed"
+        );
+
+        // 3. End insertion (after line 4)
+        let patch_ins_end = "@@ -4,0 +5,1 @@\n+line 5\n";
+        let res_ins_end = apply_unified_diff(base_content, patch_ins_end).unwrap();
+        assert_eq!(
+            res_ins_end, "line 1\nline 2\nline 3\nline 4\nline 5\n",
+            "End insertion failed"
+        );
+
+        // 4. Beginning deletion (delete line 1)
+        let patch_del_start = "@@ -1,1 +0,0 @@\n-line 1\n";
+        let res_del_start = apply_unified_diff(base_content, patch_del_start).unwrap();
+        assert_eq!(
+            res_del_start, "line 2\nline 3\nline 4\n",
+            "Beginning deletion failed"
+        );
+
+        // 5. Middle deletion (delete line 2)
+        let patch_del_mid = "@@ -2,1 +1,0 @@\n-line 2\n";
+        let res_del_mid = apply_unified_diff(base_content, patch_del_mid).unwrap();
+        assert_eq!(
+            res_del_mid, "line 1\nline 3\nline 4\n",
+            "Middle deletion failed"
+        );
+
+        // 6. End deletion (delete line 4)
+        let patch_del_end = "@@ -4,1 +3,0 @@\n-line 4\n";
+        let res_del_end = apply_unified_diff(base_content, patch_del_end).unwrap();
+        assert_eq!(
+            res_del_end, "line 1\nline 2\nline 3\n",
+            "End deletion failed"
+        );
+
+        // 7. CRLF preservation with beginning, middle, end edits
+        let crlf_base = "line 1\r\nline 2\r\nline 3\r\n";
+        let crlf_patch = "@@ -2,1 +2,1 @@\n-line 2\n+line 2 edited\n";
+        let crlf_res = apply_unified_diff(crlf_base, crlf_patch).unwrap();
+        assert_eq!(
+            crlf_res, "line 1\r\nline 2 edited\r\nline 3\r\n",
+            "CRLF preservation failed"
+        );
     }
 }

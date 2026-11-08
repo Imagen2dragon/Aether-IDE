@@ -289,6 +289,7 @@ pub struct CheckpointEngine {
     storage_dir: PathBuf,
     active_previews: Arc<Mutex<HashMap<String, ActivePreviewSession>>>,
     simulate_backup_failure: std::sync::atomic::AtomicBool,
+    fault_inject_blob_storage_failure: std::sync::atomic::AtomicBool,
     active_restore_paths: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
     pre_replace_hook: Arc<Mutex<Option<PreReplaceHook>>>,
     post_hash_hook: Arc<Mutex<Option<PreReplaceHook>>>,
@@ -352,6 +353,7 @@ impl CheckpointEngine {
             storage_dir: p,
             active_previews: Arc::new(Mutex::new(HashMap::new())),
             simulate_backup_failure: std::sync::atomic::AtomicBool::new(false),
+            fault_inject_blob_storage_failure: std::sync::atomic::AtomicBool::new(false),
             active_restore_paths: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pre_replace_hook: Arc::new(Mutex::new(None)),
             post_hash_hook: Arc::new(Mutex::new(None)),
@@ -431,6 +433,12 @@ impl CheckpointEngine {
     pub fn set_simulate_backup_failure(&self, simulate: bool) {
         self.simulate_backup_failure
             .store(simulate, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn set_fault_inject_blob_storage_failure(&self, inject: bool) {
+        self.fault_inject_blob_storage_failure
+            .store(inject, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[doc(hidden)]
@@ -3858,7 +3866,18 @@ impl CheckpointEngine {
 
                 // Content-addressed write: deduplicate if blob already exists
                 if !blob_path.exists() {
-                    let _ = std::fs::write(&blob_path, &bytes);
+                    if self
+                        .fault_inject_blob_storage_failure
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        // Clean up partial snapshot directory according to recovery contract
+                        let _ = std::fs::remove_dir_all(&snapshot_dir);
+                        return Err(AetherError::Io(std::io::Error::new(
+                            std::io::ErrorKind::StorageFull,
+                            "Checkpoint storage failure writing blob: physical disk full / storage write error",
+                        )));
+                    }
+                    std::fs::write(&blob_path, &bytes).map_err(AetherError::Io)?;
                 }
 
                 file_records.push(CheckpointFileRecord {

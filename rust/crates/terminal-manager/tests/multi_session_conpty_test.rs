@@ -4,6 +4,24 @@ async fn test_multi_session_conpty_lifecycle() {
     use std::time::Duration;
     use terminal_manager::TerminalManager;
 
+    extern "system" {
+        fn OpenProcess(
+            dwDesiredAccess: u32,
+            bInheritHandle: i32,
+            dwProcessId: u32,
+        ) -> *mut std::ffi::c_void;
+        fn GetExitCodeProcess(hProcess: *mut std::ffi::c_void, lpExitCode: *mut u32) -> i32;
+        fn WaitForSingleObject(hHandle: *mut std::ffi::c_void, dwMilliseconds: u32) -> u32;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const SYNCHRONIZE: u32 = 0x00100000;
+    const STILL_ACTIVE: u32 = 259;
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 0x00000102;
+
     let manager = TerminalManager::new();
 
     // 1. Spawn Session 1 (PID 1) and Session 2 (PID 2)
@@ -24,21 +42,48 @@ async fn test_multi_session_conpty_lifecycle() {
     let pid1 = s1.pid.unwrap();
     let pid2 = s2.pid.unwrap();
 
+    // Acquire and retain real Win32 process handles IMMEDIATELY while child processes are alive.
+    // Holding open kernel handles guarantees:
+    // 1. The Win32 process objects cannot be recycled or destroyed until handles are closed.
+    // 2. Waiting on these handles via WaitForSingleObject is 100% identity-bound to these specific child instances.
+    let h_proc1 = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid1) };
+    assert!(
+        !h_proc1.is_null(),
+        "Must acquire identity-bound handle to Session 1 process. Win32 error: {}",
+        unsafe { GetLastError() }
+    );
+
+    let h_proc2 = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid2) };
+    assert!(
+        !h_proc2.is_null(),
+        "Must acquire identity-bound handle to Session 2 process. Win32 error: {}",
+        unsafe { GetLastError() }
+    );
+
     // RAII guard: ensure cleanup runs even if an assertion fails later in the test
     struct SessionCleanupGuard<'a> {
         mgr: &'a TerminalManager,
         sessions: Vec<u32>,
+        handles: Vec<*mut std::ffi::c_void>,
     }
     impl<'a> Drop for SessionCleanupGuard<'a> {
         fn drop(&mut self) {
             for &id in &self.sessions {
                 let _ = self.mgr.close_session(id);
             }
+            for &h in &self.handles {
+                if !h.is_null() {
+                    unsafe {
+                        CloseHandle(h);
+                    }
+                }
+            }
         }
     }
     let mut guard = SessionCleanupGuard {
         mgr: &manager,
         sessions: vec![s1.id, s2.id],
+        handles: vec![h_proc1, h_proc2],
     };
 
     // Verify initial session dimensions
@@ -137,6 +182,29 @@ async fn test_multi_session_conpty_lifecycle() {
     manager.close_session(s1.id).expect("close s1");
     guard.sessions.retain(|&id| id != s1.id);
 
+    // Verify Session 1 process termination on the retained handle
+    let wait_res1 = unsafe { WaitForSingleObject(h_proc1, 5000) };
+    assert_ne!(
+        wait_res1, WAIT_TIMEOUT,
+        "Session 1 process timed out waiting for termination"
+    );
+    assert_eq!(
+        wait_res1, WAIT_OBJECT_0,
+        "Session 1 process must transition to signaled (terminated) within 5s"
+    );
+    let mut exit_code1: u32 = 0;
+    let ok1 = unsafe { GetExitCodeProcess(h_proc1, &mut exit_code1) };
+    assert_ne!(
+        ok1,
+        0,
+        "GetExitCodeProcess failed for Session 1 with error {}",
+        unsafe { GetLastError() }
+    );
+    assert_ne!(
+        exit_code1, STILL_ACTIVE,
+        "Session 1 process must not be STILL_ACTIVE after close"
+    );
+
     // Verify Session 2 is still responsive
     manager
         .write_input(s2.id, b"echo SESSION_2_POST_CLOSE_S1\r\n")
@@ -154,103 +222,29 @@ async fn test_multi_session_conpty_lifecycle() {
         out2_post
     );
 
-    // 6. Close Session 2 and verify both processes are terminated without orphans
+    // 6. Close Session 2 and verify its termination on its retained handle
     manager.close_session(s2.id).expect("close s2");
     guard.sessions.retain(|&id| id != s2.id);
 
-    // Allow JobObject / process teardown to settle
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // Check Windows process exit status with rigorous distinction:
-    // Distinguish ERROR_INVALID_PARAMETER (PID no longer exists) from query failures (e.g. ERROR_ACCESS_DENIED)
-    extern "system" {
-        fn OpenProcess(
-            dwDesiredAccess: u32,
-            bInheritHandle: i32,
-            dwProcessId: u32,
-        ) -> *mut std::ffi::c_void;
-        fn GetExitCodeProcess(hProcess: *mut std::ffi::c_void, lpExitCode: *mut u32) -> i32;
-        fn WaitForSingleObject(hHandle: *mut std::ffi::c_void, dwMilliseconds: u32) -> u32;
-        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
-        fn GetLastError() -> u32;
-    }
-
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    const SYNCHRONIZE: u32 = 0x00100000;
-    const STILL_ACTIVE: u32 = 259;
-    const WAIT_OBJECT_0: u32 = 0;
-    const WAIT_TIMEOUT: u32 = 0x00000102;
-    const ERROR_INVALID_PARAMETER: u32 = 87;
-
-    let verify_process_terminated = |pid: u32, timeout_ms: u32| -> Result<bool, String> {
-        unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid);
-            if handle.is_null() {
-                let err = GetLastError();
-                if err == ERROR_INVALID_PARAMETER {
-                    // PID does not exist in kernel process table: confirmed dead
-                    return Ok(true);
-                }
-                if err == 5 {
-                    // ERROR_ACCESS_DENIED: query permission error, NOT proof of termination
-                    return Err(format!(
-                        "Query failed for PID {}: Access Denied (error 5). Process exists but cannot be queried.",
-                        pid
-                    ));
-                }
-                return Err(format!(
-                    "OpenProcess failed unexpectedly for PID {} with Win32 error {}",
-                    pid, err
-                ));
-            }
-
-            let wait_res = WaitForSingleObject(handle, timeout_ms);
-            let mut exit_code: u32 = 0;
-            let ok = GetExitCodeProcess(handle, &mut exit_code);
-            CloseHandle(handle);
-
-            if ok == 0 {
-                let err = GetLastError();
-                return Err(format!(
-                    "GetExitCodeProcess failed for PID {} with Win32 error {}",
-                    pid, err
-                ));
-            }
-
-            if wait_res == WAIT_OBJECT_0 || exit_code != STILL_ACTIVE {
-                Ok(true)
-            } else if wait_res == WAIT_TIMEOUT {
-                Ok(false)
-            } else {
-                Err(format!(
-                    "WaitForSingleObject returned unexpected status 0x{:X} for PID {}",
-                    wait_res, pid
-                ))
-            }
-        }
-    };
-
-    let res1 = verify_process_terminated(pid1, 3000);
-    assert!(
-        res1.is_ok(),
-        "Session 1 process termination query failed: {:?}",
-        res1.err()
+    let wait_res2 = unsafe { WaitForSingleObject(h_proc2, 5000) };
+    assert_ne!(
+        wait_res2, WAIT_TIMEOUT,
+        "Session 2 process timed out waiting for termination"
     );
-    assert!(
-        res1.unwrap(),
-        "Session 1 child process {} must be confirmed terminated",
-        pid1
+    assert_eq!(
+        wait_res2, WAIT_OBJECT_0,
+        "Session 2 process must transition to signaled (terminated) within 5s"
     );
-
-    let res2 = verify_process_terminated(pid2, 3000);
-    assert!(
-        res2.is_ok(),
-        "Session 2 process termination query failed: {:?}",
-        res2.err()
+    let mut exit_code2: u32 = 0;
+    let ok2 = unsafe { GetExitCodeProcess(h_proc2, &mut exit_code2) };
+    assert_ne!(
+        ok2,
+        0,
+        "GetExitCodeProcess failed for Session 2 with error {}",
+        unsafe { GetLastError() }
     );
-    assert!(
-        res2.unwrap(),
-        "Session 2 child process {} must be confirmed terminated",
-        pid2
+    assert_ne!(
+        exit_code2, STILL_ACTIVE,
+        "Session 2 process must not be STILL_ACTIVE after close"
     );
 }
