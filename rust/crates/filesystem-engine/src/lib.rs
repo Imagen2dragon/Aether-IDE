@@ -394,6 +394,575 @@ pub fn query_directory_identity(_path: &Path) -> Result<FileObjectIdentity> {
 }
 
 #[cfg(windows)]
+#[derive(Debug)]
+pub struct PinnedDirectoryHandle {
+    file: std::fs::File,
+    path: PathBuf,
+    identity: FileObjectIdentity,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct PinnedDirectoryHandle {
+    fd: std::os::unix::io::OwnedFd,
+    path: PathBuf,
+    identity: FileObjectIdentity,
+}
+
+#[cfg(not(any(windows, unix)))]
+#[derive(Debug)]
+pub struct PinnedDirectoryHandle {
+    path: PathBuf,
+    identity: FileObjectIdentity,
+}
+
+#[cfg(windows)]
+impl PinnedDirectoryHandle {
+    pub fn identity(&self) -> FileObjectIdentity {
+        self.identity
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn clean_contents(&self) -> Result<()> {
+        let current_id = query_directory_identity(&self.path)?;
+        if current_id != self.identity {
+            return Err(AetherError::PermissionDenied(format!(
+                "Refusing cleanup: directory '{:?}' was replaced (expected {:?}, found {:?})",
+                self.path, self.identity, current_id
+            )));
+        }
+        clean_directory_tree_windows(&self.path)
+    }
+
+    pub fn verify_and_remove_entry(self) -> Result<()> {
+        let current_id = match query_directory_identity(&self.path) {
+            Ok(id) => id,
+            Err(AetherError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(())
+            }
+            Err(e) => return Err(e),
+        };
+
+        if current_id != self.identity {
+            return Err(AetherError::PermissionDenied(format!(
+                "Directory entry '{:?}' identity conflict: directory was replaced (expected {:?}, found {:?}); refusing removal to preserve replaced object",
+                self.path, self.identity, current_id
+            )));
+        }
+
+        // Drop the open handle so Windows allows directory entry removal
+        drop(self.file);
+
+        match std::fs::remove_dir(&self.path) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(AetherError::Io(e)),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn clean_directory_tree_windows(dir_path: &Path) -> Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+
+    let entries = match std::fs::read_dir(dir_path) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(AetherError::Io(e)),
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(AetherError::Io)?;
+        let child_path = entry.path();
+        let meta = std::fs::symlink_metadata(&child_path).map_err(AetherError::Io)?;
+        let is_reparse = (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+
+        if meta.file_type().is_symlink() || is_reparse {
+            if meta.is_dir() {
+                std::fs::remove_dir(&child_path).map_err(AetherError::Io)?;
+            } else {
+                std::fs::remove_file(&child_path).map_err(AetherError::Io)?;
+            }
+        } else if meta.is_dir() {
+            clean_directory_tree_windows(&child_path)?;
+            std::fs::remove_dir(&child_path).map_err(AetherError::Io)?;
+        } else {
+            std::fs::remove_file(&child_path).map_err(AetherError::Io)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn pin_created_directory(path: &Path) -> Result<PinnedDirectoryHandle> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+    const FILE_SHARE_READ: u32 = 0x00000001;
+    const FILE_SHARE_WRITE: u32 = 0x00000002;
+    const FILE_SHARE_DELETE: u32 = 0x00000004;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
+    const FILE_TYPE_DISK: u32 = 0x0001;
+    const GENERIC_READ: u32 = 0x80000000;
+    const DELETE: u32 = 0x00010000;
+    const SYNCHRONIZE: u32 = 0x00100000;
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(GENERIC_READ | DELETE | SYNCHRONIZE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(AetherError::Io)?;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct BY_HANDLE_FILE_INFORMATION {
+        dwFileAttributes: u32,
+        ftCreationTime: [u32; 2],
+        ftLastAccessTime: [u32; 2],
+        ftLastWriteTime: [u32; 2],
+        dwVolumeSerialNumber: u32,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+        nNumberOfLinks: u32,
+        nFileIndexHigh: u32,
+        nFileIndexLow: u32,
+    }
+    extern "system" {
+        fn GetFileType(hFile: *mut std::ffi::c_void) -> u32;
+        fn GetFileInformationByHandle(
+            hFile: *mut std::ffi::c_void,
+            lpFileInformation: *mut BY_HANDLE_FILE_INFORMATION,
+        ) -> i32;
+        fn GetFinalPathNameByHandleW(
+            hFile: *mut std::ffi::c_void,
+            lpszFilePath: *mut u16,
+            cchFilePath: u32,
+            dwFlags: u32,
+        ) -> u32;
+    }
+
+    let file_type = unsafe { GetFileType(file.as_raw_handle()) };
+    if file_type != FILE_TYPE_DISK {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is not a standard disk directory (file type: 0x{:x})",
+            path.display(),
+            file_type
+        )));
+    }
+
+    let mut by_handle_info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    let info_res =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), by_handle_info.as_mut_ptr()) };
+    if info_res == 0 {
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+    let file_info = unsafe { by_handle_info.assume_init() };
+
+    let is_reparse = (file_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    let is_dir = (file_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    if is_reparse {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is a reparse point (attributes: 0x{:x}); refusing directory handle pinning",
+            path.display(),
+            file_info.dwFileAttributes
+        )));
+    }
+    if !is_dir {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is not a directory (attributes: 0x{:x}); refusing directory handle pinning",
+            path.display(),
+            file_info.dwFileAttributes
+        )));
+    }
+
+    // Path verification: GetFinalPathNameByHandleW
+    let mut buf = vec![0u16; 1024];
+    let len = unsafe {
+        GetFinalPathNameByHandleW(file.as_raw_handle(), buf.as_mut_ptr(), buf.len() as u32, 0)
+    };
+    if len > 0 && (len as usize) < buf.len() {
+        let final_path_str = String::from_utf16_lossy(&buf[..len as usize]);
+        let normalized = final_path_str.trim_start_matches(r"\\?\");
+        if let Ok(canon) = std::fs::canonicalize(path) {
+            let canon_str = canon.to_string_lossy();
+            let canon_norm = canon_str.trim_start_matches(r"\\?\");
+            if !normalized.eq_ignore_ascii_case(canon_norm) {
+                return Err(AetherError::PermissionDenied(format!(
+                    "Path verification failed for directory '{}': normalized target '{}' does not match '{}'",
+                    path.display(),
+                    normalized,
+                    canon_norm
+                )));
+            }
+        }
+    }
+
+    // A newly created snapshot directory must be empty. If it contains entries,
+    // an adversary placed a replacement directory with files before ownership capture.
+    let mut entries = std::fs::read_dir(path).map_err(AetherError::Io)?;
+    if entries.next().is_some() {
+        return Err(AetherError::PermissionDenied(format!(
+            "Directory '{}' is not empty; refusing to pin non-empty directory as newly created snapshot directory",
+            path.display()
+        )));
+    }
+
+    let identity = FileObjectIdentity {
+        volume_serial_number: file_info.dwVolumeSerialNumber as u64,
+        file_index_high: file_info.nFileIndexHigh as u64,
+        file_index_low: file_info.nFileIndexLow as u64,
+    };
+
+    Ok(PinnedDirectoryHandle {
+        file,
+        path: path.to_path_buf(),
+        identity,
+    })
+}
+
+#[cfg(unix)]
+impl PinnedDirectoryHandle {
+    pub fn identity(&self) -> FileObjectIdentity {
+        self.identity
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn clean_contents(&self) -> Result<()> {
+        use std::os::unix::io::AsRawFd;
+        clean_dir_descriptor(self.fd.as_raw_fd())
+    }
+
+    pub fn verify_and_remove_entry(self) -> Result<()> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::{FromRawFd, OwnedFd};
+
+        let parent_path = self.path.parent().ok_or_else(|| {
+            AetherError::PermissionDenied(format!("Directory '{:?}' has no parent", self.path))
+        })?;
+        let file_name = self.path.file_name().ok_or_else(|| {
+            AetherError::PermissionDenied(format!("Directory '{:?}' has no file name", self.path))
+        })?;
+
+        let c_parent = CString::new(parent_path.as_os_str().as_bytes())
+            .map_err(|e| AetherError::Internal(format!("Invalid parent CString: {}", e)))?;
+        let c_name = CString::new(file_name.as_bytes())
+            .map_err(|e| AetherError::Internal(format!("Invalid file name CString: {}", e)))?;
+
+        let parent_fd_raw = unsafe {
+            libc::open(
+                c_parent.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if parent_fd_raw < 0 {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+        let _parent_fd = unsafe { OwnedFd::from_raw_fd(parent_fd_raw) };
+
+        let mut entry_stat: libc::stat = unsafe { std::mem::zeroed() };
+        let res = unsafe {
+            libc::fstatat(
+                parent_fd_raw,
+                c_name.as_ptr(),
+                &mut entry_stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if res != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            return Err(AetherError::Io(err));
+        }
+
+        let entry_ino = entry_stat.st_ino as u64;
+        let entry_dev = entry_stat.st_dev as u64;
+        let expected_ino =
+            ((self.identity.file_index_high as u64) << 32) | (self.identity.file_index_low as u64);
+        let expected_dev = self.identity.volume_serial_number;
+
+        if entry_dev != expected_dev || entry_ino != expected_ino {
+            return Err(AetherError::PermissionDenied(format!(
+                "Directory entry '{:?}' identity conflict: directory was replaced (expected dev {} ino {}, found dev {} ino {}); refusing unlinking to preserve replaced object",
+                self.path, expected_dev, expected_ino, entry_dev, entry_ino
+            )));
+        }
+
+        if unsafe { libc::unlinkat(parent_fd_raw, c_name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            return Err(AetherError::Io(err));
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+pub fn pin_created_directory(path: &Path) -> Result<PinnedDirectoryHandle> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{FromRawFd, OwnedFd};
+
+    let parent_path = path.parent().ok_or_else(|| {
+        AetherError::PermissionDenied(format!("Snapshot directory '{:?}' has no parent", path))
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        AetherError::PermissionDenied(format!("Snapshot directory '{:?}' has no file name", path))
+    })?;
+
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| AetherError::Internal(format!("Invalid path CString: {}", e)))?;
+    let c_parent = CString::new(parent_path.as_os_str().as_bytes())
+        .map_err(|e| AetherError::Internal(format!("Invalid parent path CString: {}", e)))?;
+    let c_name = CString::new(file_name.as_bytes())
+        .map_err(|e| AetherError::Internal(format!("Invalid file name CString: {}", e)))?;
+
+    let dir_fd_raw = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if dir_fd_raw < 0 {
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(dir_fd_raw) };
+
+    let mut dir_stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(dir_fd_raw, &mut dir_stat) } != 0 {
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+
+    if (dir_stat.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is not a directory; refusing directory descriptor pinning",
+            path.display()
+        )));
+    }
+
+    let parent_fd_raw = unsafe {
+        libc::open(
+            c_parent.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if parent_fd_raw < 0 {
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+    let _parent_fd = unsafe { OwnedFd::from_raw_fd(parent_fd_raw) };
+
+    let mut parent_entry_stat: libc::stat = unsafe { std::mem::zeroed() };
+    let statat_res = unsafe {
+        libc::fstatat(
+            parent_fd_raw,
+            c_name.as_ptr(),
+            &mut parent_entry_stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if statat_res != 0 {
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+
+    if (parent_entry_stat.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+        return Err(AetherError::PermissionDenied(format!(
+            "Directory entry '{}' in parent is a symlink; refusing directory descriptor pinning",
+            path.display()
+        )));
+    }
+
+    if dir_stat.st_dev != parent_entry_stat.st_dev || dir_stat.st_ino != parent_entry_stat.st_ino {
+        return Err(AetherError::PermissionDenied(format!(
+            "Relationship mismatch for directory '{}': parent entry points to dev {} ino {}, but open descriptor is dev {} ino {}",
+            path.display(),
+            parent_entry_stat.st_dev,
+            parent_entry_stat.st_ino,
+            dir_stat.st_dev,
+            dir_stat.st_ino
+        )));
+    }
+
+    // A newly created snapshot directory must be empty
+    let mut entries = std::fs::read_dir(path).map_err(AetherError::Io)?;
+    if entries.next().is_some() {
+        return Err(AetherError::PermissionDenied(format!(
+            "Directory '{}' is not empty; refusing to pin non-empty directory as newly created snapshot directory",
+            path.display()
+        )));
+    }
+
+    let ino = dir_stat.st_ino as u64;
+    let identity = FileObjectIdentity {
+        volume_serial_number: dir_stat.st_dev as u64,
+        file_index_high: (ino >> 32) as u64,
+        file_index_low: (ino & 0xFFFFFFFF) as u64,
+    };
+
+    Ok(PinnedDirectoryHandle {
+        fd,
+        path: path.to_path_buf(),
+        identity,
+    })
+}
+
+#[cfg(unix)]
+fn clean_dir_descriptor(dir_fd: libc::c_int) -> Result<()> {
+    use std::ffi::CStr;
+    use std::os::unix::io::{FromRawFd, OwnedFd};
+
+    let dup_fd = unsafe { libc::dup(dir_fd) };
+    if dup_fd < 0 {
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+
+    let dir_ptr = unsafe { libc::fdopendir(dup_fd) };
+    if dir_ptr.is_null() {
+        unsafe {
+            libc::close(dup_fd);
+        }
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+
+    loop {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        #[cfg(target_os = "macos")]
+        unsafe {
+            *libc::__error() = 0;
+        }
+
+        let entry_ptr = unsafe { libc::readdir(dir_ptr) };
+        if entry_ptr.is_null() {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(0) && err.raw_os_error() != None {
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::Io(err));
+            }
+            break;
+        }
+
+        let entry = unsafe { &*entry_ptr };
+        let name_bytes = unsafe { CStr::from_ptr(entry.d_name.as_ptr()) }.to_bytes();
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+
+        let c_name = entry.d_name.as_ptr();
+
+        let mut child_stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatat(dir_fd, c_name, &mut child_stat, libc::AT_SYMLINK_NOFOLLOW) } != 0
+        {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::NotFound {
+                continue;
+            }
+            unsafe {
+                libc::closedir(dir_ptr);
+            }
+            return Err(AetherError::Io(err));
+        }
+
+        let is_symlink = (child_stat.st_mode & libc::S_IFMT) == libc::S_IFLNK;
+        let is_dir = (child_stat.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+
+        if is_symlink {
+            if unsafe { libc::unlinkat(dir_fd, c_name, 0) } != 0 {
+                let err = std::io::Error::last_os_error();
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::Io(err));
+            }
+        } else if is_dir {
+            let child_fd_raw = unsafe {
+                libc::openat(
+                    dir_fd,
+                    c_name,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if child_fd_raw < 0 {
+                let err = std::io::Error::last_os_error();
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::Io(err));
+            }
+            let child_fd = unsafe { OwnedFd::from_raw_fd(child_fd_raw) };
+            clean_dir_descriptor(child_fd.as_raw_fd())?;
+            if unsafe { libc::unlinkat(dir_fd, c_name, libc::AT_REMOVEDIR) } != 0 {
+                let err = std::io::Error::last_os_error();
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::Io(err));
+            }
+        } else if unsafe { libc::unlinkat(dir_fd, c_name, 0) } != 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe {
+                libc::closedir(dir_ptr);
+            }
+            return Err(AetherError::Io(err));
+        }
+    }
+
+    unsafe {
+        libc::closedir(dir_ptr);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(windows, unix)))]
+impl PinnedDirectoryHandle {
+    pub fn identity(&self) -> FileObjectIdentity {
+        self.identity
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn clean_contents(&self) -> Result<()> {
+        Err(AetherError::PermissionDenied(
+            "Directory cleanup not supported on this platform".into(),
+        ))
+    }
+
+    pub fn verify_and_remove_entry(self) -> Result<()> {
+        Err(AetherError::PermissionDenied(
+            "Directory removal not supported on this platform".into(),
+        ))
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+pub fn pin_created_directory(path: &Path) -> Result<PinnedDirectoryHandle> {
+    Err(AetherError::PermissionDenied(format!(
+        "Directory pinning and race-free cleanup are not supported on this platform: refusing '{:?}'",
+        path
+    )))
+}
+
+#[cfg(windows)]
 pub fn remove_file_windows_exclusive(
     path: &Path,
     expected_hash: &str,
@@ -2659,6 +3228,54 @@ mod tests {
             missing_err.is_err(),
             "query_directory_identity must fail for non-existent path"
         );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_pinned_directory_lifecycle_and_rejections() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_fs_pin_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let dir_target = temp_dir.join("pinned_dir");
+        let regular_file = temp_dir.join("file.txt");
+        let non_empty_dir = temp_dir.join("non_empty");
+
+        fs::create_dir_all(&temp_dir).unwrap();
+        fs::create_dir(&dir_target).unwrap();
+        fs::write(&regular_file, b"content").unwrap();
+        fs::create_dir(&non_empty_dir).unwrap();
+        fs::write(non_empty_dir.join("nested.txt"), b"data").unwrap();
+
+        // 1. Regular file rejected
+        assert!(pin_created_directory(&regular_file).is_err());
+
+        // 2. Non-empty directory rejected
+        assert!(pin_created_directory(&non_empty_dir).is_err());
+
+        // 3. Valid empty directory pinned successfully
+        let pinned = pin_created_directory(&dir_target).expect("pin empty directory");
+        assert_eq!(pinned.path(), dir_target.as_path());
+
+        // Add children inside pinned directory
+        let child_file = dir_target.join("child.txt");
+        let child_sub = dir_target.join("sub");
+        fs::write(&child_file, b"child data").unwrap();
+        fs::create_dir(&child_sub).unwrap();
+        fs::write(child_sub.join("subfile.txt"), b"sub content").unwrap();
+
+        // 4. Object-bound clean_contents empties directory without deleting dir_target
+        pinned.clean_contents().expect("clean_contents");
+        assert!(dir_target.exists());
+        assert!(!child_file.exists());
+        assert!(!child_sub.exists());
+
+        // 5. verify_and_remove_entry safely removes empty directory entry
+        pinned
+            .verify_and_remove_entry()
+            .expect("verify_and_remove_entry");
+        assert!(!dir_target.exists());
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
