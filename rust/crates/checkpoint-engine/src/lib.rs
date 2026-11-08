@@ -3813,6 +3813,15 @@ impl CheckpointEngine {
             )));
         }
 
+        if self
+            .simulate_backup_failure
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(AetherError::Io(std::io::Error::other(
+                "Simulated checkpoint creation backup failure: storage quota exceeded or disk unwritable",
+            )));
+        }
+
         let checkpoint_id = format!("ckpt-{}", uuid::Uuid::new_v4().simple());
         let snapshot_dir = self.storage_dir.join(&checkpoint_id);
         let blobs_dir = snapshot_dir.join("blobs");

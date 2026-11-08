@@ -24,6 +24,35 @@ async fn test_multi_session_conpty_lifecycle() {
     let pid1 = s1.pid.unwrap();
     let pid2 = s2.pid.unwrap();
 
+    // RAII guard: ensure cleanup runs even if an assertion fails later in the test
+    struct SessionCleanupGuard<'a> {
+        mgr: &'a TerminalManager,
+        sessions: Vec<u32>,
+    }
+    impl<'a> Drop for SessionCleanupGuard<'a> {
+        fn drop(&mut self) {
+            for &id in &self.sessions {
+                let _ = self.mgr.close_session(id);
+            }
+        }
+    }
+    let mut guard = SessionCleanupGuard {
+        mgr: &manager,
+        sessions: vec![s1.id, s2.id],
+    };
+
+    // Verify initial session dimensions
+    assert_eq!(
+        manager.get_terminal_dimensions(s1.id).expect("get s1 dim"),
+        (80, 24),
+        "Session 1 initial dimensions must be 80x24"
+    );
+    assert_eq!(
+        manager.get_terminal_dimensions(s2.id).expect("get s2 dim"),
+        (100, 30),
+        "Session 2 initial dimensions must be 100x30"
+    );
+
     // 2. Subscribe to both output channels
     let mut rx1 = manager.subscribe_output(s1.id).expect("subscribe s1");
     let mut rx2 = manager.subscribe_output(s2.id).expect("subscribe s2");
@@ -90,11 +119,23 @@ async fn test_multi_session_conpty_lifecycle() {
         "Session 2 output stream must not contain Session 1 data"
     );
 
-    // 4. Resize Session 1; assert Session 2 remains unaffected and responsive
+    // 4. Resize Session 1; assert Session 2 actual dimensions remain strictly unchanged
     manager.resize_terminal(s1.id, 120, 40).expect("resize s1");
+
+    assert_eq!(
+        manager.get_terminal_dimensions(s1.id).expect("get s1 dim"),
+        (120, 40),
+        "Session 1 dimensions must be 120x40"
+    );
+    assert_eq!(
+        manager.get_terminal_dimensions(s2.id).expect("get s2 dim"),
+        (100, 30),
+        "Session 2 dimensions must remain 100x30 and must not be altered by Session 1 resize"
+    );
 
     // 5. Close Session 1; assert Session 2 remains alive and responsive
     manager.close_session(s1.id).expect("close s1");
+    guard.sessions.retain(|&id| id != s1.id);
 
     // Verify Session 2 is still responsive
     manager
@@ -115,11 +156,13 @@ async fn test_multi_session_conpty_lifecycle() {
 
     // 6. Close Session 2 and verify both processes are terminated without orphans
     manager.close_session(s2.id).expect("close s2");
+    guard.sessions.retain(|&id| id != s2.id);
 
     // Allow JobObject / process teardown to settle
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Check Windows process exit status
+    // Check Windows process exit status with rigorous distinction:
+    // Distinguish ERROR_INVALID_PARAMETER (PID no longer exists) from query failures (e.g. ERROR_ACCESS_DENIED)
     extern "system" {
         fn OpenProcess(
             dwDesiredAccess: u32,
@@ -127,38 +170,87 @@ async fn test_multi_session_conpty_lifecycle() {
             dwProcessId: u32,
         ) -> *mut std::ffi::c_void;
         fn GetExitCodeProcess(hProcess: *mut std::ffi::c_void, lpExitCode: *mut u32) -> i32;
+        fn WaitForSingleObject(hHandle: *mut std::ffi::c_void, dwMilliseconds: u32) -> u32;
         fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+        fn GetLastError() -> u32;
     }
 
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const SYNCHRONIZE: u32 = 0x00100000;
     const STILL_ACTIVE: u32 = 259;
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 0x00000102;
+    const ERROR_INVALID_PARAMETER: u32 = 87;
 
-    let check_process_dead = |pid: u32| -> bool {
+    let verify_process_terminated = |pid: u32, timeout_ms: u32| -> Result<bool, String> {
         unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid);
             if handle.is_null() {
-                // Process already terminated and handle table entry cleaned up
-                return true;
+                let err = GetLastError();
+                if err == ERROR_INVALID_PARAMETER {
+                    // PID does not exist in kernel process table: confirmed dead
+                    return Ok(true);
+                }
+                if err == 5 {
+                    // ERROR_ACCESS_DENIED: query permission error, NOT proof of termination
+                    return Err(format!(
+                        "Query failed for PID {}: Access Denied (error 5). Process exists but cannot be queried.",
+                        pid
+                    ));
+                }
+                return Err(format!(
+                    "OpenProcess failed unexpectedly for PID {} with Win32 error {}",
+                    pid, err
+                ));
             }
+
+            let wait_res = WaitForSingleObject(handle, timeout_ms);
             let mut exit_code: u32 = 0;
             let ok = GetExitCodeProcess(handle, &mut exit_code);
             CloseHandle(handle);
-            if ok != 0 {
-                exit_code != STILL_ACTIVE
+
+            if ok == 0 {
+                let err = GetLastError();
+                return Err(format!(
+                    "GetExitCodeProcess failed for PID {} with Win32 error {}",
+                    pid, err
+                ));
+            }
+
+            if wait_res == WAIT_OBJECT_0 || exit_code != STILL_ACTIVE {
+                Ok(true)
+            } else if wait_res == WAIT_TIMEOUT {
+                Ok(false)
             } else {
-                true
+                Err(format!(
+                    "WaitForSingleObject returned unexpected status 0x{:X} for PID {}",
+                    wait_res, pid
+                ))
             }
         }
     };
 
+    let res1 = verify_process_terminated(pid1, 3000);
     assert!(
-        check_process_dead(pid1),
-        "Session 1 process {} must be terminated",
-        pid1
+        res1.is_ok(),
+        "Session 1 process termination query failed: {:?}",
+        res1.err()
     );
     assert!(
-        check_process_dead(pid2),
-        "Session 2 process {} must be terminated",
+        res1.unwrap(),
+        "Session 1 child process {} must be confirmed terminated",
+        pid1
+    );
+
+    let res2 = verify_process_terminated(pid2, 3000);
+    assert!(
+        res2.is_ok(),
+        "Session 2 process termination query failed: {:?}",
+        res2.err()
+    );
+    assert!(
+        res2.unwrap(),
+        "Session 2 child process {} must be confirmed terminated",
         pid2
     );
 }

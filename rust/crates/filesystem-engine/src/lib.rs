@@ -941,6 +941,25 @@ impl WorkspaceCapability {
             let _ = self.dir.remove_file(stage);
         }
 
+        // Commit-boundary safety check:
+        // If a competing object already exists at `rel`, attempting to rename `backup_rel` to `rel`
+        // would either silently overwrite the competing object (on POSIX) or fail (on Windows).
+        // Neither the competing object nor the original backup must be lost or overwritten!
+        if self.dir.symlink_metadata(rel).is_ok() {
+            let conflict_name = format!(".aether-conflict-{}", uuid::Uuid::new_v4().simple());
+            let conflict_rel = if let Some(parent) = rel.parent() {
+                parent.join(&conflict_name)
+            } else {
+                PathBuf::from(&conflict_name)
+            };
+            let _ = self.dir.rename(backup_rel, &self.dir, &conflict_rel);
+            let conflict_abs = self.root_path.join(&conflict_rel);
+            return AetherError::PermissionDenied(format!(
+                "Commit boundary conflict on '{}': {}. Destination was concurrently recreated; competing destination preserved; original data preserved at '{}'.",
+                user_path, cause_msg, conflict_abs.display()
+            ));
+        }
+
         let rollback_res = if fault_inject_rollback_failure {
             Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -1243,15 +1262,61 @@ impl WorkspaceCapability {
         }
 
         // 7. Hash verified! Commit replacement: move stage to target
-        if let Err(e) = self.dir.rename(&stage_rel, &self.dir, &rel) {
+        // First check if a competing destination object was created at the commit boundary.
+        if self.dir.symlink_metadata(&rel).is_ok() {
             return Err(self.perform_rollback(
                 &backup_rel,
                 &rel,
                 Some(&stage_rel),
                 user_path,
-                &format!("failed to commit replacement file ({})", e),
+                "competing destination object was concurrently created at commit boundary",
                 hooks.fault_inject_rollback_failure,
             ));
+        }
+
+        // Use hard_link for atomic no-overwrite publish where supported
+        let link_res = self.dir.hard_link(&stage_rel, &self.dir, &rel);
+        match link_res {
+            Ok(()) => {
+                let _ = self.dir.remove_file(&stage_rel);
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AlreadyExists
+                    || self.dir.symlink_metadata(&rel).is_ok() =>
+            {
+                return Err(self.perform_rollback(
+                    &backup_rel,
+                    &rel,
+                    Some(&stage_rel),
+                    user_path,
+                    "competing destination object was concurrently created at commit boundary",
+                    hooks.fault_inject_rollback_failure,
+                ));
+            }
+            Err(_) => {
+                // Filesystem does not support hard links or hard_link failed for other reason.
+                // Re-verify destination does not exist before rename
+                if self.dir.symlink_metadata(&rel).is_ok() {
+                    return Err(self.perform_rollback(
+                        &backup_rel,
+                        &rel,
+                        Some(&stage_rel),
+                        user_path,
+                        "competing destination object was concurrently created at commit boundary",
+                        hooks.fault_inject_rollback_failure,
+                    ));
+                }
+                if let Err(e) = self.dir.rename(&stage_rel, &self.dir, &rel) {
+                    return Err(self.perform_rollback(
+                        &backup_rel,
+                        &rel,
+                        Some(&stage_rel),
+                        user_path,
+                        &format!("failed to commit replacement file ({})", e),
+                        hooks.fault_inject_rollback_failure,
+                    ));
+                }
+            }
         }
 
         // 8. Final guard: verify backup file did not receive trailing modifications before removal
@@ -2994,6 +3059,220 @@ mod tests {
             "external open handle wrote after verification!"
         );
 
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_commit_boundary_competing_destination_never_overwritten() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_commit_race_file_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("critical.rs");
+        let original_data = b"const SYSTEM_STATE: &str = \"ORIGINAL\";\n";
+        fs::write(&file_path, original_data).unwrap();
+
+        let initial_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(original_data);
+            format!("{:x}", hasher.finalize())
+        };
+
+        let competing_data = b"const MALICIOUS_INJECTION: bool = true;\n";
+        let post_hash = |dest: &Path| {
+            // Adversary / concurrent worker recreates target at commit boundary
+            fs::write(dest, competing_data).unwrap();
+        };
+
+        let hooks = ConditionalReplaceHooks {
+            post_hash_hook: Some(&post_hash),
+            ..Default::default()
+        };
+
+        let res = cap.replace_file_bytes_conditional_with_hooks(
+            "critical.rs",
+            b"const SYSTEM_STATE: &str = \"PROPOSED_AI_UPDATE\";\n",
+            Some(&initial_hash),
+            hooks,
+        );
+
+        // Operation MUST fail closed with a clear commit-boundary conflict error
+        assert!(
+            res.is_err(),
+            "Replacement at commit boundary must fail closed"
+        );
+        let err = res.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Commit boundary conflict"),
+            "Error must indicate commit boundary conflict, got: {}",
+            err_msg
+        );
+
+        // CRITICAL: Competing destination must NEVER be silently overwritten
+        let dest_on_disk = fs::read(&file_path).unwrap();
+        assert_eq!(
+            dest_on_disk, competing_data,
+            "Competing destination file must be 100% preserved and never overwritten!"
+        );
+
+        // CRITICAL: Original user data must be safely preserved in conflict file
+        let mut conflict_found = false;
+        for entry in fs::read_dir(&temp_dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".aether-conflict-") {
+                conflict_found = true;
+                let conflict_data = fs::read(entry.path()).unwrap();
+                assert_eq!(
+                    conflict_data, original_data,
+                    "Preserved conflict file must contain exact original data"
+                );
+            }
+        }
+        assert!(
+            conflict_found,
+            "Conflict artifact must be created to preserve original data"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_commit_boundary_competing_directory_preserved() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_commit_race_dir_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("submodule");
+        let original_data = b"original submodule pointer\n";
+        fs::write(&file_path, original_data).unwrap();
+
+        let initial_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(original_data);
+            format!("{:x}", hasher.finalize())
+        };
+
+        let post_hash = |dest: &Path| {
+            // Adversary / concurrent worker introduces a directory at commit boundary
+            let _ = fs::create_dir_all(dest);
+        };
+
+        let hooks = ConditionalReplaceHooks {
+            post_hash_hook: Some(&post_hash),
+            ..Default::default()
+        };
+
+        let res = cap.replace_file_bytes_conditional_with_hooks(
+            "submodule",
+            b"replacement submodule pointer\n",
+            Some(&initial_hash),
+            hooks,
+        );
+
+        assert!(
+            res.is_err(),
+            "Replacement must fail closed when destination is occupied"
+        );
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("Commit boundary conflict"));
+
+        // Verify destination is still a directory and original data preserved
+        assert!(file_path.is_dir(), "Competing directory must be preserved");
+
+        let mut conflict_found = false;
+        for entry in fs::read_dir(&temp_dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".aether-conflict-") {
+                conflict_found = true;
+                assert_eq!(fs::read(entry.path()).unwrap(), original_data);
+            }
+        }
+        assert!(
+            conflict_found,
+            "Original data must be preserved in conflict artifact"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_commit_boundary_competing_symlink_preserved() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_commit_race_symlink_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("target_symlink");
+        let original_data = b"original data prior to symlink race\n";
+        fs::write(&file_path, original_data).unwrap();
+
+        let initial_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(original_data);
+            format!("{:x}", hasher.finalize())
+        };
+
+        let outside_dir = std::env::temp_dir().join(format!(
+            "aether_outside_sym_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&outside_dir);
+        let external_file = outside_dir.join("external.txt");
+        fs::write(&external_file, "external secret").unwrap();
+
+        let ext_clone = external_file.clone();
+        let post_hash = move |dest: &Path| {
+            #[cfg(windows)]
+            let _ = std::os::windows::fs::symlink_file(&ext_clone, dest);
+            #[cfg(not(windows))]
+            let _ = std::os::unix::fs::symlink(&ext_clone, dest);
+        };
+
+        let hooks = ConditionalReplaceHooks {
+            post_hash_hook: Some(&post_hash),
+            ..Default::default()
+        };
+
+        let res = cap.replace_file_bytes_conditional_with_hooks(
+            "target_symlink",
+            b"replacement data\n",
+            Some(&initial_hash),
+            hooks,
+        );
+
+        // If symlink creation was permitted by OS/privileges
+        if let Ok(meta) = file_path.symlink_metadata() {
+            if meta.is_symlink() {
+                assert!(
+                    res.is_err(),
+                    "Replacement must fail closed when destination is symlink"
+                );
+                assert!(res
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Commit boundary conflict"));
+                assert_eq!(
+                    fs::read_to_string(&external_file).unwrap(),
+                    "external secret"
+                );
+            }
+        }
+
+        let _ = fs::remove_dir_all(outside_dir);
         let _ = fs::remove_dir_all(temp_dir);
     }
 

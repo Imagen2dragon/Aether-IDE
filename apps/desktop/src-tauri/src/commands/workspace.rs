@@ -1,7 +1,7 @@
 use crate::win32_dialogs;
 use crate::workspace_bridge::WorkspaceSession;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 use windows::Win32::Foundation::HWND;
@@ -244,6 +244,195 @@ pub struct WorkspaceSearchMatch {
     pub line_content: String,
 }
 
+pub fn execute_workspace_search(
+    root: &Path,
+    query: &str,
+    is_case_sensitive: bool,
+    is_whole_word: bool,
+    is_regex: bool,
+    max_results: Option<usize>,
+) -> Result<Vec<WorkspaceSearchMatch>, String> {
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let regex_matcher = if is_regex {
+        let pattern = if is_whole_word {
+            format!(r"\b(?:{})\b", query)
+        } else {
+            query.to_string()
+        };
+        let re = regex::RegexBuilder::new(&pattern)
+            .case_insensitive(!is_case_sensitive)
+            .build()
+            .map_err(|e| format!("Invalid regular expression: {}", e))?;
+        Some(re)
+    } else if is_whole_word {
+        let pattern = format!(r"\b{}\b", regex::escape(query));
+        let re = regex::RegexBuilder::new(&pattern)
+            .case_insensitive(!is_case_sensitive)
+            .build()
+            .map_err(|e| format!("Regex compilation failed for whole word: {}", e))?;
+        Some(re)
+    } else if !is_case_sensitive {
+        let pattern = regex::escape(query);
+        let re = regex::RegexBuilder::new(&pattern)
+            .case_insensitive(true)
+            .build()
+            .map_err(|e| format!("Regex compilation failed: {}", e))?;
+        Some(re)
+    } else {
+        None
+    };
+
+    let max = max_results.unwrap_or(500);
+    let mut matches = Vec::new();
+    let max_traversal_files = 10_000;
+    let mut files_traversed = 0;
+
+    let skip_dirs = [
+        ".git",
+        "node_modules",
+        "target",
+        ".system_generated",
+        "dist",
+        ".aether",
+        "build",
+        ".idea",
+        ".vscode",
+        "coverage",
+        ".next",
+    ];
+
+    let binary_exts = [
+        "exe", "dll", "so", "dylib", "png", "jpg", "jpeg", "gif", "ico", "bmp", "zip", "tar", "gz",
+        "7z", "pdf", "bin", "lock", "wasm",
+    ];
+
+    let canonical_root = match root.canonicalize() {
+        Ok(c) => c,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let mut stack = vec![canonical_root.clone()];
+    let mut visited_dirs = std::collections::HashSet::new();
+    visited_dirs.insert(canonical_root.clone());
+
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue, // Safely handle unreadable directories
+        };
+
+        for entry in entries.flatten() {
+            if files_traversed >= max_traversal_files || matches.len() >= max {
+                break;
+            }
+
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            let file_name = entry.file_name().to_string_lossy().to_string();
+
+            if file_type.is_dir() {
+                // Critical security: Never follow directory symlinks/junctions to prevent escape/loops
+                if file_type.is_symlink() {
+                    continue;
+                }
+                if !skip_dirs.contains(&file_name.as_str()) && !file_name.starts_with('.') {
+                    if let Ok(canon) = path.canonicalize() {
+                        if canon.starts_with(&canonical_root) && visited_dirs.insert(canon.clone())
+                        {
+                            stack.push(canon);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // File symlink security containment check
+            if file_type.is_symlink() {
+                match path.canonicalize() {
+                    Ok(canon) if canon.starts_with(&canonical_root) => {}
+                    _ => continue, // Reject symlink pointing outside authorized root
+                }
+            }
+
+            files_traversed += 1;
+
+            if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                if binary_exts.contains(&ext.to_lowercase().as_str()) {
+                    continue;
+                }
+            }
+
+            if let Ok(meta) = entry.metadata() {
+                if meta.len() > 4 * 1024 * 1024 {
+                    continue;
+                }
+            }
+
+            // Binary content detection: check initial bytes for null byte (0x00)
+            let raw_bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let check_len = raw_bytes.len().min(1024);
+            if raw_bytes[..check_len].contains(&0) {
+                continue; // Skip binary content
+            }
+
+            let content = match String::from_utf8(raw_bytes) {
+                Ok(s) => s,
+                Err(_) => continue, // Skip non-UTF-8 content
+            };
+
+            let rel_file = path
+                .strip_prefix(&canonical_root)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"));
+
+            for (idx, line) in content.lines().enumerate() {
+                let line_num = idx + 1;
+                if let Some(ref re) = regex_matcher {
+                    for m in re.find_iter(line) {
+                        matches.push(WorkspaceSearchMatch {
+                            file: rel_file.clone(),
+                            line: line_num,
+                            col: m.start() + 1,
+                            match_text: m.as_str().to_string(),
+                            line_content: line.trim().to_string(),
+                        });
+                        if matches.len() >= max {
+                            return Ok(matches);
+                        }
+                    }
+                } else {
+                    let mut start_idx = 0;
+                    while let Some(found_idx) = line[start_idx..].find(query) {
+                        let actual_col = start_idx + found_idx + 1;
+                        matches.push(WorkspaceSearchMatch {
+                            file: rel_file.clone(),
+                            line: line_num,
+                            col: actual_col,
+                            match_text: query.to_string(),
+                            line_content: line.trim().to_string(),
+                        });
+                        start_idx += found_idx + query.len();
+                        if matches.len() >= max {
+                            return Ok(matches);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(matches)
+}
+
 #[tauri::command]
 pub async fn workspace_search(
     app: AppHandle,
@@ -273,197 +462,29 @@ pub async fn workspace_search(
         return Ok(Vec::new());
     }
 
-    let regex_matcher = if is_regex {
-        let pattern = if is_whole_word {
-            format!(r"\b{}\b", query)
-        } else {
-            query.clone()
-        };
-        let re = regex::RegexBuilder::new(&pattern)
-            .case_insensitive(!is_case_sensitive)
-            .build()
-            .map_err(|e| format!("Invalid regular expression: {}", e))?;
-        Some(re)
-    } else if is_whole_word {
-        let pattern = format!(r"\b{}\b", regex::escape(&query));
-        let re = regex::RegexBuilder::new(&pattern)
-            .case_insensitive(!is_case_sensitive)
-            .build()
-            .map_err(|e| format!("Regex compilation failed for whole word: {}", e))?;
-        Some(re)
-    } else {
-        None
-    };
-
-    let query_lower = query.to_lowercase();
     let max = max_results.unwrap_or(500);
-    let mut matches = Vec::new();
-    let max_traversal_files = 10_000;
-    let mut files_traversed = 0;
-
-    let skip_dirs = [
-        ".git",
-        "node_modules",
-        "target",
-        ".system_generated",
-        "dist",
-        ".aether",
-        "build",
-        ".idea",
-        ".vscode",
-        "coverage",
-        ".next",
-    ];
-
-    let binary_exts = [
-        "exe", "dll", "so", "dylib", "png", "jpg", "jpeg", "gif", "ico", "bmp", "zip", "tar", "gz",
-        "7z", "pdf", "bin", "lock", "wasm",
-    ];
+    let mut all_matches = Vec::new();
 
     for root in roots {
-        let canonical_root = match root.canonicalize() {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let mut stack = vec![canonical_root.clone()];
-        let mut visited_dirs = std::collections::HashSet::new();
-        visited_dirs.insert(canonical_root.clone());
-
-        while let Some(dir) = stack.pop() {
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(e) => e,
-                Err(_) => continue, // Safely handle unreadable directories
-            };
-
-            for entry in entries.flatten() {
-                if files_traversed >= max_traversal_files || matches.len() >= max {
-                    break;
-                }
-
-                let path = entry.path();
-                let file_type = match entry.file_type() {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
-                };
-                let file_name = entry.file_name().to_string_lossy().to_string();
-
-                if file_type.is_dir() {
-                    // Critical security: Never follow directory symlinks/junctions to prevent escape/loops
-                    if file_type.is_symlink() {
-                        continue;
-                    }
-                    if !skip_dirs.contains(&file_name.as_str()) && !file_name.starts_with('.') {
-                        if let Ok(canon) = path.canonicalize() {
-                            if canon.starts_with(&canonical_root)
-                                && visited_dirs.insert(canon.clone())
-                            {
-                                stack.push(canon);
-                            }
-                        }
-                    }
-                    continue;
-                }
-
-                // File symlink security containment check
-                if file_type.is_symlink() {
-                    match path.canonicalize() {
-                        Ok(canon) if canon.starts_with(&canonical_root) => {}
-                        _ => continue, // Reject symlink pointing outside authorized root
-                    }
-                }
-
-                files_traversed += 1;
-
-                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                    if binary_exts.contains(&ext.to_lowercase().as_str()) {
-                        continue;
-                    }
-                }
-
-                if let Ok(meta) = entry.metadata() {
-                    if meta.len() > 4 * 1024 * 1024 {
-                        continue;
-                    }
-                }
-
-                // Binary content detection: check initial bytes for null byte (0x00)
-                let raw_bytes = match std::fs::read(&path) {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                };
-                let check_len = raw_bytes.len().min(1024);
-                if raw_bytes[..check_len].contains(&0) {
-                    continue; // Skip binary content
-                }
-
-                let content = match String::from_utf8(raw_bytes) {
-                    Ok(s) => s,
-                    Err(_) => continue, // Skip non-UTF-8 content
-                };
-
-                let rel_file = path
-                    .strip_prefix(&canonical_root)
-                    .map(|p| p.to_string_lossy().replace('\\', "/"))
-                    .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"));
-
-                for (idx, line) in content.lines().enumerate() {
-                    let line_num = idx + 1;
-                    if let Some(ref re) = regex_matcher {
-                        for m in re.find_iter(line) {
-                            matches.push(WorkspaceSearchMatch {
-                                file: rel_file.clone(),
-                                line: line_num,
-                                col: m.start() + 1,
-                                match_text: m.as_str().to_string(),
-                                line_content: line.trim().to_string(),
-                            });
-                            if matches.len() >= max {
-                                return Ok(matches);
-                            }
-                        }
-                    } else if is_case_sensitive {
-                        let mut start_idx = 0;
-                        while let Some(found_idx) = line[start_idx..].find(&query) {
-                            let actual_col = start_idx + found_idx + 1;
-                            matches.push(WorkspaceSearchMatch {
-                                file: rel_file.clone(),
-                                line: line_num,
-                                col: actual_col,
-                                match_text: query.clone(),
-                                line_content: line.trim().to_string(),
-                            });
-                            start_idx += found_idx + query.len();
-                            if matches.len() >= max {
-                                return Ok(matches);
-                            }
-                        }
-                    } else {
-                        let line_lower = line.to_lowercase();
-                        let mut start_idx = 0;
-                        while let Some(found_idx) = line_lower[start_idx..].find(&query_lower) {
-                            let actual_col = start_idx + found_idx + 1;
-                            let matched_slice =
-                                &line[start_idx + found_idx..start_idx + found_idx + query.len()];
-                            matches.push(WorkspaceSearchMatch {
-                                file: rel_file.clone(),
-                                line: line_num,
-                                col: actual_col,
-                                match_text: matched_slice.to_string(),
-                                line_content: line.trim().to_string(),
-                            });
-                            start_idx += found_idx + query.len();
-                            if matches.len() >= max {
-                                return Ok(matches);
-                            }
-                        }
-                    }
-                }
-            }
+        let remaining = max.saturating_sub(all_matches.len());
+        if remaining == 0 {
+            break;
+        }
+        let matches = execute_workspace_search(
+            &root,
+            &query,
+            is_case_sensitive,
+            is_whole_word,
+            is_regex,
+            Some(remaining),
+        )?;
+        all_matches.extend(matches);
+        if all_matches.len() >= max {
+            break;
         }
     }
 
-    Ok(matches)
+    Ok(all_matches)
 }
 
 #[tauri::command]
@@ -634,5 +655,259 @@ mod tests {
             // Boundary assertion: symlink outside root must NOT start with canonical root
             assert!(!canon.starts_with(&canonical_root));
         }
+    }
+
+    #[test]
+    fn test_workspace_search_unicode_case_insensitive_and_byte_offsets() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("unicode.txt");
+        // Non-ASCII text with emojis, German sharp S, Greek omega
+        let content = "First line\n🦀 Rust is awesome! Großartig und Ωμέγα\nThird line\n";
+        std::fs::write(&file, content).unwrap();
+
+        // Search case-insensitively for "großartig"
+        let matches =
+            super::execute_workspace_search(temp.path(), "großartig", false, false, false, None)
+                .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].line, 2);
+        assert_eq!(matches[0].match_text, "Großartig");
+        // Verify byte slicing: verify that slicing content at [col-1 .. col-1 + match_text.len()] is exact
+        let line2 = "🦀 Rust is awesome! Großartig und Ωμέγα";
+        let start = matches[0].col - 1;
+        let end = start + matches[0].match_text.len();
+        assert_eq!(&line2[start..end], "Großartig");
+
+        // Search case-insensitively for "ωμέγα"
+        let matches_greek =
+            super::execute_workspace_search(temp.path(), "ωμέγα", false, false, false, None)
+                .unwrap();
+        assert_eq!(matches_greek.len(), 1);
+        assert_eq!(matches_greek[0].match_text, "Ωμέγα");
+    }
+
+    #[test]
+    fn test_workspace_search_whole_word_and_regex() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("code.rs");
+        let content = "fn cat() {}\nlet cat = 1;\nlet bobcat = 2;\nlet catch = 3;\n";
+        std::fs::write(&file, content).unwrap();
+
+        // Whole word search for "cat"
+        let matches =
+            super::execute_workspace_search(temp.path(), "cat", true, true, false, None).unwrap();
+        assert_eq!(
+            matches.len(),
+            2,
+            "Only standalone 'cat' matches should be found"
+        );
+        assert_eq!(matches[0].line, 1);
+        assert_eq!(matches[1].line, 2);
+
+        // Regex search
+        let matches_re = super::execute_workspace_search(
+            temp.path(),
+            r"let \w+ = \d+;",
+            true,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(matches_re.len(), 3);
+
+        // Invalid regex rejected
+        let res_err = super::execute_workspace_search(
+            temp.path(),
+            r"[invalid_regex(",
+            true,
+            false,
+            true,
+            None,
+        );
+        assert!(res_err.is_err());
+        assert!(res_err.unwrap_err().contains("Invalid regular expression"));
+    }
+
+    #[test]
+    fn test_workspace_search_binary_files_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin_file = temp.path().join("data.dat");
+        let mut bin_data = b"Some initial text ".to_vec();
+        bin_data.push(0x00); // Null byte
+        bin_data.extend_from_slice(b" TARGET_SEARCH_KEYWORD more binary data");
+        std::fs::write(&bin_file, bin_data).unwrap();
+
+        let matches = super::execute_workspace_search(
+            temp.path(),
+            "TARGET_SEARCH_KEYWORD",
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            matches.len(),
+            0,
+            "Binary file with null byte must be skipped"
+        );
+    }
+
+    #[test]
+    fn test_workspace_search_symlink_containment() {
+        let temp = tempfile::tempdir().unwrap();
+        let internal_file = temp.path().join("internal.txt");
+        std::fs::write(&internal_file, "TARGET_INTERNAL_FOUND\n").unwrap();
+
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_file = outside_dir.path().join("secret.txt");
+        std::fs::write(&outside_file, "TARGET_OUTSIDE_SECRET\n").unwrap();
+
+        let link_inside = temp.path().join("link_internal.txt");
+        let link_outside = temp.path().join("link_outside.txt");
+
+        #[cfg(windows)]
+        {
+            let _ = std::os::windows::fs::symlink_file(&internal_file, &link_inside);
+            let _ = std::os::windows::fs::symlink_file(&outside_file, &link_outside);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = std::os::unix::fs::symlink(&internal_file, &link_inside);
+            let _ = std::os::unix::fs::symlink(&outside_file, &link_outside);
+        }
+
+        if link_outside.symlink_metadata().is_ok() {
+            let matches_outside = super::execute_workspace_search(
+                temp.path(),
+                "TARGET_OUTSIDE_SECRET",
+                false,
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                matches_outside.len(),
+                0,
+                "Symlink pointing outside workspace root must never be traversed"
+            );
+        }
+        if link_inside.symlink_metadata().is_ok() {
+            let matches_inside = super::execute_workspace_search(
+                temp.path(),
+                "TARGET_INTERNAL_FOUND",
+                false,
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(
+                matches_inside.len() >= 1,
+                "Internal file/symlink should be matched"
+            );
+        }
+    }
+
+    #[test]
+    fn test_workspace_search_directory_symlink_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        let real_sub = temp.path().join("real_sub");
+        std::fs::create_dir_all(&real_sub).unwrap();
+        std::fs::write(real_sub.join("target.txt"), "RECURSIVE_KEYWORD\n").unwrap();
+
+        let symlink_sub = temp.path().join("symlink_dir");
+        #[cfg(windows)]
+        {
+            let _ = std::os::windows::fs::symlink_dir(&real_sub, &symlink_sub);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = std::os::unix::fs::symlink(&real_sub, &symlink_sub);
+        }
+
+        let matches = super::execute_workspace_search(
+            temp.path(),
+            "RECURSIVE_KEYWORD",
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        // Should only match from real_sub, NOT duplicated via symlink_dir
+        assert_eq!(
+            matches.len(),
+            1,
+            "Directory symlinks must not be followed to avoid loops/duplicate traversal"
+        );
+    }
+
+    #[test]
+    fn test_workspace_search_traversal_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        for i in 0..20 {
+            std::fs::write(temp.path().join(format!("file_{}.txt", i)), "KEYWORD\n").unwrap();
+        }
+        let matches =
+            super::execute_workspace_search(temp.path(), "KEYWORD", false, false, false, Some(5))
+                .unwrap();
+        assert_eq!(matches.len(), 5, "Search must respect max_results cap");
+    }
+
+    #[test]
+    fn test_workspace_search_unreadable_directory_handled_gracefully() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("accessible.txt"), "ACCESSIBLE_KEYWORD\n").unwrap();
+
+        let matches = super::execute_workspace_search(
+            temp.path(),
+            "ACCESSIBLE_KEYWORD",
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn test_workspace_replace_concurrent_modification_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let cap = filesystem_engine::WorkspaceCapability::open(temp.path()).unwrap();
+        let file = temp.path().join("target.txt");
+        let initial_bytes = b"Hello old world\n";
+        std::fs::write(&file, initial_bytes).unwrap();
+
+        let initial_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(initial_bytes);
+            format!("{:x}", hasher.finalize())
+        };
+
+        // Simulate concurrent modification between search hash calculation and replacement execution
+        std::fs::write(&file, b"Concurrent modification happened!\n").unwrap();
+
+        let new_content = b"Hello new world\n";
+        let res = cap.replace_file_bytes_conditional(
+            "target.txt",
+            new_content,
+            Some(&initial_hash),
+            None,
+        );
+
+        assert!(
+            res.is_err(),
+            "Replacement must fail closed when file was modified concurrently"
+        );
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"Concurrent modification happened!\n",
+            "Target file must not be overwritten"
+        );
     }
 }

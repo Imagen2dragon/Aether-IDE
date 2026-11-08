@@ -345,12 +345,54 @@ pub struct DiffHunk {
     pub lines: Vec<DiffLine>,
 }
 
-pub fn parse_unified_diff(patch: &str) -> Result<Vec<DiffHunk>, String> {
+fn validate_hunk(hunk: &DiffHunk) -> Result<(), String> {
+    if hunk.old_start == 0 && hunk.old_count > 0 {
+        return Err(format!(
+            "Malformed patch: Invalid hunk header -{},{}: old_start cannot be 0 when old_count is non-zero",
+            hunk.old_start, hunk.old_count
+        ));
+    }
+    if hunk.new_start == 0 && hunk.new_count > 0 {
+        return Err(format!(
+            "Malformed patch: Invalid hunk header +{},{}: new_start cannot be 0 when new_count is non-zero",
+            hunk.new_start, hunk.new_count
+        ));
+    }
+
+    let consumed = hunk
+        .lines
+        .iter()
+        .filter(|l| matches!(l, DiffLine::Context(_) | DiffLine::Delete(_)))
+        .count();
+    if consumed != hunk.old_count {
+        return Err(format!(
+            "Malformed patch: Hunk header claims -{},{} but body consumes {} lines",
+            hunk.old_start, hunk.old_count, consumed
+        ));
+    }
+
+    let produced = hunk
+        .lines
+        .iter()
+        .filter(|l| matches!(l, DiffLine::Context(_) | DiffLine::Insert(_)))
+        .count();
+    if produced != hunk.new_count {
+        return Err(format!(
+            "Malformed patch: Hunk header claims +{},{} but body produces {} lines",
+            hunk.new_start, hunk.new_count, produced
+        ));
+    }
+
+    Ok(())
+}
+
+pub fn parse_unified_diff_internal(patch: &str) -> Result<(Vec<DiffHunk>, bool), String> {
     let re = regex::Regex::new(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@")
         .map_err(|e| e.to_string())?;
     let mut hunks = Vec::new();
     let mut current_hunk: Option<DiffHunk> = None;
     let mut has_seen_hunk_header = false;
+    let mut last_produced_has_no_newline = false;
 
     for raw_line in patch.lines() {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
@@ -358,6 +400,7 @@ pub fn parse_unified_diff(patch: &str) -> Result<Vec<DiffHunk>, String> {
         if let Some(caps) = re.captures(line) {
             has_seen_hunk_header = true;
             if let Some(h) = current_hunk.take() {
+                validate_hunk(&h)?;
                 hunks.push(h);
             }
 
@@ -389,14 +432,21 @@ pub fn parse_unified_diff(patch: &str) -> Result<Vec<DiffHunk>, String> {
         if let Some(ref mut h) = current_hunk {
             if let Some(stripped) = line.strip_prefix('+') {
                 h.lines.push(DiffLine::Insert(stripped.to_string()));
+                last_produced_has_no_newline = false;
             } else if let Some(stripped) = line.strip_prefix('-') {
                 h.lines.push(DiffLine::Delete(stripped.to_string()));
             } else if let Some(stripped) = line.strip_prefix(' ') {
                 h.lines.push(DiffLine::Context(stripped.to_string()));
-            } else if line.is_empty() {
-                h.lines.push(DiffLine::Context(String::new()));
+                last_produced_has_no_newline = false;
             } else if line.starts_with('\\') {
+                if let Some(last) = h.lines.last() {
+                    if matches!(last, DiffLine::Insert(_) | DiffLine::Context(_)) {
+                        last_produced_has_no_newline = true;
+                    }
+                }
                 continue;
+            } else if line.is_empty() {
+                return Err("Malformed patch: malformed empty line in hunk body without diff prefix (' ', '+', '-')".into());
             } else {
                 return Err(format!(
                     "Malformed patch line: '{}'. Must start with '+', '-', or ' '",
@@ -421,6 +471,7 @@ pub fn parse_unified_diff(patch: &str) -> Result<Vec<DiffHunk>, String> {
     }
 
     if let Some(h) = current_hunk {
+        validate_hunk(&h)?;
         hunks.push(h);
     }
 
@@ -429,37 +480,69 @@ pub fn parse_unified_diff(patch: &str) -> Result<Vec<DiffHunk>, String> {
     }
 
     let mut last_old_end = 0;
+    let mut last_new_end = 0;
     for (idx, hunk) in hunks.iter().enumerate() {
-        if idx > 0 && hunk.old_start < last_old_end {
-            return Err(format!(
-                "Ambiguous or overlapping hunks detected: hunk {} starts at line {} before previous hunk end {}",
-                idx + 1,
-                hunk.old_start,
-                last_old_end
-            ));
-        }
-        let hunk_end = if hunk.old_count == 0 {
+        let hunk_old_end = if hunk.old_count == 0 {
             hunk.old_start
         } else {
-            hunk.old_start + hunk.old_count
+            hunk.old_start + hunk.old_count - 1
         };
-        last_old_end = hunk_end;
+
+        let hunk_new_end = if hunk.new_count == 0 {
+            hunk.new_start
+        } else {
+            hunk.new_start + hunk.new_count - 1
+        };
+
+        if idx > 0 {
+            if hunk.old_start <= last_old_end
+                && (hunk.old_count > 0 || hunk.old_start < last_old_end)
+            {
+                return Err(format!(
+                    "Ambiguous or overlapping hunks detected: hunk {} starts at line {} before or at previous hunk end {}",
+                    idx + 1,
+                    hunk.old_start,
+                    last_old_end
+                ));
+            }
+            if hunk.new_start <= last_new_end
+                && (hunk.new_count > 0 || hunk.new_start < last_new_end)
+            {
+                return Err(format!(
+                    "Invalid hunk ordering or overlapping new range: hunk {} new_start {} is not strictly after previous hunk new_end {}",
+                    idx + 1,
+                    hunk.new_start,
+                    last_new_end
+                ));
+            }
+        }
+
+        last_old_end = hunk_old_end;
+        last_new_end = hunk_new_end;
     }
 
-    Ok(hunks)
+    Ok((hunks, last_produced_has_no_newline))
+}
+
+pub fn parse_unified_diff(patch: &str) -> Result<Vec<DiffHunk>, String> {
+    parse_unified_diff_internal(patch).map(|(hunks, _)| hunks)
 }
 
 pub fn apply_unified_diff(original: &str, patch: &str) -> Result<String, String> {
-    let hunks = parse_unified_diff(patch)?;
-    let is_crlf = original.contains("\r\n");
-    let has_trailing_newline = original.ends_with('\n');
+    let (hunks, no_final_newline) = parse_unified_diff_internal(patch)?;
+    let is_crlf = original.contains("\r\n") || (original.is_empty() && patch.contains("\r\n"));
+    let orig_has_trailing_newline = original.ends_with('\n');
 
-    let orig_lines: Vec<&str> = original
-        .split('\n')
-        .map(|l| l.strip_suffix('\r').unwrap_or(l))
-        .collect();
+    let orig_lines: Vec<&str> = if original.is_empty() {
+        Vec::new()
+    } else {
+        original
+            .split('\n')
+            .map(|l| l.strip_suffix('\r').unwrap_or(l))
+            .collect()
+    };
     let orig_len =
-        if has_trailing_newline && !orig_lines.is_empty() && orig_lines.last() == Some(&"") {
+        if orig_has_trailing_newline && !orig_lines.is_empty() && orig_lines.last() == Some(&"") {
             orig_lines.len() - 1
         } else {
             orig_lines.len()
@@ -469,21 +552,28 @@ pub fn apply_unified_diff(original: &str, patch: &str) -> Result<String, String>
     let mut output_lines: Vec<String> = Vec::new();
     let mut curr_orig_idx: usize = 0;
 
-    for hunk in hunks {
-        let target_idx = if hunk.old_start == 0 {
-            0
+    for (hunk_idx, hunk) in hunks.iter().enumerate() {
+        let target_idx = if hunk.old_count == 0 {
+            hunk.old_start
         } else {
-            hunk.old_start.saturating_sub(1)
+            if hunk.old_start == 0 {
+                return Err("Malformed patch: old_start cannot be 0 when old_count > 0".into());
+            }
+            hunk.old_start - 1
         };
 
         if target_idx < curr_orig_idx {
             return Err("Hunk overlaps with previously applied lines".into());
         }
 
-        if target_idx > active_orig.len() {
+        if target_idx > active_orig.len()
+            || (hunk.old_count > 0 && target_idx + hunk.old_count > active_orig.len())
+        {
             return Err(format!(
-                "Hunk start line {} exceeds original file length {}",
+                "Hunk {} target range (start: {}, count: {}) exceeds original file length {}",
+                hunk_idx + 1,
                 hunk.old_start,
+                hunk.old_count,
                 active_orig.len()
             ));
         }
@@ -493,7 +583,7 @@ pub fn apply_unified_diff(original: &str, patch: &str) -> Result<String, String>
             curr_orig_idx += 1;
         }
 
-        for line in hunk.lines {
+        for line in &hunk.lines {
             match line {
                 DiffLine::Context(expected) => {
                     if curr_orig_idx >= active_orig.len() {
@@ -511,7 +601,7 @@ pub fn apply_unified_diff(original: &str, patch: &str) -> Result<String, String>
                             active_orig[curr_orig_idx]
                         ));
                     }
-                    output_lines.push(expected);
+                    output_lines.push(expected.clone());
                     curr_orig_idx += 1;
                 }
                 DiffLine::Delete(expected) => {
@@ -533,7 +623,7 @@ pub fn apply_unified_diff(original: &str, patch: &str) -> Result<String, String>
                     curr_orig_idx += 1;
                 }
                 DiffLine::Insert(added) => {
-                    output_lines.push(added);
+                    output_lines.push(added.clone());
                 }
             }
         }
@@ -544,9 +634,22 @@ pub fn apply_unified_diff(original: &str, patch: &str) -> Result<String, String>
         curr_orig_idx += 1;
     }
 
+    if output_lines.is_empty() {
+        return Ok(String::new());
+    }
+
     let line_sep = if is_crlf { "\r\n" } else { "\n" };
     let mut result = output_lines.join(line_sep);
-    if has_trailing_newline {
+
+    let should_have_trailing_newline = if no_final_newline {
+        false
+    } else if original.is_empty() {
+        true
+    } else {
+        orig_has_trailing_newline
+    };
+
+    if should_have_trailing_newline {
         result.push_str(line_sep);
     }
     Ok(result)
@@ -585,7 +688,12 @@ pub async fn ai_preview_proposal(
                 rel_path
             ));
         }
-        apply_unified_diff(&original_content, &proposal.proposed_content)?
+        let patch_text = if !proposal.unified_diff.is_empty() {
+            &proposal.unified_diff
+        } else {
+            &proposal.proposed_content
+        };
+        apply_unified_diff(&original_content, patch_text)?
     } else {
         proposal.proposed_content.clone()
     };
@@ -721,7 +829,12 @@ pub fn execute_proposal_internal(
                 .map_err(|e| format!("Failed to read target file '{:?}': {}", full_path, e))?;
             let original_str = String::from_utf8(original_bytes)
                 .map_err(|e| format!("Target file '{}' is not valid UTF-8: {}", rel_path, e))?;
-            apply_unified_diff(&original_str, &proposal.proposed_content)?
+            let patch_text = if !proposal.unified_diff.is_empty() {
+                &proposal.unified_diff
+            } else {
+                &proposal.proposed_content
+            };
+            apply_unified_diff(&original_str, patch_text)?
         }
         "insert_at" => {
             let original_bytes = std::fs::read(&full_path).map_err(|e| {
@@ -1224,5 +1337,215 @@ mod tests {
         let res = execute_proposal_internal(&session, Some(&ckpt), &proposal);
         assert!(res.is_err(), "Safety guard must reject empty file wipe");
         assert_eq!(std::fs::read_to_string(&file_path).unwrap(), original);
+    }
+
+    #[test]
+    fn test_diff_old_count_mismatch_rejected() {
+        // Hunk claims -1,3 (3 lines consumed) but only supplies 2 lines (1 context + 1 delete)
+        let patch = "@@ -1,3 +1,2 @@\n context\n-removed\n";
+        let res = parse_unified_diff(patch);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("claims -1,3 but body consumes 2 lines"),
+            "Error was: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_diff_new_count_mismatch_rejected() {
+        // Hunk claims +1,3 (3 lines produced) but only supplies 2 lines (1 context + 1 insert)
+        // old_count is 1, which matches the 1 context line consumed
+        let patch = "@@ -1,1 +1,3 @@\n context\n+added\n";
+        let res = parse_unified_diff(patch);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("claims +1,3 but body produces 2 lines"),
+            "Error was: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_diff_invalid_positions_rejected() {
+        // Invalid old_start=0 when old_count > 0
+        let patch1 = "@@ -0,2 +1,2 @@\n-line1\n-line2\n+newline1\n+newline2\n";
+        let res1 = parse_unified_diff(patch1);
+        assert!(res1.is_err());
+        assert!(res1.unwrap_err().contains("old_start cannot be 0"));
+
+        // Invalid new_start=0 when new_count > 0
+        let patch2 = "@@ -1,2 +0,2 @@\n-line1\n-line2\n+newline1\n+newline2\n";
+        let res2 = parse_unified_diff(patch2);
+        assert!(res2.is_err());
+        assert!(res2.unwrap_err().contains("new_start cannot be 0"));
+
+        // Overlapping hunks: hunk 2 starts at line 2 before previous hunk ends at line 3
+        let patch3 = "@@ -1,3 +1,3 @@\n line1\n line2\n line3\n@@ -2,2 +2,2 @@\n line2\n line3\n";
+        let res3 = parse_unified_diff(patch3);
+        assert!(res3.is_err());
+        assert!(res3
+            .unwrap_err()
+            .contains("Ambiguous or overlapping hunks detected"));
+    }
+
+    #[test]
+    fn test_diff_zero_length_hunks_empty_file_insertion() {
+        // Inserting into empty file
+        let patch = "@@ -0,0 +1,2 @@\n+first line\n+second line\n";
+        let res = apply_unified_diff("", patch);
+        assert!(
+            res.is_ok(),
+            "Applying patch to empty file failed: {:?}",
+            res.err()
+        );
+        assert_eq!(res.unwrap(), "first line\nsecond line\n");
+
+        // Inserting lines after line 2 in existing file
+        let orig = "line 1\nline 2\nline 3\n";
+        let insert_patch = "@@ -2,0 +3,2 @@\n+inserted A\n+inserted B\n";
+        let res_ins = apply_unified_diff(orig, insert_patch);
+        assert!(
+            res_ins.is_ok(),
+            "Zero-length insertion failed: {:?}",
+            res_ins.err()
+        );
+        assert_eq!(
+            res_ins.unwrap(),
+            "line 1\nline 2\ninserted A\ninserted B\nline 3\n"
+        );
+    }
+
+    #[test]
+    fn test_diff_multiple_hunks_applied_in_order() {
+        let orig = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n";
+        let patch = "@@ -2,1 +2,1 @@\n-line 2\n+LINE TWO\n@@ -5,1 +5,1 @@\n-line 5\n+LINE FIVE\n";
+        let res = apply_unified_diff(orig, patch);
+        assert!(
+            res.is_ok(),
+            "Multi-hunk application failed: {:?}",
+            res.err()
+        );
+        assert_eq!(
+            res.unwrap(),
+            "line 1\nLINE TWO\nline 3\nline 4\nLINE FIVE\nline 6\n"
+        );
+    }
+
+    #[test]
+    fn test_diff_no_final_newline_preserved() {
+        let orig = "first line\nsecond line\n";
+        let patch = "@@ -1,2 +1,2 @@\n first line\n-second line\n+second line modified\n\\ No newline at end of file\n";
+        let res = apply_unified_diff(orig, patch);
+        assert!(
+            res.is_ok(),
+            "No final newline application failed: {:?}",
+            res.err()
+        );
+        let output = res.unwrap();
+        assert_eq!(output, "first line\nsecond line modified");
+        assert!(!output.ends_with('\n'), "Output must not end with newline");
+    }
+
+    #[test]
+    fn test_diff_malformed_empty_lines_rejected() {
+        // Hunk body contains an empty line without prefix (' ', '+', '-')
+        let patch = "@@ -1,2 +1,2 @@\n line 1\n\n";
+        let res = parse_unified_diff(patch);
+        assert!(
+            res.is_err(),
+            "Empty line without diff prefix must be rejected"
+        );
+        assert!(res
+            .unwrap_err()
+            .contains("malformed empty line in hunk body"));
+    }
+
+    #[test]
+    fn test_diff_preview_and_apply_produce_identical_output() {
+        let (temp, session, ckpt) = setup_test_workspace();
+        let file_path = temp.path().join("service.rs");
+        let initial_content =
+            "pub fn execute() {\n    let step = 1;\n    println!(\"{}\", step);\n}\n";
+        std::fs::write(&file_path, initial_content).unwrap();
+        let base_hash = compute_sha256(initial_content.as_bytes());
+
+        let patch = "@@ -2,2 +2,2 @@\n-    let step = 1;\n-    println!(\"{}\", step);\n+    let step = 2;\n+    info!(\"Step {}\", step);\n";
+
+        let proposal = StructuredProposal {
+            proposal_id: "prop-preview-equiv".into(),
+            workspace_id: session.workspace_id(),
+            relative_path: "service.rs".into(),
+            operation: "apply_patch".into(),
+            base_hash,
+            unified_diff: patch.into(),
+            proposed_content: "".into(),
+            insertion_line: None,
+        };
+
+        // Preview logic
+        let preview_applied = apply_unified_diff(initial_content, patch).unwrap();
+
+        // Execution logic
+        let res = execute_proposal_internal(&session, Some(&ckpt), &proposal);
+        assert!(res.is_ok(), "Execution failed: {:?}", res.err());
+        let on_disk_content = std::fs::read_to_string(&file_path).unwrap();
+
+        assert_eq!(
+            preview_applied, on_disk_content,
+            "Preview output and on-disk execution output must be byte-for-byte identical"
+        );
+    }
+
+    #[test]
+    fn test_ai_safety_genuine_checkpoint_engine_failure_aborts_without_mutation() {
+        let (temp, session, ckpt) = setup_test_workspace();
+        let file_path = temp.path().join("production.rs");
+        let original_bytes = b"pub fn critical_system() -> bool { true }\n";
+        std::fs::write(&file_path, original_bytes).unwrap();
+        let hash = compute_sha256(original_bytes);
+
+        // Arm genuine failure in real checkpoint engine
+        ckpt.set_simulate_backup_failure(true);
+
+        let proposal = StructuredProposal {
+            proposal_id: "prop-fail-ckpt".into(),
+            workspace_id: session.workspace_id(),
+            relative_path: "production.rs".into(),
+            operation: "replace_file".into(),
+            base_hash: hash,
+            unified_diff: "".into(),
+            proposed_content: "pub fn critical_system() -> bool { false }\n".into(),
+            insertion_line: None,
+        };
+
+        let res = execute_proposal_internal(&session, Some(&ckpt), &proposal);
+        assert!(res.is_err(), "Genuine checkpoint failure must fail closed");
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("Mandatory pre-edit checkpoint failed"),
+            "Error must clearly indicate mandatory checkpoint failure, got: {}",
+            err
+        );
+
+        // Verify target file remains byte-for-byte unchanged
+        assert_eq!(
+            std::fs::read(&file_path).unwrap(),
+            original_bytes,
+            "Target file must remain byte-for-byte identical after checkpoint failure"
+        );
+
+        // Verify no temporary or partial staging artifacts remain in directory
+        for entry in std::fs::read_dir(temp.path()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with(".aether-stage-"),
+                "No staging artifacts should remain: {}",
+                name
+            );
+        }
     }
 }
