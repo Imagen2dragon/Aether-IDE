@@ -15841,9 +15841,31 @@ mod tests {
         // PART A: Physical replacement of created snapshot directory with a new directory containing sentinel
         let replacement_sentinel_data = b"REPLACEMENT_ADVERSARY_SENTINEL_DATA_MUST_SURVIVE";
         engine.set_post_snapshot_dir_create_hook(Some(move |snapshot_path: &Path| {
-            // Remove the created directory and replace it with a new one
+            let original_id = filesystem_engine::query_directory_identity(snapshot_path)
+                .expect("query original snapshot dir identity");
             let _ = std::fs::remove_dir(snapshot_path);
-            std::fs::create_dir(snapshot_path).unwrap();
+
+            // Ensure the newly created replacement directory receives a distinct identity across
+            // filesystems (including Linux tmpfs where immediate recycled inode reuse can occur)
+            let mut holders = Vec::new();
+            for _ in 0..50 {
+                let holder = snapshot_path
+                    .parent()
+                    .unwrap()
+                    .join(format!("holder_{}", uuid::Uuid::new_v4().simple()));
+                let _ = std::fs::create_dir(&holder);
+                holders.push(holder);
+                std::fs::create_dir(snapshot_path).unwrap();
+                let new_id = filesystem_engine::query_directory_identity(snapshot_path).unwrap();
+                if new_id != original_id {
+                    break;
+                }
+                let _ = std::fs::remove_dir(snapshot_path);
+            }
+            for h in holders {
+                let _ = std::fs::remove_dir(h);
+            }
+
             let marker = snapshot_path.join("replacement_marker.txt");
             std::fs::write(&marker, replacement_sentinel_data).unwrap();
         }));
