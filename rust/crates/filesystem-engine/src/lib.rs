@@ -1185,8 +1185,7 @@ fn clean_dir_descriptor(dir_fd: libc::c_int, dir_path: &Path) -> Result<()> {
             unsafe {
                 libc::closedir(dir_ptr);
             }
-            return Err(AetherError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(AetherError::Io(std::io::Error::other(
                 "Injected I/O error during directory cleanup traversal",
             )));
         }
