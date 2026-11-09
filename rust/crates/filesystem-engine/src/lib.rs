@@ -1654,7 +1654,7 @@ fn pin_created_directory_internal(
 
 #[cfg(unix)]
 fn clean_dir_descriptor(dir_fd: libc::c_int, dir_path: &Path) -> Result<()> {
-    use std::ffi::CStr;
+    use std::ffi::{CStr, CString};
     use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
     let dup_fd = unsafe { libc::dup(dir_fd) };
