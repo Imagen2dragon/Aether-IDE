@@ -1336,6 +1336,25 @@ fn clean_dir_descriptor(dir_fd: libc::c_int, dir_path: &Path) -> Result<()> {
                 return Err(AetherError::Io(err));
             }
         } else {
+            let child_file_raw = unsafe {
+                libc::openat(
+                    dir_fd,
+                    c_name,
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if child_file_raw < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::Io(err));
+            }
+            let child_file_fd = unsafe { OwnedFd::from_raw_fd(child_file_raw) };
+
             if let Ok(guard) = CHILD_FILE_PRE_DELETE_HOOK.lock() {
                 if let Some(ref hook) = *guard {
                     hook(&child_path);
@@ -1366,8 +1385,13 @@ fn clean_dir_descriptor(dir_fd: libc::c_int, dir_path: &Path) -> Result<()> {
                 )));
             }
 
+            drop(child_file_fd);
+
             if unsafe { libc::unlinkat(dir_fd, c_name, 0) } != 0 {
                 let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
                 unsafe {
                     libc::closedir(dir_ptr);
                 }

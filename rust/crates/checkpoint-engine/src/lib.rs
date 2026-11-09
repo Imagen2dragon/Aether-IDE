@@ -16922,8 +16922,27 @@ mod tests {
         filesystem_engine::set_child_file_pre_delete_hook(Some(std::sync::Arc::new(
             move |path: &Path| {
                 if path.file_name().and_then(|n| n.to_str()) == Some("victim_child.txt") {
+                    let original_id = filesystem_engine::query_file_object_identity(path).ok();
                     let _ = std::fs::remove_file(path);
-                    std::fs::write(path, sensitive_bytes_copy).unwrap();
+                    // Ensure the replacement file receives a distinct identity across all filesystems
+                    let mut holders = Vec::new();
+                    for _ in 0..50 {
+                        let holder = path
+                            .parent()
+                            .unwrap()
+                            .join(format!("holder_{}", uuid::Uuid::new_v4().simple()));
+                        let _ = std::fs::write(&holder, b"h");
+                        holders.push(holder);
+                        std::fs::write(path, sensitive_bytes_copy).unwrap();
+                        let new_id = filesystem_engine::query_file_object_identity(path).ok();
+                        if new_id != original_id {
+                            break;
+                        }
+                        let _ = std::fs::remove_file(path);
+                    }
+                    for h in holders {
+                        let _ = std::fs::remove_file(h);
+                    }
                 }
             },
         )));
