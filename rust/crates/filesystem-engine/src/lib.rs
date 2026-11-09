@@ -694,6 +694,7 @@ pub fn verify_and_secure_storage_parent(parent: &Path) -> Result<()> {
                 )));
             }
         }
+        Ok(())
     }
 
     #[cfg(windows)]
