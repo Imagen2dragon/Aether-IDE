@@ -393,9 +393,97 @@ pub fn query_directory_identity(_path: &Path) -> Result<FileObjectIdentity> {
     })
 }
 
+#[cfg(windows)]
+pub fn query_any_object_identity(path: &Path) -> Result<FileObjectIdentity> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+    const FILE_SHARE_READ: u32 = 0x00000001;
+    const FILE_SHARE_WRITE: u32 = 0x00000002;
+    const FILE_SHARE_DELETE: u32 = 0x00000004;
+    const FILE_TYPE_DISK: u32 = 0x0001;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(AetherError::Io)?;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct BY_HANDLE_FILE_INFORMATION {
+        dwFileAttributes: u32,
+        ftCreationTime: [u32; 2],
+        ftLastAccessTime: [u32; 2],
+        ftLastWriteTime: [u32; 2],
+        dwVolumeSerialNumber: u32,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+        nNumberOfLinks: u32,
+        nFileIndexHigh: u32,
+        nFileIndexLow: u32,
+    }
+    extern "system" {
+        fn GetFileType(hFile: *mut std::ffi::c_void) -> u32;
+        fn GetFileInformationByHandle(
+            hFile: *mut std::ffi::c_void,
+            lpFileInformation: *mut BY_HANDLE_FILE_INFORMATION,
+        ) -> i32;
+    }
+
+    let file_type = unsafe { GetFileType(file.as_raw_handle()) };
+    if file_type != FILE_TYPE_DISK {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is not a standard disk object (file type: 0x{:x})",
+            path.display(),
+            file_type
+        )));
+    }
+
+    let mut by_handle_info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    let info_res =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), by_handle_info.as_mut_ptr()) };
+    if info_res == 0 {
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+    let file_info = unsafe { by_handle_info.assume_init() };
+
+    Ok(FileObjectIdentity {
+        volume_serial_number: file_info.dwVolumeSerialNumber as u64,
+        file_index_high: file_info.nFileIndexHigh as u64,
+        file_index_low: file_info.nFileIndexLow as u64,
+    })
+}
+
+#[cfg(unix)]
+pub fn query_any_object_identity(path: &Path) -> Result<FileObjectIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).map_err(AetherError::Io)?;
+    let ino = meta.ino();
+    Ok(FileObjectIdentity {
+        volume_serial_number: meta.dev(),
+        file_index_high: (ino >> 32) as u64,
+        file_index_low: (ino & 0xFFFFFFFF) as u64,
+    })
+}
+
+#[cfg(not(any(windows, unix)))]
+pub fn query_any_object_identity(_path: &Path) -> Result<FileObjectIdentity> {
+    Ok(FileObjectIdentity {
+        volume_serial_number: 0,
+        file_index_high: 0,
+        file_index_low: 0,
+    })
+}
+
 pub type PathHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
 
 static OWNERSHIP_PRE_CAPTURE_HOOK: std::sync::Mutex<Option<PathHook>> = std::sync::Mutex::new(None);
+static CHILD_OPEN_PRE_HOOK: std::sync::Mutex<Option<PathHook>> = std::sync::Mutex::new(None);
+static NESTED_DIR_PRE_TRAVERSAL_HOOK: std::sync::Mutex<Option<PathHook>> =
+    std::sync::Mutex::new(None);
 static CHILD_FILE_PRE_DELETE_HOOK: std::sync::Mutex<Option<PathHook>> = std::sync::Mutex::new(None);
 static SYMLINK_PRE_DELETE_HOOK: std::sync::Mutex<Option<PathHook>> = std::sync::Mutex::new(None);
 static NESTED_DIR_PRE_REMOVE_HOOK: std::sync::Mutex<Option<PathHook>> = std::sync::Mutex::new(None);
@@ -405,6 +493,18 @@ static PARTIAL_TRAVERSAL_FAULT_INJECT: std::sync::atomic::AtomicBool =
 
 pub fn set_ownership_pre_capture_hook(hook: Option<PathHook>) {
     if let Ok(mut g) = OWNERSHIP_PRE_CAPTURE_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+pub fn set_child_open_pre_hook(hook: Option<PathHook>) {
+    if let Ok(mut g) = CHILD_OPEN_PRE_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+pub fn set_nested_dir_pre_traversal_hook(hook: Option<PathHook>) {
+    if let Ok(mut g) = NESTED_DIR_PRE_TRAVERSAL_HOOK.lock() {
         *g = hook;
     }
 }
@@ -437,6 +537,81 @@ pub fn set_partial_traversal_fault_inject(val: bool) {
     PARTIAL_TRAVERSAL_FAULT_INJECT.store(val, std::sync::atomic::Ordering::SeqCst);
 }
 
+pub fn verify_and_secure_storage_parent(parent: &Path) -> Result<()> {
+    if !parent.is_dir() {
+        return Err(AetherError::PermissionDenied(format!(
+            "Parent storage path '{:?}' is not a directory",
+            parent
+        )));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::symlink_metadata(parent).map_err(AetherError::Io)?;
+        if meta.file_type().is_symlink() {
+            return Err(AetherError::PermissionDenied(format!(
+                "Parent storage path '{:?}' is a symlink; refusing operation",
+                parent
+            )));
+        }
+        let current_uid = unsafe { libc::getuid() };
+        if meta.uid() != current_uid {
+            return Err(AetherError::PermissionDenied(format!(
+                "Parent storage directory '{:?}' is owned by UID {}, but current process is UID {}; refusing operation",
+                parent,
+                meta.uid(),
+                current_uid
+            )));
+        }
+        let mode = meta.permissions().mode();
+        if (mode & 0o077) != 0 {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                |e| {
+                    AetherError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "Failed to enforce 0700 permissions on storage parent '{:?}': {}",
+                            parent, e
+                        ),
+                    ))
+                },
+            )?;
+            let meta_after = std::fs::symlink_metadata(parent).map_err(AetherError::Io)?;
+            if (meta_after.permissions().mode() & 0o077) != 0 {
+                return Err(AetherError::PermissionDenied(format!(
+                    "Failed to verify restricted 0700 permissions on storage parent '{:?}'",
+                    parent
+                )));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
+        let meta = std::fs::symlink_metadata(parent).map_err(AetherError::Io)?;
+        let attrs = meta.file_attributes();
+        if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return Err(AetherError::PermissionDenied(format!(
+                "Parent storage path '{:?}' is a reparse point or junction; refusing operation",
+                parent
+            )));
+        }
+        if (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 {
+            return Err(AetherError::PermissionDenied(format!(
+                "Parent storage path '{:?}' is not a directory (attrs 0x{:x})",
+                parent, attrs
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 pub fn create_and_pin_directory(path: &Path) -> Result<PinnedDirectoryHandle> {
     create_and_pin_directory_with_hook(path, None)
 }
@@ -448,43 +623,58 @@ pub fn create_and_pin_directory_with_hook(
     let parent = path.parent().ok_or_else(|| {
         AetherError::PermissionDenied(format!("Directory '{:?}' has no parent", path))
     })?;
-    if !parent.is_dir() {
-        return Err(AetherError::PermissionDenied(format!(
-            "Parent path '{:?}' is not a directory",
-            parent
+    verify_and_secure_storage_parent(parent)?;
+
+    // Check if destination path already exists prior to operation (standard collision check)
+    let initial_dest_exists = match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(AetherError::Io(e)),
+    };
+    if initial_dest_exists {
+        return Err(AetherError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "Failed to create snapshot directory '{:?}': directory already exists",
+                path
+            ),
         )));
     }
 
+    // Isolated Staging Creation:
+    // Create an unpredictable, cryptographically random staging directory inside the verified parent.
+    // Because the name is a 128-bit random nonce inside a private parent,
+    // no concurrent process can predict or pre-substitute it.
+    let staging_nonce = format!(
+        ".stage_{}_{}",
+        uuid::Uuid::new_v4().simple(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let staging_path = parent.join(&staging_nonce);
+
+    std::fs::create_dir(&staging_path).map_err(AetherError::Io)?;
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::symlink_metadata(parent) {
-            let mode = meta.permissions().mode();
-            // Verify parent directory has restricted permissions (owner rwx)
-            if (mode & 0o077) != 0 {
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-            }
+        let _ = std::fs::set_permissions(&staging_path, std::fs::Permissions::from_mode(0o700));
+    }
+
+    // Immediately open and pin the staging directory handle.
+    // This is our verified, immutable first ownership witness.
+    let mut pinned = match pin_created_directory(&staging_path) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = std::fs::remove_dir(&staging_path);
+            return Err(e);
         }
-    }
+    };
 
-    // 1. Create the directory on disk
-    std::fs::create_dir(path).map_err(AetherError::Io)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-    }
-
-    // 2. Query initial identity at creation
-    let initial_identity = query_directory_identity(path)?;
-
-    // 3. Write secret ownership proof token inside the directory
-    let proof_token = uuid::Uuid::new_v4().to_string();
-    let proof_file = path.join(".aether_ownership_proof");
-    std::fs::write(&proof_file, proof_token.as_bytes()).map_err(AetherError::Io)?;
-
-    // 4. Execute test hook if provided or registered (simulating adversarial substitution before ownership capture)
+    // Adversarial Hook Seam (Test 1 & 2):
+    // Simulates an adversary attempting to substitute `path` before ownership capture.
     if let Some(ref h) = hook {
         h(path);
     } else if let Ok(guard) = OWNERSHIP_PRE_CAPTURE_HOOK.lock() {
@@ -493,44 +683,156 @@ pub fn create_and_pin_directory_with_hook(
         }
     }
 
-    // 5. Verify ownership continuity:
-    // The directory currently at `path` MUST match initial_identity AND MUST contain the exact secret proof token.
-    let current_identity = match query_directory_identity(path) {
-        Ok(id) => id,
+    // If destination `path` already exists (e.g. pre-created by adversary or test hook),
+    // NEVER adopt it! Refuse adoption, preserve the replacement object, clean staging, and fail closed.
+    let dest_exists = match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => {
-            return Err(AetherError::PermissionDenied(format!(
-                "Ownership continuity verification failed for '{:?}': directory was replaced or altered before ownership capture (query error: {}); refusing to adopt unowned directory",
-                path, e
-            )));
+            let _ = pinned.clean_contents();
+            let _ = pinned.verify_and_remove_entry();
+            return Err(AetherError::Io(e));
         }
     };
 
-    if current_identity != initial_identity {
+    if dest_exists {
+        // Clean staging dir through its pinned handle
+        let _ = pinned.clean_contents();
+        let _ = pinned.verify_and_remove_entry();
         return Err(AetherError::PermissionDenied(format!(
-            "Ownership continuity verification failed for '{:?}': directory was replaced by another object before ownership capture (initial {:?}, current {:?}); refusing to adopt unowned directory",
-            path, initial_identity, current_identity
+            "Refusing to adopt directory '{:?}': destination already exists or was substituted before ownership capture",
+            path
         )));
     }
 
-    // Verify secret ownership proof token
-    let read_proof = std::fs::read_to_string(&proof_file);
-    match read_proof {
-        Ok(content) if content == proof_token => {
-            // Token verified
+    // Publish the pinned staging directory to `path` with no-replace semantics
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide_stage: Vec<u16> = staging_path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let wide_dest: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        extern "system" {
+            fn MoveFileExW(
+                lpExistingFileName: *const u16,
+                lpNewFileName: *const u16,
+                dwFlags: u32,
+            ) -> i32;
         }
-        _ => {
-            return Err(AetherError::PermissionDenied(format!(
-                "Ownership continuity verification failed for '{:?}': ownership proof token missing or invalid; refusing to adopt unowned directory",
-                path
-            )));
+        // dwFlags = 0 (no MOVEFILE_REPLACE_EXISTING)
+        let res = unsafe { MoveFileExW(wide_stage.as_ptr(), wide_dest.as_ptr(), 0) };
+        if res == 0 {
+            let err = std::io::Error::last_os_error();
+            let _ = pinned.clean_contents();
+            let _ = pinned.verify_and_remove_entry();
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                return Err(AetherError::PermissionDenied(format!(
+                    "Refusing to adopt directory '{:?}': destination already exists or was substituted",
+                    path
+                )));
+            }
+            return Err(AetherError::Io(err));
         }
     }
 
-    // Remove the temporary proof token so directory is clean
-    let _ = std::fs::remove_file(&proof_file);
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::{FromRawFd, OwnedFd};
 
-    // 6. Pin the verified directory handle
-    pin_created_directory_internal(path, initial_identity)
+        let file_name = path.file_name().ok_or_else(|| {
+            AetherError::PermissionDenied(format!("Directory '{:?}' has no file name", path))
+        })?;
+        let c_parent = CString::new(parent.as_os_str().as_bytes())
+            .map_err(|e| AetherError::Internal(format!("Invalid parent CString: {}", e)))?;
+        let c_stage = CString::new(staging_nonce.as_bytes())
+            .map_err(|e| AetherError::Internal(format!("Invalid stage CString: {}", e)))?;
+        let c_dest = CString::new(file_name.as_bytes())
+            .map_err(|e| AetherError::Internal(format!("Invalid dest CString: {}", e)))?;
+
+        let parent_fd_raw = unsafe {
+            libc::open(
+                c_parent.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if parent_fd_raw < 0 {
+            let _ = pinned.clean_contents();
+            let _ = pinned.verify_and_remove_entry();
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+        let _parent_fd = unsafe { OwnedFd::from_raw_fd(parent_fd_raw) };
+
+        // Double check target absence in parent descriptor
+        let mut target_stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                parent_fd_raw,
+                c_dest.as_ptr(),
+                &mut target_stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0
+        {
+            let _ = pinned.clean_contents();
+            let _ = pinned.verify_and_remove_entry();
+            return Err(AetherError::PermissionDenied(format!(
+                "Refusing to adopt directory '{:?}': destination already exists in parent descriptor",
+                path
+            )));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let res = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    parent_fd_raw,
+                    c_stage.as_ptr(),
+                    parent_fd_raw,
+                    c_dest.as_ptr(),
+                    1u32, // RENAME_NOREPLACE
+                )
+            };
+            if res != 0 {
+                let err = std::io::Error::last_os_error();
+                let _ = pinned.clean_contents();
+                let _ = pinned.verify_and_remove_entry();
+                if err.raw_os_error() == Some(libc::EEXIST) {
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Refusing to adopt directory '{:?}': destination already exists",
+                        path
+                    )));
+                }
+                return Err(AetherError::Io(err));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if unsafe {
+                libc::renameat(
+                    parent_fd_raw,
+                    c_stage.as_ptr(),
+                    parent_fd_raw,
+                    c_dest.as_ptr(),
+                )
+            } != 0
+            {
+                let err = std::io::Error::last_os_error();
+                let _ = pinned.clean_contents();
+                let _ = pinned.verify_and_remove_entry();
+                return Err(AetherError::Io(err));
+            }
+        }
+    }
+
+    // Publication succeeded: update path in PinnedDirectoryHandle
+    pinned.path = path.to_path_buf();
+    Ok(pinned)
 }
 
 #[cfg(windows)]
@@ -620,7 +922,7 @@ impl PinnedDirectoryHandle {
 
         // Set delete disposition on the open directory handle
         let disp = FILE_DISPOSITION_INFO { DeleteFile: 1 };
-        let _ = unsafe {
+        let set_res = unsafe {
             SetFileInformationByHandle(
                 self.file.as_raw_handle(),
                 FileDispositionInfo,
@@ -628,33 +930,29 @@ impl PinnedDirectoryHandle {
                 std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
             )
         };
+        if set_res == 0 {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
 
-        // Drop the open handle so Windows commits deletion
+        // Drop the open handle so Windows commits deletion of the handle-bound object
         drop(self.file);
 
-        // If directory entry still exists, verify identity before attempting fallback remove_dir
+        // Absence verification (NO pathname fallback remove_dir)
         match std::fs::symlink_metadata(&self.path) {
             Ok(_) => {
                 let id_now = query_directory_identity(&self.path).ok();
                 if id_now == Some(self.identity) {
-                    let _ = std::fs::remove_dir(&self.path);
-                } else {
-                    return Err(AetherError::PermissionDenied(format!(
-                        "Directory entry '{:?}' was replaced after handle close; refusing removal to preserve replaced object",
+                    Err(AetherError::Internal(format!(
+                        "Directory '{:?}' still exists after handle deletion disposition commit",
                         self.path
-                    )));
+                    )))
+                } else {
+                    Err(AetherError::PermissionDenied(format!(
+                        "Directory '{:?}' was replaced during removal; refusing further action to preserve replaced object",
+                        self.path
+                    )))
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(AetherError::Io(e)),
-        }
-
-        // Final absence verification
-        match std::fs::symlink_metadata(&self.path) {
-            Ok(_) => Err(AetherError::PermissionDenied(format!(
-                "Directory '{:?}' still exists after removal; refusing further destructive action",
-                self.path
-            ))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(AetherError::Io(e)),
         }
@@ -666,8 +964,52 @@ fn clean_directory_handle_windows(
     dir_path: &Path,
     expected_dir_id: FileObjectIdentity,
 ) -> Result<()> {
-    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+    const GENERIC_READ: u32 = 0x80000000;
+    const DELETE: u32 = 0x00010000;
+    const SYNCHRONIZE: u32 = 0x00100000;
+    const FILE_SHARE_READ: u32 = 0x00000001;
+    const FILE_SHARE_WRITE: u32 = 0x00000002;
+    const FILE_SHARE_DELETE: u32 = 0x00000004;
+    #[allow(non_upper_case_globals)]
+    const FileDispositionInfo: u32 = 4;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct FILE_DISPOSITION_INFO {
+        DeleteFile: u8,
+    }
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct BY_HANDLE_FILE_INFORMATION {
+        dwFileAttributes: u32,
+        ftCreationTime: [u32; 2],
+        ftLastAccessTime: [u32; 2],
+        ftLastWriteTime: [u32; 2],
+        dwVolumeSerialNumber: u32,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+        nNumberOfLinks: u32,
+        nFileIndexHigh: u32,
+        nFileIndexLow: u32,
+    }
+    extern "system" {
+        fn GetFileInformationByHandle(
+            hFile: *mut std::ffi::c_void,
+            lpFileInformation: *mut BY_HANDLE_FILE_INFORMATION,
+        ) -> i32;
+        fn SetFileInformationByHandle(
+            hFile: *mut std::ffi::c_void,
+            FileInformationClass: u32,
+            lpFileInformation: *mut std::ffi::c_void,
+            dwBufferSize: u32,
+        ) -> i32;
+    }
 
     let current_id = query_directory_identity(dir_path)?;
     if current_id != expected_dir_id {
@@ -683,6 +1025,8 @@ fn clean_directory_handle_windows(
         Err(e) => return Err(AetherError::Io(e)),
     };
 
+    let disp = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+
     for entry in entries {
         if PARTIAL_TRAVERSAL_FAULT_INJECT.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(AetherError::Io(std::io::Error::other(
@@ -692,82 +1036,177 @@ fn clean_directory_handle_windows(
 
         let entry = entry.map_err(AetherError::Io)?;
         let child_path = entry.path();
-        let meta = std::fs::symlink_metadata(&child_path).map_err(AetherError::Io)?;
-        let is_reparse = (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-        let is_symlink = meta.file_type().is_symlink();
-        let is_dir = meta.is_dir();
 
-        if is_symlink || is_reparse {
+        // Step 1: Initial entry identity inspection
+        let initial_id = match query_any_object_identity(&child_path) {
+            Ok(id) => id,
+            Err(AetherError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+
+        // Test 2 Seam: Replacement between initial child inspection and open
+        if let Ok(guard) = CHILD_OPEN_PRE_HOOK.lock() {
+            if let Some(ref hook) = *guard {
+                hook(&child_path);
+            }
+        }
+
+        let child_file = match std::fs::OpenOptions::new()
+            .access_mode(GENERIC_READ | DELETE | SYNCHRONIZE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&child_path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(AetherError::Io(e)),
+        };
+
+        let mut by_handle_info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+        let info_res = unsafe {
+            GetFileInformationByHandle(child_file.as_raw_handle(), by_handle_info.as_mut_ptr())
+        };
+        if info_res == 0 {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+        let file_info = unsafe { by_handle_info.assume_init() };
+
+        let is_reparse = (file_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        let is_dir = (file_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        let child_id = FileObjectIdentity {
+            volume_serial_number: file_info.dwVolumeSerialNumber as u64,
+            file_index_high: file_info.nFileIndexHigh as u64,
+            file_index_low: file_info.nFileIndexLow as u64,
+        };
+
+        // Step 4: Verify opened descriptor matches the initial observed object
+        if child_id != initial_id {
+            return Err(AetherError::PermissionDenied(format!(
+                "Refusing deletion: child '{:?}' was replaced between inspection and opening (expected {:?}, found {:?})",
+                child_path, initial_id, child_id
+            )));
+        }
+
+        if is_reparse {
+            // Symlink or NTFS Junction: do NOT follow into external target!
             if let Ok(guard) = SYMLINK_PRE_DELETE_HOOK.lock() {
                 if let Some(ref hook) = *guard {
                     hook(&child_path);
                 }
             }
 
-            let meta_after = std::fs::symlink_metadata(&child_path).map_err(AetherError::Io)?;
-            let is_reparse_after =
-                (meta_after.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-            let is_symlink_after = meta_after.file_type().is_symlink();
-            if !is_reparse_after && !is_symlink_after {
+            // Verify entry at child_path is still a reparse point and matches handle identity
+            let meta_now = match std::fs::symlink_metadata(&child_path) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(AetherError::Io(e)),
+            };
+            use std::os::windows::fs::MetadataExt;
+            if (meta_now.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) == 0 {
                 return Err(AetherError::PermissionDenied(format!(
                     "Refusing deletion: reparse point '{:?}' was replaced by a regular object",
                     child_path
                 )));
             }
 
-            let is_dir_reparse = (meta_after.file_attributes() & 0x00000010) != 0;
-            if is_dir_reparse {
-                if std::fs::remove_dir(&child_path).is_err() {
-                    std::fs::remove_file(&child_path).map_err(AetherError::Io)?;
-                }
-            } else if std::fs::remove_file(&child_path).is_err() {
-                std::fs::remove_dir(&child_path).map_err(AetherError::Io)?;
+            let set_res = unsafe {
+                SetFileInformationByHandle(
+                    child_file.as_raw_handle(),
+                    FileDispositionInfo,
+                    &disp as *const _ as *mut std::ffi::c_void,
+                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            };
+            if set_res == 0 {
+                return Err(AetherError::Io(std::io::Error::last_os_error()));
             }
+            drop(child_file);
         } else if is_dir {
-            let child_id = query_directory_identity(&child_path)?;
+            // Test 3 Seam: Nested-directory substitution before recursive traversal begins
+            if let Ok(guard) = NESTED_DIR_PRE_TRAVERSAL_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&child_path);
+                }
+            }
+
+            let current_child_id = match query_directory_identity(&child_path) {
+                Ok(id) => id,
+                Err(AetherError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            if current_child_id != child_id {
+                return Err(AetherError::PermissionDenied(format!(
+                    "Refusing recursive traversal: nested directory '{:?}' was substituted before traversal",
+                    child_path
+                )));
+            }
+
+            // Clean child directory recursively
             clean_directory_handle_windows(&child_path, child_id)?;
 
+            // Test 6 & 7 Seam: Nested directory replacement before removal
             if let Ok(guard) = NESTED_DIR_PRE_REMOVE_HOOK.lock() {
                 if let Some(ref hook) = *guard {
                     hook(&child_path);
                 }
             }
 
-            let id_before_rm = match query_directory_identity(&child_path) {
+            let current_after_clean = match query_directory_identity(&child_path) {
                 Ok(id) => id,
                 Err(AetherError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
             };
-            if id_before_rm != child_id {
+            if current_after_clean != child_id {
                 return Err(AetherError::PermissionDenied(format!(
                     "Refusing removal: nested directory '{:?}' was replaced before unlinking",
                     child_path
                 )));
             }
 
-            std::fs::remove_dir(&child_path).map_err(AetherError::Io)?;
+            let set_res = unsafe {
+                SetFileInformationByHandle(
+                    child_file.as_raw_handle(),
+                    FileDispositionInfo,
+                    &disp as *const _ as *mut std::ffi::c_void,
+                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            };
+            if set_res == 0 {
+                return Err(AetherError::Io(std::io::Error::last_os_error()));
+            }
+            drop(child_file);
         } else {
-            let file_id = query_file_object_identity(&child_path)?;
-
+            // Regular file
             if let Ok(guard) = CHILD_FILE_PRE_DELETE_HOOK.lock() {
                 if let Some(ref hook) = *guard {
                     hook(&child_path);
                 }
             }
 
-            let id_before_rm = match query_file_object_identity(&child_path) {
+            let current_file_id = match query_file_object_identity(&child_path) {
                 Ok(id) => id,
                 Err(AetherError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
             };
-            if id_before_rm != file_id {
+            if current_file_id != child_id {
                 return Err(AetherError::PermissionDenied(format!(
                     "Refusing deletion: child file '{:?}' was replaced before unlinking (expected {:?}, found {:?})",
-                    child_path, file_id, id_before_rm
+                    child_path, child_id, current_file_id
                 )));
             }
 
-            std::fs::remove_file(&child_path).map_err(AetherError::Io)?;
+            let set_res = unsafe {
+                SetFileInformationByHandle(
+                    child_file.as_raw_handle(),
+                    FileDispositionInfo,
+                    &disp as *const _ as *mut std::ffi::c_void,
+                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            };
+            if set_res == 0 {
+                return Err(AetherError::Io(std::io::Error::last_os_error()));
+            }
+            drop(child_file);
         }
     }
     Ok(())
@@ -1025,12 +1464,63 @@ impl PinnedDirectoryHandle {
             )));
         }
 
-        if unsafe { libc::unlinkat(parent_fd_raw, c_name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::NotFound {
-                return Ok(());
+        let temp_unlink_name = CString::new(format!(
+            ".to_del_{}_{}",
+            uuid::Uuid::new_v4().simple(),
+            file_name.to_string_lossy()
+        ))
+        .map_err(|e| AetherError::Internal(format!("Invalid temp CString: {}", e)))?;
+
+        if unsafe {
+            libc::renameat(
+                parent_fd_raw,
+                c_name.as_ptr(),
+                parent_fd_raw,
+                temp_unlink_name.as_ptr(),
+            )
+        } == 0
+        {
+            let mut temp_stat: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe {
+                libc::fstatat(
+                    parent_fd_raw,
+                    temp_unlink_name.as_ptr(),
+                    &mut temp_stat,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } == 0
+                && (temp_stat.st_ino as u64) == expected_ino
+                && (temp_stat.st_dev as u64) == expected_dev
+            {
+                if unsafe {
+                    libc::unlinkat(parent_fd_raw, temp_unlink_name.as_ptr(), libc::AT_REMOVEDIR)
+                } != 0
+                {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() != std::io::ErrorKind::NotFound {
+                        return Err(AetherError::Io(err));
+                    }
+                }
+            } else {
+                unsafe {
+                    libc::renameat(
+                        parent_fd_raw,
+                        temp_unlink_name.as_ptr(),
+                        parent_fd_raw,
+                        c_name.as_ptr(),
+                    )
+                };
+                return Err(AetherError::PermissionDenied(format!(
+                    "Directory entry '{:?}' identity conflict during rename",
+                    self.path
+                )));
             }
-            return Err(AetherError::Io(err));
+        } else if unsafe { libc::unlinkat(parent_fd_raw, c_name.as_ptr(), libc::AT_REMOVEDIR) } != 0
+        {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(AetherError::Io(err));
+            }
         }
 
         Ok(())
@@ -1272,14 +1762,54 @@ fn clean_dir_descriptor(dir_fd: libc::c_int, dir_path: &Path) -> Result<()> {
                 )));
             }
 
-            if unsafe { libc::unlinkat(dir_fd, c_name, 0) } != 0 {
-                let err = std::io::Error::last_os_error();
-                unsafe {
-                    libc::closedir(dir_ptr);
+            let temp_unlink_name = CString::new(format!(
+                ".to_del_{}_{}",
+                uuid::Uuid::new_v4().simple(),
+                name_str
+            ))
+            .map_err(|e| AetherError::Internal(format!("Invalid temp CString: {}", e)))?;
+
+            if unsafe { libc::renameat(dir_fd, c_name, dir_fd, temp_unlink_name.as_ptr()) } == 0 {
+                let mut temp_stat: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe {
+                    libc::fstatat(
+                        dir_fd,
+                        temp_unlink_name.as_ptr(),
+                        &mut temp_stat,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } == 0
+                    && (temp_stat.st_mode & libc::S_IFMT) == libc::S_IFLNK
+                    && temp_stat.st_ino == child_stat.st_ino
+                {
+                    unsafe { libc::unlinkat(dir_fd, temp_unlink_name.as_ptr(), 0) };
+                } else {
+                    unsafe { libc::renameat(dir_fd, temp_unlink_name.as_ptr(), dir_fd, c_name) };
+                    unsafe {
+                        libc::closedir(dir_ptr);
+                    }
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Refusing deletion: symlink '{:?}' identity conflict during rename",
+                        child_path
+                    )));
                 }
-                return Err(AetherError::Io(err));
+            } else if unsafe { libc::unlinkat(dir_fd, c_name, 0) } != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    unsafe {
+                        libc::closedir(dir_ptr);
+                    }
+                    return Err(AetherError::Io(err));
+                }
             }
         } else if is_dir {
+            // Test 2 Seam: Replacement between initial child inspection and openat
+            if let Ok(guard) = CHILD_OPEN_PRE_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&child_path);
+                }
+            }
+
             let child_fd_raw = unsafe {
                 libc::openat(
                     dir_fd,
@@ -1289,14 +1819,69 @@ fn clean_dir_descriptor(dir_fd: libc::c_int, dir_path: &Path) -> Result<()> {
             };
             if child_fd_raw < 0 {
                 let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
                 unsafe {
                     libc::closedir(dir_ptr);
                 }
                 return Err(AetherError::Io(err));
             }
             let child_fd = unsafe { OwnedFd::from_raw_fd(child_fd_raw) };
+
+            // Step 3: fstat() the opened descriptor
+            let mut opened_stat: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(child_fd.as_raw_fd(), &mut opened_stat) } != 0 {
+                let err = std::io::Error::last_os_error();
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::Io(err));
+            }
+
+            // Step 4: Verify opened descriptor matches the intended object
+            if opened_stat.st_ino != child_stat.st_ino || opened_stat.st_dev != child_stat.st_dev {
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::PermissionDenied(format!(
+                    "Refusing recursive traversal: child directory '{:?}' was replaced before openat()",
+                    child_path
+                )));
+            }
+
+            // Test 3 Seam: Nested directory substitution before recursive traversal begins
+            if let Ok(guard) = NESTED_DIR_PRE_TRAVERSAL_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&child_path);
+                }
+            }
+
+            let mut pre_traverse_stat: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe {
+                libc::fstatat(
+                    dir_fd,
+                    c_name,
+                    &mut pre_traverse_stat,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+                || pre_traverse_stat.st_ino != child_stat.st_ino
+                || pre_traverse_stat.st_dev != child_stat.st_dev
+            {
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::PermissionDenied(format!(
+                    "Refusing recursive traversal: child directory '{:?}' was replaced before traversal started",
+                    child_path
+                )));
+            }
+
+            // Step 5: Recurse into that descriptor
             clean_dir_descriptor(child_fd.as_raw_fd(), &child_path)?;
 
+            // Test 6 & 7 Seam: Nested directory replacement before removal
             if let Ok(guard) = NESTED_DIR_PRE_REMOVE_HOOK.lock() {
                 if let Some(ref hook) = *guard {
                     hook(&child_path);
@@ -1328,14 +1913,57 @@ fn clean_dir_descriptor(dir_fd: libc::c_int, dir_path: &Path) -> Result<()> {
             }
 
             drop(child_fd);
-            if unsafe { libc::unlinkat(dir_fd, c_name, libc::AT_REMOVEDIR) } != 0 {
-                let err = std::io::Error::last_os_error();
-                unsafe {
-                    libc::closedir(dir_ptr);
+
+            let temp_unlink_name = CString::new(format!(
+                ".to_del_{}_{}",
+                uuid::Uuid::new_v4().simple(),
+                name_str
+            ))
+            .map_err(|e| AetherError::Internal(format!("Invalid temp CString: {}", e)))?;
+
+            if unsafe { libc::renameat(dir_fd, c_name, dir_fd, temp_unlink_name.as_ptr()) } == 0 {
+                let mut temp_stat: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe {
+                    libc::fstatat(
+                        dir_fd,
+                        temp_unlink_name.as_ptr(),
+                        &mut temp_stat,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } == 0
+                    && temp_stat.st_ino == child_stat.st_ino
+                    && temp_stat.st_dev == child_stat.st_dev
+                {
+                    unsafe {
+                        libc::unlinkat(dir_fd, temp_unlink_name.as_ptr(), libc::AT_REMOVEDIR)
+                    };
+                } else {
+                    unsafe { libc::renameat(dir_fd, temp_unlink_name.as_ptr(), dir_fd, c_name) };
+                    unsafe {
+                        libc::closedir(dir_ptr);
+                    }
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Refusing removal: nested directory '{:?}' identity conflict during rename",
+                        child_path
+                    )));
                 }
-                return Err(AetherError::Io(err));
+            } else if unsafe { libc::unlinkat(dir_fd, c_name, libc::AT_REMOVEDIR) } != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    unsafe {
+                        libc::closedir(dir_ptr);
+                    }
+                    return Err(AetherError::Io(err));
+                }
             }
         } else {
+            // Test 2 Seam: Replacement between initial child inspection and openat
+            if let Ok(guard) = CHILD_OPEN_PRE_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&child_path);
+                }
+            }
+
             let child_file_raw = unsafe {
                 libc::openat(
                     dir_fd,
@@ -1354,6 +1982,27 @@ fn clean_dir_descriptor(dir_fd: libc::c_int, dir_path: &Path) -> Result<()> {
                 return Err(AetherError::Io(err));
             }
             let child_file_fd = unsafe { OwnedFd::from_raw_fd(child_file_raw) };
+
+            // Step 3: fstat() the opened file descriptor
+            let mut opened_stat: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(child_file_fd.as_raw_fd(), &mut opened_stat) } != 0 {
+                let err = std::io::Error::last_os_error();
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::Io(err));
+            }
+
+            // Step 4: Verify opened descriptor matches initial metadata
+            if opened_stat.st_ino != child_stat.st_ino || opened_stat.st_dev != child_stat.st_dev {
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::PermissionDenied(format!(
+                    "Refusing deletion: child file '{:?}' was replaced before openat()",
+                    child_path
+                )));
+            }
 
             if let Ok(guard) = CHILD_FILE_PRE_DELETE_HOOK.lock() {
                 if let Some(ref hook) = *guard {
@@ -1387,7 +2036,38 @@ fn clean_dir_descriptor(dir_fd: libc::c_int, dir_path: &Path) -> Result<()> {
 
             drop(child_file_fd);
 
-            if unsafe { libc::unlinkat(dir_fd, c_name, 0) } != 0 {
+            let temp_unlink_name = CString::new(format!(
+                ".to_del_{}_{}",
+                uuid::Uuid::new_v4().simple(),
+                name_str
+            ))
+            .map_err(|e| AetherError::Internal(format!("Invalid temp CString: {}", e)))?;
+
+            if unsafe { libc::renameat(dir_fd, c_name, dir_fd, temp_unlink_name.as_ptr()) } == 0 {
+                let mut temp_stat: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe {
+                    libc::fstatat(
+                        dir_fd,
+                        temp_unlink_name.as_ptr(),
+                        &mut temp_stat,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } == 0
+                    && temp_stat.st_ino == child_stat.st_ino
+                    && temp_stat.st_dev == child_stat.st_dev
+                {
+                    unsafe { libc::unlinkat(dir_fd, temp_unlink_name.as_ptr(), 0) };
+                } else {
+                    unsafe { libc::renameat(dir_fd, temp_unlink_name.as_ptr(), dir_fd, c_name) };
+                    unsafe {
+                        libc::closedir(dir_ptr);
+                    }
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Refusing deletion: child file '{:?}' identity conflict during rename",
+                        child_path
+                    )));
+                }
+            } else if unsafe { libc::unlinkat(dir_fd, c_name, 0) } != 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::NotFound {
                     continue;

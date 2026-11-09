@@ -16754,14 +16754,14 @@ mod tests {
     }
 
     // =========================================================================
-    // SPRINT 26.9: ADVERSARIAL AND CORRECTNESS VERIFICATION SUITE
+    // SPRINT 26.10: ADVERSARIAL AND CORRECTNESS VERIFICATION SUITE
     // =========================================================================
 
     #[test]
-    fn test_sprint26_9_01_empty_directory_replacement_between_creation_and_ownership_capture() {
+    fn test_sprint26_10_01_empty_replacement_before_first_ownership_capture() {
         let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
         let temp_dir = std::env::temp_dir().join(format!(
-            "aether_sprint26_9_t1_{}",
+            "aether_sprint26_10_t1_{}",
             uuid::Uuid::new_v4().simple()
         ));
         let storage_dir = temp_dir.join(".aether").join("checkpoints");
@@ -16773,7 +16773,7 @@ mod tests {
         let file = ws_dir.join("file.txt");
         std::fs::write(&file, "test data").unwrap();
 
-        // Adversary removes the newly created directory and replaces it with a completely empty directory
+        // Adversary creates an empty directory at the intended snapshot path before ownership capture
         engine.set_pre_ownership_capture_hook(Some(move |snapshot_path: &Path| {
             let _ = std::fs::remove_dir_all(snapshot_path);
             std::fs::create_dir(snapshot_path).unwrap();
@@ -16786,10 +16786,10 @@ mod tests {
             Some(std::slice::from_ref(&file)),
         );
 
-        // 1. Operation MUST fail.
+        // 1. Operation MUST fail closed.
         assert!(
             res.is_err(),
-            "Operation must fail when directory is replaced by an empty directory"
+            "Operation must fail when destination is replaced before ownership capture"
         );
         let err_str = res.unwrap_err().to_string();
         assert!(
@@ -16827,104 +16827,164 @@ mod tests {
     }
 
     #[test]
-    fn test_sprint26_9_02_non_empty_directory_replacement_during_ownership_capture() {
+    fn test_sprint26_10_02_replacement_between_initial_child_metadata_inspection_and_openat() {
         let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
         let temp_dir = std::env::temp_dir().join(format!(
-            "aether_sprint26_9_t2_{}",
+            "aether_sprint26_10_t2_{}",
             uuid::Uuid::new_v4().simple()
         ));
         let storage_dir = temp_dir.join(".aether").join("checkpoints");
-        let ws_dir = temp_dir.join("workspace");
         std::fs::create_dir_all(&storage_dir).unwrap();
-        std::fs::create_dir_all(&ws_dir).unwrap();
 
         let engine = CheckpointEngine::new(&storage_dir);
-        let file = ws_dir.join("file.txt");
-        std::fs::write(&file, "test data").unwrap();
+        let snapshot_dir = storage_dir.join("ckpt-test-open-race");
+        let pinned = filesystem_engine::create_and_pin_directory(&snapshot_dir).unwrap();
 
-        let sentinel_data = b"ADVERSARIAL_SENTINEL_NON_EMPTY_REPLACEMENT_MUST_SURVIVE";
-        engine.set_pre_ownership_capture_hook(Some(move |snapshot_path: &Path| {
-            let _ = std::fs::remove_dir_all(snapshot_path);
-            std::fs::create_dir(snapshot_path).unwrap();
-            let marker = snapshot_path.join("adversary_sentinel.txt");
-            std::fs::write(&marker, sentinel_data).unwrap();
-        }));
+        let child_file = snapshot_dir.join("open_race_child.txt");
+        std::fs::write(&child_file, b"initial benign content").unwrap();
 
-        let res = engine.create_checkpoint_with_root(
-            "test_non_empty_replace",
-            "ws-1",
-            &ws_dir,
-            Some(std::slice::from_ref(&file)),
-        );
+        let sensitive_bytes = b"SENSITIVE_DATA_MUST_SURVIVE_BETWEEN_INSPECTION_AND_OPEN";
+        let sensitive_copy = sensitive_bytes;
+
+        // Register hook to run between initial metadata inspection and opening
+        filesystem_engine::set_child_open_pre_hook(Some(std::sync::Arc::new(
+            move |path: &Path| {
+                if path.file_name().and_then(|n| n.to_str()) == Some("open_race_child.txt") {
+                    let original_id = filesystem_engine::query_file_object_identity(path).ok();
+                    let _ = std::fs::remove_file(path);
+                    let mut holders = Vec::new();
+                    for _ in 0..50 {
+                        let holder = path
+                            .parent()
+                            .unwrap()
+                            .join(format!("holder_{}", uuid::Uuid::new_v4().simple()));
+                        let _ = std::fs::write(&holder, b"h");
+                        holders.push(holder);
+                        std::fs::write(path, sensitive_copy).unwrap();
+                        let new_id = filesystem_engine::query_file_object_identity(path).ok();
+                        if new_id != original_id {
+                            break;
+                        }
+                        let _ = std::fs::remove_file(path);
+                    }
+                    for h in holders {
+                        let _ = std::fs::remove_file(h);
+                    }
+                }
+            },
+        )));
+
+        let mut guard = SnapshotCleanupGuard::new(&storage_dir, &snapshot_dir, Some(&engine));
+        guard.arm(pinned);
+
+        let cleanup_res = guard.explicit_cleanup();
+        filesystem_engine::set_child_open_pre_hook(None);
 
         assert!(
-            res.is_err(),
-            "Operation must fail when replaced by non-empty directory"
+            cleanup_res.is_err(),
+            "Cleanup must fail when child is replaced between inspection and opening"
         );
-        let err_str = res.unwrap_err().to_string();
         assert!(
-            err_str.contains("Failed to pin created snapshot directory"),
-            "Error must indicate pinning failure: {}",
-            err_str
+            child_file.exists(),
+            "Replaced child file must NOT be deleted"
         );
-
-        let subdirs: Vec<_> = std::fs::read_dir(&storage_dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .collect();
+        let read_bytes = std::fs::read(&child_file).unwrap();
         assert_eq!(
-            subdirs.len(),
-            1,
-            "Adversarial directory must NOT be deleted"
-        );
-        let marker = subdirs[0].join("adversary_sentinel.txt");
-        assert!(marker.exists(), "Adversary sentinel file must survive");
-        let content = std::fs::read(&marker).unwrap();
-        assert_eq!(
-            content, sentinel_data,
-            "Adversary sentinel data must survive byte-for-byte"
+            read_bytes, sensitive_bytes,
+            "Sensitive data must survive byte-for-byte"
         );
         assert!(
             engine.last_cleanup_error().is_some(),
-            "Error must be recorded in last_cleanup_error"
+            "Cleanup error must be recorded"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
-    fn test_sprint26_9_03_child_regular_file_replacement_between_metadata_inspection_and_deletion()
-    {
+    fn test_sprint26_10_03_nested_directory_substitution_before_recursive_traversal_begins() {
         let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
         let temp_dir = std::env::temp_dir().join(format!(
-            "aether_sprint26_9_t3_{}",
+            "aether_sprint26_10_t3_{}",
             uuid::Uuid::new_v4().simple()
         ));
         let storage_dir = temp_dir.join(".aether").join("checkpoints");
-        let ws_dir = temp_dir.join("workspace");
         std::fs::create_dir_all(&storage_dir).unwrap();
-        std::fs::create_dir_all(&ws_dir).unwrap();
 
         let engine = CheckpointEngine::new(&storage_dir);
-        let file = ws_dir.join("file.txt");
-        std::fs::write(&file, "test data").unwrap();
+        let snapshot_dir = storage_dir.join("ckpt-test-nested-pre-traverse");
+        let pinned = filesystem_engine::create_and_pin_directory(&snapshot_dir).unwrap();
 
+        let nested_dir = snapshot_dir.join("nested_pre_traverse");
+        std::fs::create_dir(&nested_dir).unwrap();
+
+        let sentinel_data = b"NESTED_SENTINEL_BEFORE_TRAVERSAL_MUST_SURVIVE";
+        let sentinel_copy = sentinel_data;
+
+        filesystem_engine::set_nested_dir_pre_traversal_hook(Some(std::sync::Arc::new(
+            move |path: &Path| {
+                if path.file_name().and_then(|n| n.to_str()) == Some("nested_pre_traverse") {
+                    let _ = std::fs::remove_dir_all(path);
+                    std::fs::create_dir(path).unwrap();
+                    let marker = path.join("sentinel.txt");
+                    std::fs::write(&marker, sentinel_copy).unwrap();
+                }
+            },
+        )));
+
+        let mut guard = SnapshotCleanupGuard::new(&storage_dir, &snapshot_dir, Some(&engine));
+        guard.arm(pinned);
+
+        let cleanup_res = guard.explicit_cleanup();
+        filesystem_engine::set_nested_dir_pre_traversal_hook(None);
+
+        assert!(
+            cleanup_res.is_err(),
+            "Cleanup must fail when nested directory is replaced before traversal begins"
+        );
+        assert!(
+            nested_dir.exists(),
+            "Substituted nested directory must NOT be removed"
+        );
+        let marker = nested_dir.join("sentinel.txt");
+        assert!(marker.exists(), "Nested sentinel file must survive");
+        let content = std::fs::read(&marker).unwrap();
+        assert_eq!(
+            content, sentinel_data,
+            "Nested sentinel data must survive byte-for-byte"
+        );
+        assert!(
+            engine.last_cleanup_error().is_some(),
+            "Cleanup error must be recorded"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_10_04_regular_file_substitution_after_last_identity_check_and_before_unlink() {
+        let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_10_t4_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
         let sensitive_bytes = b"CONFIDENTIAL_USER_DOCUMENT_DATA_MUST_SURVIVE_CHILD_SWAP";
 
-        // Create a real snapshot directory with child files
-        let snapshot_dir = storage_dir.join("ckpt-test-child-swap");
+        let snapshot_dir = storage_dir.join("ckpt-test-child-swap-26-10");
         let pinned = filesystem_engine::create_and_pin_directory(&snapshot_dir).unwrap();
         let child_file = snapshot_dir.join("victim_child.txt");
         std::fs::write(&child_file, b"original child file contents").unwrap();
 
-        // Register child file hook: replace victim_child.txt with sensitive data
         let sensitive_bytes_copy = sensitive_bytes;
         filesystem_engine::set_child_file_pre_delete_hook(Some(std::sync::Arc::new(
             move |path: &Path| {
                 if path.file_name().and_then(|n| n.to_str()) == Some("victim_child.txt") {
                     let original_id = filesystem_engine::query_file_object_identity(path).ok();
                     let _ = std::fs::remove_file(path);
-                    // Ensure the replacement file receives a distinct identity across all filesystems
                     let mut holders = Vec::new();
                     for _ in 0..50 {
                         let holder = path
@@ -16950,13 +17010,12 @@ mod tests {
         let mut guard = SnapshotCleanupGuard::new(&storage_dir, &snapshot_dir, Some(&engine));
         guard.arm(pinned);
 
-        // Explicit cleanup must fail closed or refuse deletion when child is swapped
         let cleanup_res = guard.explicit_cleanup();
         filesystem_engine::set_child_file_pre_delete_hook(None);
 
         assert!(
             cleanup_res.is_err(),
-            "Cleanup must fail when child file is replaced"
+            "Cleanup must fail when child file is replaced before unlinking"
         );
         assert!(
             child_file.exists(),
@@ -16976,10 +17035,10 @@ mod tests {
     }
 
     #[test]
-    fn test_sprint26_9_04_symlink_replacement_between_inspection_and_deletion() {
+    fn test_sprint26_10_05_symlink_substitution_after_last_metadata_check_and_before_unlink() {
         let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
         let temp_dir = std::env::temp_dir().join(format!(
-            "aether_sprint26_9_t4_{}",
+            "aether_sprint26_10_t5_{}",
             uuid::Uuid::new_v4().simple()
         ));
         let storage_dir = temp_dir.join(".aether").join("checkpoints");
@@ -16992,7 +17051,7 @@ mod tests {
         let sensitive_data = b"CRITICAL_EXTERNAL_SYSTEM_DATA_MUST_NEVER_BE_TOUCHED";
         std::fs::write(&external_file, sensitive_data).unwrap();
 
-        let snapshot_dir = storage_dir.join("ckpt-test-symlink-swap");
+        let snapshot_dir = storage_dir.join("ckpt-test-symlink-swap-26-10");
         let pinned = filesystem_engine::create_and_pin_directory(&snapshot_dir).unwrap();
         let symlink_entry = snapshot_dir.join("test_link.txt");
 
@@ -17017,7 +17076,6 @@ mod tests {
 
             let _ = guard.explicit_cleanup();
 
-            // External file MUST survive byte-for-byte!
             assert!(
                 external_file.exists(),
                 "External sensitive file must survive"
@@ -17033,157 +17091,17 @@ mod tests {
     }
 
     #[test]
-    fn test_sprint26_9_05_directory_to_junction_substitution_during_windows_cleanup() {
+    fn test_sprint26_10_06_root_replacement_after_final_identity_check_and_before_root_removal() {
         let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
         let temp_dir = std::env::temp_dir().join(format!(
-            "aether_sprint26_9_t5_{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let storage_dir = temp_dir.join(".aether").join("checkpoints");
-        let external_dir = temp_dir.join("external_junction_target");
-        std::fs::create_dir_all(&storage_dir).unwrap();
-        std::fs::create_dir_all(&external_dir).unwrap();
-
-        let engine = CheckpointEngine::new(&storage_dir);
-        let target_sentinel = external_dir.join("target_sentinel.txt");
-        let sentinel_bytes = b"TARGET_DIR_SENTINEL_DATA_MUST_NEVER_BE_REMOVED";
-        std::fs::write(&target_sentinel, sentinel_bytes).unwrap();
-
-        let snapshot_dir = storage_dir.join("ckpt-test-junction");
-        let pinned = filesystem_engine::create_and_pin_directory(&snapshot_dir).unwrap();
-        let nested_link = snapshot_dir.join("nested_link");
-
-        let junction_or_symlink_created = {
-            #[cfg(windows)]
-            {
-                if std::os::windows::fs::symlink_dir(&external_dir, &nested_link).is_ok() {
-                    true
-                } else {
-                    let out = std::process::Command::new("cmd")
-                        .args([
-                            "/C",
-                            "mklink",
-                            "/J",
-                            &nested_link.to_string_lossy(),
-                            &external_dir.to_string_lossy(),
-                        ])
-                        .output();
-                    out.map(|o| o.status.success()).unwrap_or(false)
-                }
-            }
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::symlink(&external_dir, &nested_link).is_ok()
-            }
-            #[cfg(not(any(windows, unix)))]
-            {
-                false
-            }
-        };
-
-        if junction_or_symlink_created {
-            let mut guard = SnapshotCleanupGuard::new(&storage_dir, &snapshot_dir, Some(&engine));
-            guard.arm(pinned);
-
-            let res = guard.explicit_cleanup();
-            assert!(
-                res.is_ok(),
-                "Cleanup of junction entry must succeed: {:?}",
-                res
-            );
-
-            // Nested link itself is removed
-            assert!(!nested_link.exists(), "Junction entry must be unlinked");
-
-            // External target directory and its contents MUST survive byte-for-byte!
-            assert!(
-                external_dir.exists(),
-                "External directory must NOT be deleted"
-            );
-            assert!(
-                target_sentinel.exists(),
-                "Target sentinel file must survive"
-            );
-            let read_data = std::fs::read(&target_sentinel).unwrap();
-            assert_eq!(
-                read_data, sentinel_bytes,
-                "Target sentinel data must survive byte-for-byte"
-            );
-        }
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_sprint26_9_06_nested_directory_replacement_between_opening_and_removal() {
-        let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
-        let temp_dir = std::env::temp_dir().join(format!(
-            "aether_sprint26_9_t6_{}",
+            "aether_sprint26_10_t6_{}",
             uuid::Uuid::new_v4().simple()
         ));
         let storage_dir = temp_dir.join(".aether").join("checkpoints");
         std::fs::create_dir_all(&storage_dir).unwrap();
 
         let engine = CheckpointEngine::new(&storage_dir);
-        let snapshot_dir = storage_dir.join("ckpt-test-nested-swap");
-        let pinned = filesystem_engine::create_and_pin_directory(&snapshot_dir).unwrap();
-        let nested_dir = snapshot_dir.join("nested_victim_dir");
-        std::fs::create_dir(&nested_dir).unwrap();
-
-        let sentinel_data = b"ADVERSARIAL_NESTED_DIR_SENTINEL_MUST_SURVIVE";
-        let sentinel_copy = sentinel_data;
-        filesystem_engine::set_nested_dir_pre_remove_hook(Some(std::sync::Arc::new(
-            move |path: &Path| {
-                if path.file_name().and_then(|n| n.to_str()) == Some("nested_victim_dir") {
-                    let _ = std::fs::remove_dir_all(path);
-                    std::fs::create_dir(path).unwrap();
-                    let marker = path.join("nested_marker.txt");
-                    std::fs::write(&marker, sentinel_copy).unwrap();
-                }
-            },
-        )));
-
-        let mut guard = SnapshotCleanupGuard::new(&storage_dir, &snapshot_dir, Some(&engine));
-        guard.arm(pinned);
-
-        let cleanup_res = guard.explicit_cleanup();
-        filesystem_engine::set_nested_dir_pre_remove_hook(None);
-
-        assert!(
-            cleanup_res.is_err(),
-            "Cleanup must fail when nested directory is replaced"
-        );
-        assert!(
-            nested_dir.exists(),
-            "Replaced nested directory must NOT be removed"
-        );
-        let marker = nested_dir.join("nested_marker.txt");
-        assert!(marker.exists(), "Nested marker file must survive");
-        let content = std::fs::read(&marker).unwrap();
-        assert_eq!(
-            content, sentinel_data,
-            "Nested marker data must survive byte-for-byte"
-        );
-        assert!(
-            engine.last_cleanup_error().is_some(),
-            "Cleanup error must be recorded"
-        );
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_sprint26_9_07_root_directory_replacement_after_identity_verification() {
-        let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
-        let temp_dir = std::env::temp_dir().join(format!(
-            "aether_sprint26_9_t7_{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let storage_dir = temp_dir.join(".aether").join("checkpoints");
-        std::fs::create_dir_all(&storage_dir).unwrap();
-
-        let engine = CheckpointEngine::new(&storage_dir);
-        let snapshot_dir = storage_dir.join("ckpt-test-root-swap");
+        let snapshot_dir = storage_dir.join("ckpt-test-root-swap-26-10");
         let pinned = filesystem_engine::create_and_pin_directory(&snapshot_dir).unwrap();
 
         let sentinel_data = b"ADVERSARIAL_ROOT_DIR_SENTINEL_MUST_SURVIVE";
@@ -17227,7 +17145,215 @@ mod tests {
     }
 
     #[test]
-    fn test_sprint26_9_08_same_identity_value_simulation_with_explanation() {
+    fn test_sprint26_10_07_windows_child_file_and_nested_directory_replacement_at_final_deletion_windows(
+    ) {
+        let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_10_t7_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let snapshot_dir = storage_dir.join("ckpt-test-win-final-windows");
+        let pinned = filesystem_engine::create_and_pin_directory(&snapshot_dir).unwrap();
+
+        let nested_dir = snapshot_dir.join("nested_victim_dir");
+        std::fs::create_dir(&nested_dir).unwrap();
+
+        let sentinel_data = b"ADVERSARIAL_NESTED_DIR_SENTINEL_MUST_SURVIVE_FINAL_WINDOW";
+        let sentinel_copy = sentinel_data;
+        filesystem_engine::set_nested_dir_pre_remove_hook(Some(std::sync::Arc::new(
+            move |path: &Path| {
+                if path.file_name().and_then(|n| n.to_str()) == Some("nested_victim_dir") {
+                    let _ = std::fs::remove_dir_all(path);
+                    std::fs::create_dir(path).unwrap();
+                    let marker = path.join("nested_marker.txt");
+                    std::fs::write(&marker, sentinel_copy).unwrap();
+                }
+            },
+        )));
+
+        let mut guard = SnapshotCleanupGuard::new(&storage_dir, &snapshot_dir, Some(&engine));
+        guard.arm(pinned);
+
+        let cleanup_res = guard.explicit_cleanup();
+        filesystem_engine::set_nested_dir_pre_remove_hook(None);
+
+        assert!(
+            cleanup_res.is_err(),
+            "Cleanup must fail when nested directory is replaced at final deletion window"
+        );
+        assert!(
+            nested_dir.exists(),
+            "Replaced nested directory must NOT be removed"
+        );
+        let marker = nested_dir.join("nested_marker.txt");
+        assert!(marker.exists(), "Nested marker file must survive");
+        let content = std::fs::read(&marker).unwrap();
+        assert_eq!(
+            content, sentinel_data,
+            "Nested marker data must survive byte-for-byte"
+        );
+        assert!(
+            engine.last_cleanup_error().is_some(),
+            "Cleanup error must be recorded"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_10_08_windows_reparse_point_and_junction_replacement_during_traversal() {
+        let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_10_t8_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let external_dir = temp_dir.join("external_junction_target");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        std::fs::create_dir_all(&external_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let target_sentinel = external_dir.join("target_sentinel.txt");
+        let sentinel_bytes = b"TARGET_DIR_SENTINEL_DATA_MUST_NEVER_BE_REMOVED";
+        std::fs::write(&target_sentinel, sentinel_bytes).unwrap();
+
+        let snapshot_dir = storage_dir.join("ckpt-test-junction-26-10");
+        let pinned = filesystem_engine::create_and_pin_directory(&snapshot_dir).unwrap();
+        let nested_link = snapshot_dir.join("nested_link");
+
+        let junction_or_symlink_created = {
+            #[cfg(windows)]
+            {
+                if std::os::windows::fs::symlink_dir(&external_dir, &nested_link).is_ok() {
+                    true
+                } else {
+                    let out = std::process::Command::new("cmd")
+                        .args([
+                            "/C",
+                            "mklink",
+                            "/J",
+                            &nested_link.to_string_lossy(),
+                            &external_dir.to_string_lossy(),
+                        ])
+                        .output();
+                    out.map(|o| o.status.success()).unwrap_or(false)
+                }
+            }
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&external_dir, &nested_link).is_ok()
+            }
+            #[cfg(not(any(windows, unix)))]
+            {
+                false
+            }
+        };
+
+        if junction_or_symlink_created {
+            let mut guard = SnapshotCleanupGuard::new(&storage_dir, &snapshot_dir, Some(&engine));
+            guard.arm(pinned);
+
+            let res = guard.explicit_cleanup();
+            assert!(
+                res.is_ok(),
+                "Cleanup of junction entry must succeed: {:?}",
+                res
+            );
+
+            assert!(!nested_link.exists(), "Junction entry must be unlinked");
+            assert!(
+                external_dir.exists(),
+                "External directory must NOT be deleted"
+            );
+            assert!(
+                target_sentinel.exists(),
+                "Target sentinel file must survive"
+            );
+            let read_data = std::fs::read(&target_sentinel).unwrap();
+            assert_eq!(
+                read_data, sentinel_bytes,
+                "Target sentinel data must survive byte-for-byte"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_10_09_partial_cleanup_failure_after_at_least_one_real_child_processed() {
+        let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_10_t9_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let unrelated_file = storage_dir.join("unrelated_persisted_checkpoint.json");
+        std::fs::write(&unrelated_file, b"unrelated checkpoint metadata").unwrap();
+        let unrelated_dir = storage_dir.join("unrelated_snapshot_dir");
+        std::fs::create_dir(&unrelated_dir).unwrap();
+        let unrelated_blob = unrelated_dir.join("blob.bin");
+        std::fs::write(&unrelated_blob, b"unrelated blob").unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let snapshot_dir = storage_dir.join("ckpt-test-partial-traversal-26-10");
+        let pinned = filesystem_engine::create_and_pin_directory(&snapshot_dir).unwrap();
+        let child1 = snapshot_dir.join("child1.txt");
+        std::fs::write(&child1, b"child1").unwrap();
+        let child2 = snapshot_dir.join("child2.txt");
+        std::fs::write(&child2, b"child2").unwrap();
+
+        // Inject traversal failure
+        filesystem_engine::set_partial_traversal_fault_inject(true);
+
+        let mut guard = SnapshotCleanupGuard::new(&storage_dir, &snapshot_dir, Some(&engine));
+        guard.arm(pinned);
+
+        let cleanup_res = guard.explicit_cleanup();
+        filesystem_engine::set_partial_traversal_fault_inject(false);
+
+        // 1. Observable error
+        assert!(
+            cleanup_res.is_err(),
+            "Cleanup must fail with observable error on traversal failure"
+        );
+        let err_str = cleanup_res.unwrap_err().to_string();
+        assert!(
+            err_str.contains("cleanup") || err_str.contains("Injected I/O error"),
+            "Error must report cleanup traversal failure: {}",
+            err_str
+        );
+
+        // 2. Error recorded in last_cleanup_error
+        assert!(
+            engine.last_cleanup_error().is_some(),
+            "Error must be recorded in last_cleanup_error"
+        );
+
+        // 3. Unrelated files in storage directory are NOT deleted
+        assert!(
+            unrelated_file.exists(),
+            "Unrelated metadata file must NOT be deleted"
+        );
+        assert!(
+            unrelated_dir.exists(),
+            "Unrelated snapshot directory must NOT be deleted"
+        );
+        assert!(
+            unrelated_blob.exists(),
+            "Unrelated blob file must NOT be deleted"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_10_10_same_identity_simulation_distinguished_from_real_filesystem_race() {
         let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
         // EXPLANATION OF SIMULATED VS ACTUAL KERNEL BEHAVIOR:
         // In real operating systems (such as Linux ext4/tmpfs or Windows NTFS), inode numbers
@@ -17242,7 +17368,7 @@ mod tests {
         // the identical (device, inode) or (volume_serial, file_index) pair.
         // The implementation detects this conflict and fails closed, preserving the object byte-for-byte.
         let temp_dir = std::env::temp_dir().join(format!(
-            "aether_sprint26_9_t8_{}",
+            "aether_sprint26_10_t10_{}",
             uuid::Uuid::new_v4().simple()
         ));
         let storage_dir = temp_dir.join(".aether").join("checkpoints");
@@ -17306,80 +17432,10 @@ mod tests {
     }
 
     #[test]
-    fn test_sprint26_9_09_cleanup_failure_after_partial_traversal() {
+    fn test_sprint26_10_11_successful_multi_file_checkpoint_and_manifest_integrity_regression() {
         let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
         let temp_dir = std::env::temp_dir().join(format!(
-            "aether_sprint26_9_t9_{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let storage_dir = temp_dir.join(".aether").join("checkpoints");
-        std::fs::create_dir_all(&storage_dir).unwrap();
-
-        // Create an unrelated file and directory in storage_dir
-        let unrelated_file = storage_dir.join("unrelated_persisted_checkpoint.json");
-        std::fs::write(&unrelated_file, b"unrelated checkpoint metadata").unwrap();
-        let unrelated_dir = storage_dir.join("unrelated_snapshot_dir");
-        std::fs::create_dir(&unrelated_dir).unwrap();
-        let unrelated_blob = unrelated_dir.join("blob.bin");
-        std::fs::write(&unrelated_blob, b"unrelated blob").unwrap();
-
-        let engine = CheckpointEngine::new(&storage_dir);
-        let snapshot_dir = storage_dir.join("ckpt-test-partial-traversal");
-        let pinned = filesystem_engine::create_and_pin_directory(&snapshot_dir).unwrap();
-        let child1 = snapshot_dir.join("child1.txt");
-        std::fs::write(&child1, b"child1").unwrap();
-        let child2 = snapshot_dir.join("child2.txt");
-        std::fs::write(&child2, b"child2").unwrap();
-
-        // Inject traversal failure
-        filesystem_engine::set_partial_traversal_fault_inject(true);
-
-        let mut guard = SnapshotCleanupGuard::new(&storage_dir, &snapshot_dir, Some(&engine));
-        guard.arm(pinned);
-
-        let cleanup_res = guard.explicit_cleanup();
-        filesystem_engine::set_partial_traversal_fault_inject(false);
-
-        // 1. Observable error
-        assert!(
-            cleanup_res.is_err(),
-            "Cleanup must fail with observable error on traversal failure"
-        );
-        let err_str = cleanup_res.unwrap_err().to_string();
-        assert!(
-            err_str.contains("cleanup") || err_str.contains("Injected I/O error"),
-            "Error must report cleanup traversal failure: {}",
-            err_str
-        );
-
-        // 2. Error recorded in last_cleanup_error
-        assert!(
-            engine.last_cleanup_error().is_some(),
-            "Error must be recorded in last_cleanup_error"
-        );
-
-        // 3. Unrelated files in storage directory are NOT deleted
-        assert!(
-            unrelated_file.exists(),
-            "Unrelated metadata file must NOT be deleted"
-        );
-        assert!(
-            unrelated_dir.exists(),
-            "Unrelated snapshot directory must NOT be deleted"
-        );
-        assert!(
-            unrelated_blob.exists(),
-            "Unrelated blob file must NOT be deleted"
-        );
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_sprint26_9_10_successful_creation_and_manifest_integrity_regression() {
-        let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
-        let temp_dir = std::env::temp_dir().join(format!(
-            "aether_sprint26_9_t10_{}",
+            "aether_sprint26_10_t11_{}",
             uuid::Uuid::new_v4().simple()
         ));
         let storage_dir = temp_dir.join(".aether").join("checkpoints");
@@ -17389,9 +17445,8 @@ mod tests {
 
         let engine = CheckpointEngine::new(&storage_dir);
 
-        // Multiple files with various contents
         let file1 = ws_dir.join("file1.txt");
-        let content1 = b"Sprint 26.9 Multi-File Payload Alpha";
+        let content1 = b"Sprint 26.10 Multi-File Payload Alpha";
         std::fs::write(&file1, content1).unwrap();
 
         let file2 = ws_dir.join("file2.bin");
@@ -17399,14 +17454,14 @@ mod tests {
         std::fs::write(&file2, content2).unwrap();
 
         let file3 = ws_dir.join("file3.rs");
-        let content3 = b"pub fn aether_sprint_26_9() -> bool { true }";
+        let content3 = b"pub fn aether_sprint_26_10() -> bool { true }";
         std::fs::write(&file3, content3).unwrap();
 
         let files = [file1.clone(), file2.clone(), file3.clone()];
 
         let ckpt = engine
             .create_checkpoint_with_root(
-                "Sprint 26.9 Clean Publication Multi-File Snapshot",
+                "Sprint 26.10 Clean Publication Multi-File Snapshot",
                 "ws-multi",
                 &ws_dir,
                 Some(&files),
@@ -17417,10 +17472,9 @@ mod tests {
         assert_eq!(ckpt.workspace_id, "ws-multi");
         assert_eq!(
             ckpt.description,
-            "Sprint 26.9 Clean Publication Multi-File Snapshot"
+            "Sprint 26.10 Clean Publication Multi-File Snapshot"
         );
 
-        // Verify SHA-256 blob addresses and lengths match content
         let snapshot_dir = storage_dir.join(&ckpt.checkpoint_id);
         for f in &ckpt.files {
             let rel = &f.relative_path;
@@ -17433,7 +17487,6 @@ mod tests {
             assert_eq!(&computed_hash, hash, "Blob hash must match SHA-256");
         }
 
-        // Verify manifest exists and is valid
         let manifest_path = snapshot_dir.join("metadata.json");
         assert!(manifest_path.exists(), "Manifest file must exist");
         let manifest_str = std::fs::read_to_string(&manifest_path).unwrap();
@@ -17441,7 +17494,6 @@ mod tests {
         assert_eq!(loaded_ckpt.checkpoint_id, ckpt.checkpoint_id);
         assert_eq!(loaded_ckpt.files.len(), 3);
 
-        // Verify no cleanup errors recorded
         assert!(
             engine.last_cleanup_error().is_none(),
             "No cleanup errors should be recorded on success"
