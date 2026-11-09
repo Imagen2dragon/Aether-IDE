@@ -17928,13 +17928,14 @@ mod tests {
             );
             let replaced_temp = replaced_temp_holder.lock().unwrap().take();
             if let Some(tp) = replaced_temp {
+                let preserved_path = if tp.exists() { tp } else { child_file.clone() };
                 assert!(
-                    tp.exists(),
+                    preserved_path.exists(),
                     "Replaced temporary entry must NOT be unlinked/deleted: {:?}",
-                    tp
+                    preserved_path
                 );
                 assert_eq!(
-                    std::fs::read_to_string(&tp).unwrap(),
+                    std::fs::read_to_string(&preserved_path).unwrap(),
                     "ADVERSARY_TEMP_PRECIOUS_PAYLOAD",
                     "Replacement temporary entry content must remain untouched"
                 );

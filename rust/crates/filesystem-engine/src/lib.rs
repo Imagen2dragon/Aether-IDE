@@ -2584,6 +2584,14 @@ impl PinnedDirectoryHandle {
                     }
                 }
             } else {
+                unsafe {
+                    libc::renameat(
+                        parent_fd_raw,
+                        temp_unlink_name.as_ptr(),
+                        parent_fd_raw,
+                        c_name.as_ptr(),
+                    )
+                };
                 return Err(AetherError::PermissionDenied(format!(
                     "Directory entry '{:?}' identity conflict during rename",
                     self.path
@@ -2888,6 +2896,7 @@ fn clean_dir_descriptor(dir_fd: libc::c_int, dir_path: &Path) -> Result<()> {
                         }
                     }
                 } else {
+                    unsafe { libc::renameat(dir_fd, temp_unlink_name.as_ptr(), dir_fd, c_name) };
                     unsafe {
                         libc::closedir(dir_ptr);
                     }
@@ -3073,6 +3082,7 @@ fn clean_dir_descriptor(dir_fd: libc::c_int, dir_path: &Path) -> Result<()> {
                         }
                     }
                 } else {
+                    unsafe { libc::renameat(dir_fd, temp_unlink_name.as_ptr(), dir_fd, c_name) };
                     unsafe {
                         libc::closedir(dir_ptr);
                     }
@@ -3223,6 +3233,7 @@ fn clean_dir_descriptor(dir_fd: libc::c_int, dir_path: &Path) -> Result<()> {
                         }
                     }
                 } else {
+                    unsafe { libc::renameat(dir_fd, temp_unlink_name.as_ptr(), dir_fd, c_name) };
                     unsafe {
                         libc::closedir(dir_ptr);
                     }
