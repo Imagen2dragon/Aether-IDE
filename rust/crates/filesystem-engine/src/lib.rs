@@ -59,6 +59,8 @@ thread_local! {
     static FAULT_INJECT_WINDOWS_DEST_IDENTITY_QUERY_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAULT_INJECT_WINDOWS_SECURITY_DESCRIPTOR_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAULT_INJECT_WINDOWS_DIFFERENT_OWNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAULT_INJECT_WINDOWS_SIMULATED_OWNER_SID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    static FAULT_INJECT_WINDOWS_SIMULATED_ADMIN_TOKEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static HOOK_WINDOWS_PRE_EXCLUSIVE_OPEN: std::cell::RefCell<Option<WindowsPreExclusiveOpenHook>> = const { std::cell::RefCell::new(None) };
     static HOOK_WINDOWS_POST_EXCLUSIVE_OPEN: std::cell::RefCell<Option<WindowsPostExclusiveOpenHook>> = const { std::cell::RefCell::new(None) };
 }
@@ -146,6 +148,22 @@ pub fn set_fault_inject_windows_different_owner(inject: bool) {
 pub fn is_fault_inject_windows_different_owner() -> bool {
     FAULT_INJECT_WINDOWS_DIFFERENT_OWNER.with(|cell| cell.get())
 }
+
+#[cfg(windows)]
+pub fn set_fault_inject_windows_simulated_owner_sid(sid_type: Option<u32>) {
+    FAULT_INJECT_WINDOWS_SIMULATED_OWNER_SID.with(|cell| cell.set(sid_type));
+}
+
+#[cfg(windows)]
+pub fn set_fault_inject_windows_simulated_admin_token(is_admin: bool) {
+    FAULT_INJECT_WINDOWS_SIMULATED_ADMIN_TOKEN.with(|cell| cell.set(is_admin));
+}
+
+#[cfg(not(windows))]
+pub fn set_fault_inject_windows_simulated_owner_sid(_sid_type: Option<u32>) {}
+
+#[cfg(not(windows))]
+pub fn set_fault_inject_windows_simulated_admin_token(_is_admin: bool) {}
 
 #[cfg(not(windows))]
 pub fn set_hook_windows_pre_exclusive_open(_hook: Option<WindowsPreExclusiveOpenHook>) {}
@@ -782,6 +800,12 @@ pub fn verify_storage_parent_acl(parent: &Path) -> Result<()> {
                 SidToCheck: *mut std::ffi::c_void,
                 IsMember: *mut i32,
             ) -> i32;
+            fn CreateWellKnownSid(
+                WellKnownSidType: u32,
+                DomainSid: *mut std::ffi::c_void,
+                pSid: *mut std::ffi::c_void,
+                cbSid: *mut u32,
+            ) -> i32;
             fn EqualSid(pSid1: *mut std::ffi::c_void, pSid2: *mut std::ffi::c_void) -> i32;
             fn GetAclInformation(
                 pAcl: *mut std::ffi::c_void,
@@ -904,27 +928,104 @@ pub fn verify_storage_parent_acl(parent: &Path) -> Result<()> {
         // Test seam for simulating different owner
         if FAULT_INJECT_WINDOWS_DIFFERENT_OWNER.with(|c| c.get()) {
             return Err(AetherError::PermissionDenied(format!(
-                "Parent storage directory '{:?}' is not owned by the current user token (simulated different user)",
+                "Parent storage directory '{:?}' is not owned by an authorized private owner (simulated different user)",
                 parent
             )));
         }
 
-        // Verify owner SID matches TokenUser, TokenOwner, or CheckTokenMembership
-        let mut is_owner = EqualSid(token_user.User.Sid, p_owner_sid) != 0;
-        if !is_owner && !tok_owner_sid.is_null() {
-            is_owner = EqualSid(tok_owner_sid, p_owner_sid) != 0;
-        }
-        if !is_owner {
-            let mut is_member = 0i32;
-            if CheckTokenMembership(std::ptr::null_mut(), p_owner_sid, &mut is_member) != 0
-                && is_member != 0
+        // Allow simulated owner SID (e.g. BUILTIN\Users or BUILTIN\Administrators) for testing
+        const WIN_LOCAL_SYSTEM_SID: u32 = 22;
+        const WIN_BUILTIN_ADMINISTRATORS_SID: u32 = 26;
+        let mut sim_owner_sid = vec![0u8; 68];
+        let mut effective_owner_sid = p_owner_sid;
+        if let Some(well_known_type) = FAULT_INJECT_WINDOWS_SIMULATED_OWNER_SID.with(|c| c.get()) {
+            let mut cb_sim = sim_owner_sid.len() as u32;
+            if CreateWellKnownSid(
+                well_known_type,
+                std::ptr::null_mut(),
+                sim_owner_sid.as_mut_ptr() as *mut _,
+                &mut cb_sim,
+            ) != 0
             {
-                is_owner = true;
+                effective_owner_sid = sim_owner_sid.as_mut_ptr() as *mut _;
             }
         }
-        if !is_owner {
+
+        // Narrow accepted-owner policy:
+        // 1. Current individual user (TokenUser):
+        let is_current_user = EqualSid(token_user.User.Sid, effective_owner_sid) != 0;
+
+        // 2. Elevated administrative storage (BUILTIN\Administrators S-1-5-32-544):
+        let mut is_authorized_admin_owner = false;
+        let mut admin_sid = vec![0u8; 68];
+        let mut cb_admin = admin_sid.len() as u32;
+        if CreateWellKnownSid(
+            WIN_BUILTIN_ADMINISTRATORS_SID,
+            std::ptr::null_mut(),
+            admin_sid.as_mut_ptr() as *mut _,
+            &mut cb_admin,
+        ) != 0
+            && EqualSid(admin_sid.as_mut_ptr() as *mut _, effective_owner_sid) != 0
+        {
+            let mut is_member = 0i32;
+            let token_is_admin_member = (CheckTokenMembership(
+                std::ptr::null_mut(),
+                admin_sid.as_mut_ptr() as *mut _,
+                &mut is_member,
+            ) != 0
+                && is_member != 0)
+                || FAULT_INJECT_WINDOWS_SIMULATED_ADMIN_TOKEN.with(|c| c.get());
+
+            if token_is_admin_member {
+                let matches_tok_owner = (!tok_owner_sid.is_null()
+                    && EqualSid(tok_owner_sid, admin_sid.as_mut_ptr() as *mut _) != 0)
+                    || FAULT_INJECT_WINDOWS_SIMULATED_ADMIN_TOKEN.with(|c| c.get());
+
+                #[repr(C)]
+                #[allow(non_snake_case)]
+                struct TOKEN_ELEVATION {
+                    TokenIsElevated: u32,
+                }
+                const TOKEN_ELEVATION_CLASS: u32 = 20;
+                let mut elev = TOKEN_ELEVATION { TokenIsElevated: 0 };
+                let mut elev_ret_len = 0u32;
+                let is_elevated = (GetTokenInformation(
+                    token,
+                    TOKEN_ELEVATION_CLASS,
+                    &mut elev as *mut _ as *mut _,
+                    std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                    &mut elev_ret_len,
+                ) != 0
+                    && elev.TokenIsElevated != 0)
+                    || FAULT_INJECT_WINDOWS_SIMULATED_ADMIN_TOKEN.with(|c| c.get());
+
+                if matches_tok_owner || is_elevated {
+                    is_authorized_admin_owner = true;
+                }
+            }
+        }
+
+        // 3. SYSTEM (S-1-5-18):
+        let mut is_authorized_system_owner = false;
+        let mut sys_sid = vec![0u8; 68];
+        let mut cb_sys = sys_sid.len() as u32;
+        if CreateWellKnownSid(
+            WIN_LOCAL_SYSTEM_SID,
+            std::ptr::null_mut(),
+            sys_sid.as_mut_ptr() as *mut _,
+            &mut cb_sys,
+        ) != 0
+            && EqualSid(sys_sid.as_mut_ptr() as *mut _, effective_owner_sid) != 0
+            && EqualSid(token_user.User.Sid, sys_sid.as_mut_ptr() as *mut _) != 0
+        {
+            is_authorized_system_owner = true;
+        }
+
+        let is_valid_owner =
+            is_current_user || is_authorized_admin_owner || is_authorized_system_owner;
+        if !is_valid_owner {
             return Err(AetherError::PermissionDenied(format!(
-                "Parent storage directory '{:?}' is not owned by the current user token",
+                "Parent storage directory '{:?}' is not owned by an authorized private owner (individual TokenUser or authorized elevated Administrators); refusing operation",
                 parent
             )));
         }
@@ -1017,38 +1118,36 @@ pub fn verify_storage_parent_acl(parent: &Path) -> Result<()> {
                 let mask = allowed_ace.Mask;
                 if (mask & DANGEROUS_PERMISSIONS) != 0 {
                     let ace_sid = &allowed_ace.SidStart as *const u32 as *mut std::ffi::c_void;
-                    let is_current_user = EqualSid(token_user.User.Sid, ace_sid) != 0;
-                    let is_token_owner =
-                        !tok_owner_sid.is_null() && EqualSid(tok_owner_sid, ace_sid) != 0;
-                    let is_dir_owner = EqualSid(p_owner_sid, ace_sid) != 0;
+                    let is_current_user_ace = EqualSid(token_user.User.Sid, ace_sid) != 0;
 
-                    if !is_current_user && !is_token_owner && !is_dir_owner {
-                        let mut p_str: *mut u16 = std::ptr::null_mut();
-                        if ConvertSidToStringSidW(ace_sid, &mut p_str) != 0 && !p_str.is_null() {
-                            let mut len = 0;
-                            while *p_str.add(len) != 0 {
-                                len += 1;
-                            }
-                            let s =
-                                String::from_utf16_lossy(std::slice::from_raw_parts(p_str, len));
-                            LocalFree(p_str as *mut _);
+                    if is_current_user_ace {
+                        continue;
+                    }
 
-                            // S-1-5-18 = NT AUTHORITY\SYSTEM
-                            // S-1-5-32-544 = BUILTIN\Administrators
-                            if s == "S-1-5-18" || s == "S-1-5-32-544" {
-                                continue;
-                            }
-
-                            return Err(AetherError::PermissionDenied(format!(
-                                "Parent storage directory '{:?}' has unsafe permissions: ACE {} grants dangerous permissions (0x{:08X}) to unauthorized principal {}; refusing operation",
-                                parent, i, mask, s
-                            )));
-                        } else {
-                            return Err(AetherError::PermissionDenied(format!(
-                                "Parent storage directory '{:?}' has unsafe permissions: ACE {} grants dangerous permissions (0x{:08X}) to unknown principal; refusing operation",
-                                parent, i, mask
-                            )));
+                    let mut p_str: *mut u16 = std::ptr::null_mut();
+                    if ConvertSidToStringSidW(ace_sid, &mut p_str) != 0 && !p_str.is_null() {
+                        let mut len = 0;
+                        while *p_str.add(len) != 0 {
+                            len += 1;
                         }
+                        let s = String::from_utf16_lossy(std::slice::from_raw_parts(p_str, len));
+                        LocalFree(p_str as *mut _);
+
+                        // S-1-5-18 = NT AUTHORITY\SYSTEM
+                        // S-1-5-32-544 = BUILTIN\Administrators
+                        if s == "S-1-5-18" || s == "S-1-5-32-544" {
+                            continue;
+                        }
+
+                        return Err(AetherError::PermissionDenied(format!(
+                            "Parent storage directory '{:?}' has unsafe permissions: ACE {} grants dangerous permissions (0x{:08X}) to unauthorized principal {}; refusing operation",
+                            parent, i, mask, s
+                        )));
+                    } else {
+                        return Err(AetherError::PermissionDenied(format!(
+                            "Parent storage directory '{:?}' has unsafe permissions: ACE {} grants dangerous permissions (0x{:08X}) to unknown principal; refusing operation",
+                            parent, i, mask
+                        )));
                     }
                 }
             }
@@ -3753,6 +3852,15 @@ pub struct ConditionalReplaceOutcome {
     /// If a backup file had to be preserved due to trailing modifications, read failure,
     /// rename failure, or removal failure, this contains the absolute path of the surviving file.
     pub preserved_backup: Option<PathBuf>,
+    /// If a temporary staging file could not be unlinked after publication, this contains the absolute path of the residual artifact.
+    pub residual_staging: Option<PathBuf>,
+}
+
+impl ConditionalReplaceOutcome {
+    /// Returns true if no backup was preserved and no residual staging artifact remains.
+    pub fn is_fully_clean(&self) -> bool {
+        self.preserved_backup.is_none() && self.residual_staging.is_none()
+    }
 }
 
 /// Optional hooks and fault-injection flags for conditional file replacement.
@@ -3776,6 +3884,8 @@ pub struct ConditionalReplaceHooks<'a> {
     pub fault_inject_conflict_rename: bool,
     /// Injected fault: simulate failure during backup removal.
     pub fault_inject_backup_removal: bool,
+    /// Injected fault: simulate failure during staging file removal after publication or during rollback.
+    pub fault_inject_staging_removal: bool,
     /// Injected immediately before primary atomic publication (pre-hard-link / pre-publish).
     pub pre_publish_hook: Option<&'a (dyn Fn(&Path) + 'a)>,
     /// Injected immediately before platform-specific fallback publication primitive.
@@ -3971,6 +4081,7 @@ impl WorkspaceCapability {
     /// Internal rollback helper that strictly verifies rollback rename results.
     /// If rollback fails, the backup file is preserved on disk without deletion,
     /// and an explicit `AetherError::Internal` containing the backup location is returned.
+    #[allow(clippy::too_many_arguments)]
     fn perform_rollback(
         &self,
         backup_rel: &Path,
@@ -3979,16 +4090,32 @@ impl WorkspaceCapability {
         user_path: &str,
         cause_msg: &str,
         fault_inject_rollback_failure: bool,
+        fault_inject_staging_removal: bool,
     ) -> AetherError {
         // Clean up temporary incoming stage file if present
+        let mut staging_residual_note = None;
         if let Some(stage) = stage_rel {
-            if let Err(e) = self.dir.remove_file(stage) {
+            let stage_abs = self.root_path.join(stage);
+            let rm_res = if fault_inject_staging_removal {
+                Err(std::io::Error::other(
+                    "Injected staging removal failure during rollback",
+                ))
+            } else {
+                self.dir.remove_file(stage)
+            };
+            if let Err(e) = rm_res {
                 warn!(
                     "perform_rollback: failed to remove staging file '{:?}': {}",
                     stage, e
                 );
+                staging_residual_note = Some(format!(
+                    "; additionally failed to remove residual staging artifact '{}': {}",
+                    stage_abs.display(),
+                    e
+                ));
             }
         }
+        let staging_note = staging_residual_note.as_deref().unwrap_or("");
 
         // Commit-boundary safety check:
         // If a competing object already exists at `rel`, attempting to rename `backup_rel` to `rel`
@@ -4006,14 +4133,14 @@ impl WorkspaceCapability {
                 Ok(()) => {
                     let conflict_abs = self.root_path.join(&conflict_rel);
                     return AetherError::PermissionDenied(format!(
-                        "Commit boundary conflict on '{}': {}. Destination was concurrently recreated; competing destination preserved; original data preserved at '{}'.",
-                        user_path, cause_msg, conflict_abs.display()
+                        "Commit boundary conflict on '{}': {}. Destination was concurrently recreated; competing destination preserved; original data preserved at '{}'{}.",
+                        user_path, cause_msg, conflict_abs.display(), staging_note
                     ));
                 }
                 Err(e) => {
                     return AetherError::Internal(format!(
-                        "Commit boundary conflict on '{}': {}. Destination was concurrently recreated; preservation rename to conflict path failed ({}); original data retained at '{}'.",
-                        user_path, cause_msg, e, backup_abs.display()
+                        "Commit boundary conflict on '{}': {}. Destination was concurrently recreated; preservation rename to conflict path failed ({}); original data retained at '{}'{}.",
+                        user_path, cause_msg, e, backup_abs.display(), staging_note
                     ));
                 }
             }
@@ -4030,14 +4157,14 @@ impl WorkspaceCapability {
 
         match rollback_res {
             Ok(()) => AetherError::PermissionDenied(format!(
-                "Restore race detected: {}. Restore aborted, target rolled back successfully.",
-                cause_msg
+                "Restore race detected: {}. Restore aborted, target rolled back successfully{}.",
+                cause_msg, staging_note
             )),
             Err(rb_err) => {
                 let backup_abs = self.root_path.join(backup_rel);
                 AetherError::Internal(format!(
-                    "RESTORE ROLLBACK FAILURE on '{}': {}. Attempted rollback to destination failed ({}). User data PRESERVED at '{}'. Do not delete this file; manual recovery required.",
-                    user_path, cause_msg, rb_err, backup_abs.display()
+                    "RESTORE ROLLBACK FAILURE on '{}': {}. Attempted rollback to destination failed ({}). User data PRESERVED at '{}'. Do not delete this file; manual recovery required{}.",
+                    user_path, cause_msg, rb_err, backup_abs.display(), staging_note
                 ))
             }
         }
@@ -4181,7 +4308,7 @@ impl WorkspaceCapability {
         stage_abs: &Path,
         dest_abs: &Path,
         hooks: &ConditionalReplaceHooks,
-    ) -> std::result::Result<(), AtomicPublishError> {
+    ) -> std::result::Result<Option<PathBuf>, AtomicPublishError> {
         if let Some(hook) = hooks.pre_publish_hook {
             hook(dest_abs);
         }
@@ -4197,13 +4324,18 @@ impl WorkspaceCapability {
 
         match link_res {
             Ok(()) => {
-                if let Err(e) = self.dir.remove_file(stage_rel) {
+                let residual_staging = if hooks.fault_inject_staging_removal {
+                    Some(stage_abs.to_path_buf())
+                } else if let Err(e) = self.dir.remove_file(stage_rel) {
                     warn!(
                         "atomic_publish_no_replace: failed to remove staging link '{:?}': {}",
                         stage_rel, e
                     );
-                }
-                return Ok(());
+                    Some(stage_abs.to_path_buf())
+                } else {
+                    None
+                };
+                return Ok(residual_staging);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(AtomicPublishError::DestinationExists);
@@ -4227,7 +4359,8 @@ impl WorkspaceCapability {
             fb_hook(dest_abs);
         }
 
-        Self::atomic_publish_fallback(stage_abs, dest_abs)
+        Self::atomic_publish_fallback(stage_abs, dest_abs)?;
+        Ok(None)
     }
 
     /// Conditionally replaces or creates a file inside workspace capability with full hook support.
@@ -4260,6 +4393,7 @@ impl WorkspaceCapability {
             } else {
                 PathBuf::from(&stage_name)
             };
+            let stage_abs = self.root_path.join(&stage_rel);
 
             let mut opts = OpenOptions::new();
             opts.write(true).create_new(true);
@@ -4269,32 +4403,52 @@ impl WorkspaceCapability {
                 .open_with(&stage_rel, &opts)
                 .map_err(AetherError::Io)?;
 
+            let cleanup_stage_or_error = |primary_msg: String| -> AetherError {
+                let rm_res = if hooks.fault_inject_staging_removal {
+                    Err(std::io::Error::other("Injected staging removal failure"))
+                } else {
+                    self.dir.remove_file(&stage_rel)
+                };
+                if let Err(rm_err) = rm_res {
+                    AetherError::Io(std::io::Error::other(format!(
+                        "{}; additionally failed to remove residual staging artifact '{}': {}",
+                        primary_msg,
+                        stage_abs.display(),
+                        rm_err
+                    )))
+                } else {
+                    AetherError::Io(std::io::Error::other(primary_msg))
+                }
+            };
+
             if hooks.fault_inject_stage_write {
                 drop(f);
-                let _ = self.dir.remove_file(&stage_rel);
-                return Err(AetherError::Io(std::io::Error::other(
-                    "Injected stage write failure",
-                )));
+                return Err(cleanup_stage_or_error(
+                    "Injected stage write failure".to_string(),
+                ));
             }
 
             if let Err(e) = f.write_all(bytes) {
                 drop(f);
-                let _ = self.dir.remove_file(&stage_rel);
-                return Err(AetherError::Io(e));
+                return Err(cleanup_stage_or_error(format!(
+                    "Failed to write stage file bytes: {}",
+                    e
+                )));
             }
 
             if hooks.fault_inject_stage_sync {
                 drop(f);
-                let _ = self.dir.remove_file(&stage_rel);
-                return Err(AetherError::Io(std::io::Error::other(
-                    "Injected stage sync failure",
-                )));
+                return Err(cleanup_stage_or_error(
+                    "Injected stage sync failure".to_string(),
+                ));
             }
 
             if let Err(e) = f.sync_all() {
                 drop(f);
-                let _ = self.dir.remove_file(&stage_rel);
-                return Err(AetherError::Io(e));
+                return Err(cleanup_stage_or_error(format!(
+                    "Failed to sync stage file: {}",
+                    e
+                )));
             }
             drop(f);
 
@@ -4302,30 +4456,69 @@ impl WorkspaceCapability {
             let link_res = self.dir.hard_link(&stage_rel, &self.dir, &rel);
             match link_res {
                 Ok(()) => {
-                    let _ = self.dir.remove_file(&stage_rel);
+                    let residual_staging = if hooks.fault_inject_staging_removal {
+                        Some(stage_abs.clone())
+                    } else if let Err(e) = self.dir.remove_file(&stage_rel) {
+                        warn!(
+                            "replace_file_bytes_conditional_with_hooks: failed to remove staging link '{:?}': {}",
+                            stage_rel, e
+                        );
+                        Some(stage_abs.clone())
+                    } else {
+                        None
+                    };
                     return Ok(ConditionalReplaceOutcome {
                         dest_path: dest_abs,
                         preserved_backup: None,
+                        residual_staging,
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let _ = self.dir.remove_file(&stage_rel);
+                    let rm_res = if hooks.fault_inject_staging_removal {
+                        Err(std::io::Error::other("Injected staging removal failure"))
+                    } else {
+                        self.dir.remove_file(&stage_rel)
+                    };
+                    let residual_msg = if let Err(rm_err) = rm_res {
+                        format!(
+                            "; additionally failed to remove residual staging artifact '{}': {}",
+                            stage_abs.display(),
+                            rm_err
+                        )
+                    } else {
+                        String::new()
+                    };
                     return Err(AetherError::PermissionDenied(format!(
-                        "Restore race detected: target file '{}' was newly created on disk before replacement. Restore aborted.",
-                        user_path
+                        "Restore race detected: target file '{}' was newly created on disk before replacement{}. Restore aborted.",
+                        user_path, residual_msg
                     )));
                 }
                 Err(e) => {
+                    let rm_res = if hooks.fault_inject_staging_removal {
+                        Err(std::io::Error::other("Injected staging removal failure"))
+                    } else {
+                        self.dir.remove_file(&stage_rel)
+                    };
+                    let residual_msg = if let Err(rm_err) = rm_res {
+                        format!(
+                            "; additionally failed to remove residual staging artifact '{}': {}",
+                            stage_abs.display(),
+                            rm_err
+                        )
+                    } else {
+                        String::new()
+                    };
                     // Check if file exists to detect race condition
                     if self.dir.symlink_metadata(&rel).is_ok() {
-                        let _ = self.dir.remove_file(&stage_rel);
                         return Err(AetherError::PermissionDenied(format!(
-                            "Restore race detected: target file '{}' was newly created on disk before replacement. Restore aborted.",
-                            user_path
+                            "Restore race detected: target file '{}' was newly created on disk before replacement{}. Restore aborted.",
+                            user_path, residual_msg
                         )));
                     }
-                    let _ = self.dir.remove_file(&stage_rel);
-                    return Err(AetherError::Io(e));
+                    return Err(AetherError::Io(std::io::Error::other(format!(
+                        "Failed to hard-link stage file ({}){}",
+                        e, residual_msg
+                    ))));
                 }
             }
         }
@@ -4339,6 +4532,7 @@ impl WorkspaceCapability {
         } else {
             PathBuf::from(&stage_name)
         };
+        let stage_abs = self.root_path.join(&stage_rel);
 
         let mut opts = OpenOptions::new();
         opts.write(true).create_new(true);
@@ -4347,8 +4541,54 @@ impl WorkspaceCapability {
             .dir
             .open_with(&stage_rel, &opts)
             .map_err(AetherError::Io)?;
-        f.write_all(bytes).map_err(AetherError::Io)?;
-        f.sync_all().map_err(AetherError::Io)?;
+
+        let cleanup_stage_or_error = |primary_msg: String| -> AetherError {
+            let rm_res = if hooks.fault_inject_staging_removal {
+                Err(std::io::Error::other("Injected staging removal failure"))
+            } else {
+                self.dir.remove_file(&stage_rel)
+            };
+            if let Err(rm_err) = rm_res {
+                AetherError::Io(std::io::Error::other(format!(
+                    "{}; additionally failed to remove residual staging artifact '{}': {}",
+                    primary_msg,
+                    stage_abs.display(),
+                    rm_err
+                )))
+            } else {
+                AetherError::Io(std::io::Error::other(primary_msg))
+            }
+        };
+
+        if hooks.fault_inject_stage_write {
+            drop(f);
+            return Err(cleanup_stage_or_error(
+                "Injected stage write failure".to_string(),
+            ));
+        }
+
+        if let Err(e) = f.write_all(bytes) {
+            drop(f);
+            return Err(cleanup_stage_or_error(format!(
+                "Failed to write stage file bytes: {}",
+                e
+            )));
+        }
+
+        if hooks.fault_inject_stage_sync {
+            drop(f);
+            return Err(cleanup_stage_or_error(
+                "Injected stage sync failure".to_string(),
+            ));
+        }
+
+        if let Err(e) = f.sync_all() {
+            drop(f);
+            return Err(cleanup_stage_or_error(format!(
+                "Failed to sync stage file: {}",
+                e
+            )));
+        }
         drop(f);
 
         // 2. Invoke pre_replace_hook if configured (deterministic test injection)
@@ -4365,10 +4605,23 @@ impl WorkspaceCapability {
         };
 
         if let Err(e) = self.dir.rename(&rel, &self.dir, &backup_rel) {
-            let _ = self.dir.remove_file(&stage_rel);
+            let rm_res = if hooks.fault_inject_staging_removal {
+                Err(std::io::Error::other("Injected staging removal failure"))
+            } else {
+                self.dir.remove_file(&stage_rel)
+            };
+            let residual_msg = if let Err(rm_err) = rm_res {
+                format!(
+                    "; additionally failed to remove residual staging artifact '{}': {}",
+                    stage_abs.display(),
+                    rm_err
+                )
+            } else {
+                String::new()
+            };
             return Err(AetherError::PermissionDenied(format!(
-                "Restore race detected: target file '{}' could not be staged for verification ({}). Restore aborted.",
-                user_path, e
+                "Restore race detected: target file '{}' could not be staged for verification ({}){}. Restore aborted.",
+                user_path, e, residual_msg
             )));
         }
 
@@ -4386,6 +4639,7 @@ impl WorkspaceCapability {
                         user_path, e
                     ),
                     hooks.fault_inject_rollback_failure,
+                    hooks.fault_inject_staging_removal,
                 ));
             }
         };
@@ -4401,6 +4655,7 @@ impl WorkspaceCapability {
                     user_path
                 ),
                 hooks.fault_inject_rollback_failure,
+                hooks.fault_inject_staging_removal,
             ));
         }
 
@@ -4417,6 +4672,7 @@ impl WorkspaceCapability {
                         user_path, e
                     ),
                     hooks.fault_inject_rollback_failure,
+                    hooks.fault_inject_staging_removal,
                 ));
             }
         };
@@ -4431,6 +4687,7 @@ impl WorkspaceCapability {
                 user_path,
                 &format!("target file '{}' could not be read ({})", user_path, e),
                 hooks.fault_inject_rollback_failure,
+                hooks.fault_inject_staging_removal,
             ));
         }
         drop(backup_file);
@@ -4454,6 +4711,7 @@ impl WorkspaceCapability {
                     user_path, expected, current_hash
                 ),
                 hooks.fault_inject_rollback_failure,
+                hooks.fault_inject_staging_removal,
             ));
         }
 
@@ -4480,6 +4738,7 @@ impl WorkspaceCapability {
                         user_path, e
                     ),
                     hooks.fault_inject_rollback_failure,
+                    hooks.fault_inject_staging_removal,
                 ));
             }
         };
@@ -4504,6 +4763,7 @@ impl WorkspaceCapability {
                     user_path, expected, recheck_hash
                 ),
                 hooks.fault_inject_rollback_failure,
+                hooks.fault_inject_staging_removal,
             ));
         }
 
@@ -4512,8 +4772,8 @@ impl WorkspaceCapability {
         let publish_res =
             self.atomic_publish_no_replace(&stage_rel, &rel, &stage_abs, &dest_abs, &hooks);
 
-        match publish_res {
-            Ok(()) => {}
+        let residual_staging = match publish_res {
+            Ok(res_staging) => res_staging,
             Err(AtomicPublishError::DestinationExists) => {
                 return Err(self.perform_rollback(
                     &backup_rel,
@@ -4522,6 +4782,7 @@ impl WorkspaceCapability {
                     user_path,
                     "competing destination object was concurrently created at commit boundary",
                     hooks.fault_inject_rollback_failure,
+                    hooks.fault_inject_staging_removal,
                 ));
             }
             Err(AtomicPublishError::Unsupported) => {
@@ -4532,6 +4793,7 @@ impl WorkspaceCapability {
                     user_path,
                     "filesystem does not support atomic no-replace publication; failed closed to prevent overwrite",
                     hooks.fault_inject_rollback_failure,
+                    hooks.fault_inject_staging_removal,
                 ));
             }
             Err(AtomicPublishError::CrossDevice) => {
@@ -4542,6 +4804,7 @@ impl WorkspaceCapability {
                     user_path,
                     "cross-device link error during publication; failed closed to prevent overwrite",
                     hooks.fault_inject_rollback_failure,
+                    hooks.fault_inject_staging_removal,
                 ));
             }
             Err(AtomicPublishError::Io(e)) => {
@@ -4552,9 +4815,10 @@ impl WorkspaceCapability {
                     user_path,
                     &format!("failed to commit replacement file atomically ({})", e),
                     hooks.fault_inject_rollback_failure,
+                    hooks.fault_inject_staging_removal,
                 ));
             }
-        }
+        };
 
         // 8. Final guard: verify backup file did not receive trailing modifications before removal
         let backup_check_result: std::io::Result<bool> = (|| {
@@ -4617,6 +4881,7 @@ impl WorkspaceCapability {
             return Ok(ConditionalReplaceOutcome {
                 dest_path: dest_abs,
                 preserved_backup: Some(surviving_path),
+                residual_staging,
             });
         }
 
@@ -4656,6 +4921,7 @@ impl WorkspaceCapability {
                 return Ok(ConditionalReplaceOutcome {
                     dest_path: dest_abs,
                     preserved_backup: Some(surviving),
+                    residual_staging,
                 });
             }
         }
@@ -4671,6 +4937,7 @@ impl WorkspaceCapability {
             Ok(()) => Ok(ConditionalReplaceOutcome {
                 dest_path: dest_abs,
                 preserved_backup: None,
+                residual_staging,
             }),
             Err(rm_err) => {
                 let surviving = self.root_path.join(&backup_rel);
@@ -4683,6 +4950,7 @@ impl WorkspaceCapability {
                 Ok(ConditionalReplaceOutcome {
                     dest_path: dest_abs,
                     preserved_backup: Some(surviving),
+                    residual_staging,
                 })
             }
         }
@@ -7336,7 +7604,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    unsafe fn set_permissive_dacl_for_everyone(path: &Path, inherit: bool) {
+    unsafe fn set_permissive_dacl_for_sid(path: &Path, well_known_sid: u32, inherit: bool) {
         use std::os::windows::ffi::OsStrExt;
         let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
 
@@ -7344,7 +7612,6 @@ mod tests {
         const DACL_SECURITY_INFORMATION: u32 = 0x00000004;
         const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x80000000;
         const ACL_REVISION: u32 = 2;
-        const WIN_WORLD_SID: u32 = 1;
         const GENERIC_ALL: u32 = 0x10000000;
         const CONTAINER_INHERIT_ACE: u32 = 0x02;
         const OBJECT_INHERIT_ACE: u32 = 0x01;
@@ -7379,13 +7646,13 @@ mod tests {
             ) -> u32;
         }
 
-        let mut everyone_sid = vec![0u8; 68];
-        let mut cb_everyone = everyone_sid.len() as u32;
+        let mut sid_buf = vec![0u8; 68];
+        let mut cb_sid = sid_buf.len() as u32;
         CreateWellKnownSid(
-            WIN_WORLD_SID,
+            well_known_sid,
             std::ptr::null_mut(),
-            everyone_sid.as_mut_ptr() as *mut _,
-            &mut cb_everyone,
+            sid_buf.as_mut_ptr() as *mut _,
+            &mut cb_sid,
         );
 
         let mut acl_buf = vec![0u8; 1024];
@@ -7405,7 +7672,7 @@ mod tests {
             ACL_REVISION,
             flags,
             GENERIC_ALL,
-            everyone_sid.as_mut_ptr() as *mut _,
+            sid_buf.as_mut_ptr() as *mut _,
         );
 
         SetNamedSecurityInfoW(
@@ -7417,6 +7684,12 @@ mod tests {
             acl_buf.as_mut_ptr() as *mut _,
             std::ptr::null_mut(),
         );
+    }
+
+    #[cfg(windows)]
+    unsafe fn set_permissive_dacl_for_everyone(path: &Path, inherit: bool) {
+        const WIN_WORLD_SID: u32 = 1;
+        set_permissive_dacl_for_sid(path, WIN_WORLD_SID, inherit);
     }
 
     #[test]
@@ -7486,7 +7759,7 @@ mod tests {
         );
         let err_msg = format!("{:?}", res);
         assert!(
-            err_msg.contains("not owned by the current user token"),
+            err_msg.contains("not owned by an authorized private owner"),
             "Error must indicate ownership mismatch: {}",
             err_msg
         );
@@ -7550,6 +7823,296 @@ mod tests {
             err_msg.contains("failed to inspect security descriptor"),
             "Error must indicate inspection failure: {}",
             err_msg
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_parent_broad_group_owner_cannot_bypass_private_acl() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_dacl_broad_group_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Directory owned by broad group BUILTIN\Users (SID 27):
+        // Must be rejected at ownership check (broad groups are not accepted as private owner)
+        const WIN_BUILTIN_USERS_SID: u32 = 27;
+        set_fault_inject_windows_simulated_owner_sid(Some(WIN_BUILTIN_USERS_SID));
+        let res = verify_storage_parent_acl(&temp_dir);
+        set_fault_inject_windows_simulated_owner_sid(None);
+
+        assert!(
+            res.is_err(),
+            "Parent directory owned by BUILTIN\\Users must be rejected"
+        );
+        let err_msg = format!("{:?}", res);
+        assert!(
+            err_msg.contains("not owned by an authorized private owner"),
+            "Error must indicate rejection of broad group owner: {}",
+            err_msg
+        );
+
+        // 2. Directory owned by BUILTIN\Users AND having dangerous permissions granted to BUILTIN\Users in DACL:
+        // Neither check may be bypassed.
+        unsafe {
+            set_permissive_dacl_for_sid(&temp_dir, WIN_BUILTIN_USERS_SID, false);
+        }
+        set_fault_inject_windows_simulated_owner_sid(Some(WIN_BUILTIN_USERS_SID));
+        let res_dacl = verify_storage_parent_acl(&temp_dir);
+        set_fault_inject_windows_simulated_owner_sid(None);
+
+        assert!(
+            res_dacl.is_err(),
+            "Parent directory with broad group owner and permissive group DACL must be rejected"
+        );
+
+        // 3. Secure remediation: secure_storage_parent_private_acl reconfigures DACL to private,
+        // eliminating dangerous permissions for other users.
+        secure_storage_parent_private_acl(&temp_dir).expect("remediation must succeed");
+        // After securing, verify that broad group BUILTIN\Users is no longer in DACL
+        let verify_safe = verify_storage_parent_acl(&temp_dir);
+        assert!(
+            verify_safe.is_ok(),
+            "Secured parent directory must pass verification: {:?}",
+            verify_safe
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_parent_authorized_administrators_owner() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_dacl_admin_owner_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        const WIN_BUILTIN_ADMINISTRATORS_SID: u32 = 26;
+        set_fault_inject_windows_simulated_owner_sid(Some(WIN_BUILTIN_ADMINISTRATORS_SID));
+        set_fault_inject_windows_simulated_admin_token(true);
+
+        secure_storage_parent_private_acl(&temp_dir).expect("secure private acl");
+        let res = verify_storage_parent_acl(&temp_dir);
+
+        set_fault_inject_windows_simulated_owner_sid(None);
+        set_fault_inject_windows_simulated_admin_token(false);
+
+        assert!(
+            res.is_ok(),
+            "Authorized elevated Administrators-owned parent must be accepted: {:?}",
+            res
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_replace_file_publication_staging_removal_failure_surfaces_residual() {
+        use sha2::Digest;
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_replace_staging_fail_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let target = temp_dir.join("test.txt");
+        std::fs::write(&target, b"original content").unwrap();
+
+        let caps = WorkspaceCapability::open(&temp_dir).unwrap();
+        let hooks = ConditionalReplaceHooks {
+            fault_inject_staging_removal: true,
+            ..Default::default()
+        };
+
+        let outcome = caps
+            .replace_file_bytes_conditional_with_hooks(
+                "test.txt",
+                b"new content",
+                Some(&format!("{:x}", sha2::Sha256::digest(b"original content"))),
+                hooks,
+            )
+            .expect("replacement should succeed");
+
+        assert_eq!(outcome.dest_path, caps.root_path().join("test.txt"));
+        assert!(
+            outcome.residual_staging.is_some(),
+            "Residual staging path must be surfaced when staging removal fails"
+        );
+        assert!(
+            !outcome.is_fully_clean(),
+            "Outcome must indicate not fully clean due to residual staging"
+        );
+        let residual = outcome.residual_staging.unwrap();
+        assert!(
+            residual.exists(),
+            "Residual staging artifact must remain on disk: {:?}",
+            residual
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"new content");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_replace_file_stage_write_failure_surfaces_residual_path() {
+        use sha2::Digest;
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_replace_stage_write_fail_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let target = temp_dir.join("test.txt");
+        std::fs::write(&target, b"original content").unwrap();
+
+        let caps = WorkspaceCapability::open(&temp_dir).unwrap();
+        let hooks = ConditionalReplaceHooks {
+            fault_inject_stage_write: true,
+            fault_inject_staging_removal: true,
+            ..Default::default()
+        };
+
+        let res = caps.replace_file_bytes_conditional_with_hooks(
+            "test.txt",
+            b"new content",
+            Some(&format!("{:x}", sha2::Sha256::digest(b"original content"))),
+            hooks,
+        );
+
+        assert!(res.is_err(), "Stage write failure must be returned");
+        let err_str = format!("{:?}", res);
+        assert!(
+            err_str.contains("Injected stage write failure"),
+            "Error must preserve primary error: {}",
+            err_str
+        );
+        assert!(
+            err_str.contains("additionally failed to remove residual staging artifact"),
+            "Error must expose residual staging cleanup failure and artifact path: {}",
+            err_str
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_replace_file_stage_sync_failure_surfaces_residual_path() {
+        use sha2::Digest;
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_replace_stage_sync_fail_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let target = temp_dir.join("test.txt");
+        std::fs::write(&target, b"original content").unwrap();
+
+        let caps = WorkspaceCapability::open(&temp_dir).unwrap();
+        let hooks = ConditionalReplaceHooks {
+            fault_inject_stage_sync: true,
+            fault_inject_staging_removal: true,
+            ..Default::default()
+        };
+
+        let res = caps.replace_file_bytes_conditional_with_hooks(
+            "test.txt",
+            b"new content",
+            Some(&format!("{:x}", sha2::Sha256::digest(b"original content"))),
+            hooks,
+        );
+
+        assert!(res.is_err(), "Stage sync failure must be returned");
+        let err_str = format!("{:?}", res);
+        assert!(
+            err_str.contains("Injected stage sync failure"),
+            "Error must preserve primary error: {}",
+            err_str
+        );
+        assert!(
+            err_str.contains("additionally failed to remove residual staging artifact"),
+            "Error must expose residual staging cleanup failure and artifact path: {}",
+            err_str
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_replace_file_missing_target_collision_surfaces_residual_path() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_missing_collision_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let caps = WorkspaceCapability::open(&temp_dir).unwrap();
+        let hooks = ConditionalReplaceHooks {
+            pre_replace_hook: Some(&|p| {
+                let _ = std::fs::write(p, b"competing creator");
+            }),
+            fault_inject_staging_removal: true,
+            ..Default::default()
+        };
+
+        let res = caps.replace_file_bytes_conditional_with_hooks(
+            "missing.txt",
+            b"new content",
+            None,
+            hooks,
+        );
+
+        assert!(res.is_err(), "Collision must fail");
+        let err_str = format!("{:?}", res);
+        assert!(
+            err_str.contains("Restore race detected"),
+            "Must report restore race: {}",
+            err_str
+        );
+        assert!(
+            err_str.contains("additionally failed to remove residual staging artifact"),
+            "Must surface residual staging artifact on collision: {}",
+            err_str
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_perform_rollback_staging_removal_failure_surfaces_in_error() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_rollback_staging_fail_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let target = temp_dir.join("test.txt");
+        std::fs::write(&target, b"original content").unwrap();
+
+        let caps = WorkspaceCapability::open(&temp_dir).unwrap();
+        let hooks = ConditionalReplaceHooks {
+            fault_inject_staging_removal: true,
+            ..Default::default()
+        };
+
+        let res = caps.replace_file_bytes_conditional_with_hooks(
+            "test.txt",
+            b"new content",
+            Some("0000000000000000000000000000000000000000000000000000000000000000"),
+            hooks,
+        );
+
+        assert!(res.is_err(), "Hash mismatch must trigger rollback");
+        let err_str = format!("{:?}", res);
+        assert!(
+            err_str.contains("Restore race detected"),
+            "Error must contain primary restore race error: {}",
+            err_str
+        );
+        assert!(
+            err_str.contains("additionally failed to remove residual staging artifact"),
+            "Error must surface staging removal failure and residual path: {}",
+            err_str
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);

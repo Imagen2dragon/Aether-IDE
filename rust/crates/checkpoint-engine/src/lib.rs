@@ -17991,18 +17991,31 @@ mod tests {
         let count_processed = processed_count.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
             count_processed >= 1,
-            "At least one real child must have been processed before fault: {}",
+            "At least one real child must have had pre-delete hook invoked: {}",
             count_processed
         );
 
         let surviving = [f1.exists(), f2.exists(), f3.exists()];
         let surviving_count = surviving.iter().filter(|&&e| e).count();
-        assert!(
-            surviving_count >= 1,
-            "Remaining unprocessed siblings must remain on disk: surviving {}, processed {}",
-            surviving_count,
-            count_processed
+        let deleted_count = surviving.iter().filter(|&&e| !e).count();
+        assert_eq!(
+            deleted_count, 1,
+            "Exactly one completed child deletion must have occurred before the injected failure"
         );
+        assert_eq!(
+            surviving_count, 2,
+            "Exactly two sibling files must remain intact on disk"
+        );
+        for (path, expected_data) in [(&f1, "data1"), (&f2, "data2"), (&f3, "data3")] {
+            if path.exists() {
+                assert_eq!(
+                    std::fs::read_to_string(path).unwrap(),
+                    expected_data,
+                    "Surviving file '{:?}' must retain original byte contents",
+                    path
+                );
+            }
+        }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -18065,10 +18078,7 @@ mod tests {
 
         filesystem_engine::set_child_open_pre_hook(None);
 
-        assert!(
-            clean_res.is_ok() || clean_res.is_err(),
-            "Traversal must complete or fail closed without following reparse point"
-        );
+        let _ = clean_res;
 
         assert!(
             outside_dir.exists(),
