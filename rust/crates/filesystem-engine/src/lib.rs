@@ -2551,9 +2551,14 @@ impl PinnedDirectoryHandle {
             )
         } == 0
         {
+            let temp_child_path = self
+                .path
+                .parent()
+                .map(|p| p.join(temp_unlink_name.to_string_lossy().as_ref()))
+                .unwrap_or_else(|| PathBuf::from(temp_unlink_name.to_string_lossy().as_ref()));
             if let Ok(guard) = TEMP_ENTRY_PRE_UNLINK_HOOK.lock() {
                 if let Some(ref hook) = *guard {
-                    hook(&self.path);
+                    hook(&temp_child_path);
                 }
             }
 
@@ -2579,14 +2584,6 @@ impl PinnedDirectoryHandle {
                     }
                 }
             } else {
-                unsafe {
-                    libc::renameat(
-                        parent_fd_raw,
-                        temp_unlink_name.as_ptr(),
-                        parent_fd_raw,
-                        c_name.as_ptr(),
-                    )
-                };
                 return Err(AetherError::PermissionDenied(format!(
                     "Directory entry '{:?}' identity conflict during rename",
                     self.path
@@ -2862,9 +2859,10 @@ fn clean_dir_descriptor(dir_fd: libc::c_int, dir_path: &Path) -> Result<()> {
             .map_err(|e| AetherError::Internal(format!("Invalid temp CString: {}", e)))?;
 
             if unsafe { libc::renameat(dir_fd, c_name, dir_fd, temp_unlink_name.as_ptr()) } == 0 {
+                let temp_child_path = dir_path.join(temp_unlink_name.to_string_lossy().as_ref());
                 if let Ok(guard) = TEMP_ENTRY_PRE_UNLINK_HOOK.lock() {
                     if let Some(ref hook) = *guard {
-                        hook(&child_path);
+                        hook(&temp_child_path);
                     }
                 }
 
@@ -2890,7 +2888,6 @@ fn clean_dir_descriptor(dir_fd: libc::c_int, dir_path: &Path) -> Result<()> {
                         }
                     }
                 } else {
-                    unsafe { libc::renameat(dir_fd, temp_unlink_name.as_ptr(), dir_fd, c_name) };
                     unsafe {
                         libc::closedir(dir_ptr);
                     }
@@ -3044,9 +3041,10 @@ fn clean_dir_descriptor(dir_fd: libc::c_int, dir_path: &Path) -> Result<()> {
             .map_err(|e| AetherError::Internal(format!("Invalid temp CString: {}", e)))?;
 
             if unsafe { libc::renameat(dir_fd, c_name, dir_fd, temp_unlink_name.as_ptr()) } == 0 {
+                let temp_child_path = dir_path.join(temp_unlink_name.to_string_lossy().as_ref());
                 if let Ok(guard) = TEMP_ENTRY_PRE_UNLINK_HOOK.lock() {
                     if let Some(ref hook) = *guard {
-                        hook(&child_path);
+                        hook(&temp_child_path);
                     }
                 }
 
@@ -3075,7 +3073,6 @@ fn clean_dir_descriptor(dir_fd: libc::c_int, dir_path: &Path) -> Result<()> {
                         }
                     }
                 } else {
-                    unsafe { libc::renameat(dir_fd, temp_unlink_name.as_ptr(), dir_fd, c_name) };
                     unsafe {
                         libc::closedir(dir_ptr);
                     }
@@ -3197,9 +3194,10 @@ fn clean_dir_descriptor(dir_fd: libc::c_int, dir_path: &Path) -> Result<()> {
             .map_err(|e| AetherError::Internal(format!("Invalid temp CString: {}", e)))?;
 
             if unsafe { libc::renameat(dir_fd, c_name, dir_fd, temp_unlink_name.as_ptr()) } == 0 {
+                let temp_child_path = dir_path.join(temp_unlink_name.to_string_lossy().as_ref());
                 if let Ok(guard) = TEMP_ENTRY_PRE_UNLINK_HOOK.lock() {
                     if let Some(ref hook) = *guard {
-                        hook(&child_path);
+                        hook(&temp_child_path);
                     }
                 }
 
@@ -3225,7 +3223,6 @@ fn clean_dir_descriptor(dir_fd: libc::c_int, dir_path: &Path) -> Result<()> {
                         }
                     }
                 } else {
-                    unsafe { libc::renameat(dir_fd, temp_unlink_name.as_ptr(), dir_fd, c_name) };
                     unsafe {
                         libc::closedir(dir_ptr);
                     }
