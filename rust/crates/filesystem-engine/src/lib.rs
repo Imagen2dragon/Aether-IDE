@@ -57,6 +57,8 @@ thread_local! {
     static FAULT_INJECT_WINDOWS_IDENTITY_MISMATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAULT_INJECT_WINDOWS_DEST_IDENTITY_MISMATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAULT_INJECT_WINDOWS_DEST_IDENTITY_QUERY_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAULT_INJECT_WINDOWS_SECURITY_DESCRIPTOR_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAULT_INJECT_WINDOWS_DIFFERENT_OWNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static HOOK_WINDOWS_PRE_EXCLUSIVE_OPEN: std::cell::RefCell<Option<WindowsPreExclusiveOpenHook>> = const { std::cell::RefCell::new(None) };
     static HOOK_WINDOWS_POST_EXCLUSIVE_OPEN: std::cell::RefCell<Option<WindowsPostExclusiveOpenHook>> = const { std::cell::RefCell::new(None) };
 }
@@ -125,6 +127,26 @@ pub fn is_fault_inject_windows_dest_identity_mismatch() -> bool {
     FAULT_INJECT_WINDOWS_DEST_IDENTITY_MISMATCH.with(|cell| cell.get())
 }
 
+#[cfg(windows)]
+pub fn set_fault_inject_windows_security_descriptor_failure(inject: bool) {
+    FAULT_INJECT_WINDOWS_SECURITY_DESCRIPTOR_FAILURE.with(|cell| cell.set(inject));
+}
+
+#[cfg(windows)]
+pub fn is_fault_inject_windows_security_descriptor_failure() -> bool {
+    FAULT_INJECT_WINDOWS_SECURITY_DESCRIPTOR_FAILURE.with(|cell| cell.get())
+}
+
+#[cfg(windows)]
+pub fn set_fault_inject_windows_different_owner(inject: bool) {
+    FAULT_INJECT_WINDOWS_DIFFERENT_OWNER.with(|cell| cell.set(inject));
+}
+
+#[cfg(windows)]
+pub fn is_fault_inject_windows_different_owner() -> bool {
+    FAULT_INJECT_WINDOWS_DIFFERENT_OWNER.with(|cell| cell.get())
+}
+
 #[cfg(not(windows))]
 pub fn set_hook_windows_pre_exclusive_open(_hook: Option<WindowsPreExclusiveOpenHook>) {}
 
@@ -170,6 +192,22 @@ pub fn set_fault_inject_windows_dest_identity_mismatch(_inject: bool) {}
 
 #[cfg(not(windows))]
 pub fn is_fault_inject_windows_dest_identity_mismatch() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn set_fault_inject_windows_security_descriptor_failure(_inject: bool) {}
+
+#[cfg(not(windows))]
+pub fn is_fault_inject_windows_security_descriptor_failure() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn set_fault_inject_windows_different_owner(_inject: bool) {}
+
+#[cfg(not(windows))]
+pub fn is_fault_inject_windows_different_owner() -> bool {
     false
 }
 
@@ -595,13 +633,18 @@ pub fn set_fault_inject_pin_failure(val: bool) {
 }
 
 /// Threat-Model & Security Boundary:
-/// - Cross-user local isolation is enforced by verifying parent directory ownership against the
-///   running process UID and restricting POSIX mode to 0700 (or on Windows, verifying parent owner
-///   SID matches the current process token).
-/// - Threat-Model Boundary Limitation: Neither Unix 0700 nor Windows user-token matching isolates
-///   against malicious concurrent processes or threads running under the IDENTICAL UID / user security token.
-///   Protection against same-user concurrent namespace substitution during snapshot creation is established
-///   by Isolated Staging Creation & Atomic Adoption (using a 128-bit unguessable nonce in a private parent).
+/// - Cross-user local isolation is enforced on Unix by verifying parent directory ownership against the
+///   running process UID and restricting POSIX mode to 0700.
+/// - On Windows, cross-user isolation is enforced by verifying parent directory ownership against the
+///   current process token (checking TokenUser, TokenOwner, and token membership for elevated/admin contexts)
+///   and inspecting explicit and inherited ACEs in the DACL to verify or establish restricted private permissions,
+///   rejecting any dangerous access (creation, modification, deletion, inheritance) granted to unauthorized principals
+///   (such as Everyone, BUILTIN\Users, Authenticated Users, or third-party accounts).
+/// - Threat-Model Boundary Limitation: Local filesystem permissions do not isolate against malicious concurrent
+///   processes or threads running under the IDENTICAL UID / user security token. Protection against same-user
+///   concurrent namespace substitution during snapshot creation is established by Isolated Staging Creation
+///   & Atomic Adoption (using an unguessable 128-bit random nonce in a private parent) and OS-level atomic
+///   no-replace publication (RENAME_NOREPLACE on Linux, renameatx_np(RENAME_EXCL) on macOS, MoveFileExW without replace on Windows).
 pub fn verify_and_secure_storage_parent(parent: &Path) -> Result<()> {
     if !parent.is_dir() {
         return Err(AetherError::PermissionDenied(format!(
@@ -655,139 +698,560 @@ pub fn verify_and_secure_storage_parent(parent: &Path) -> Result<()> {
 
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
-        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
-        let meta = std::fs::symlink_metadata(parent).map_err(AetherError::Io)?;
-        let attrs = meta.file_attributes();
-        if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        match verify_storage_parent_acl(parent) {
+            Ok(()) => Ok(()),
+            Err(AetherError::PermissionDenied(ref msg))
+                if msg.contains("unsafe permissions") || msg.contains("NULL DACL") =>
+            {
+                secure_storage_parent_private_acl(parent)?;
+                verify_storage_parent_acl(parent)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+pub fn verify_storage_parent_acl(parent: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
+
+    let meta = std::fs::symlink_metadata(parent).map_err(AetherError::Io)?;
+    let attrs = meta.file_attributes();
+    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return Err(AetherError::PermissionDenied(format!(
+            "Parent storage path '{:?}' is a reparse point or junction; refusing operation",
+            parent
+        )));
+    }
+    if (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 {
+        return Err(AetherError::PermissionDenied(format!(
+            "Parent storage path '{:?}' is not a directory (attrs 0x{:x})",
+            parent, attrs
+        )));
+    }
+
+    if FAULT_INJECT_WINDOWS_SECURITY_DESCRIPTOR_FAILURE.with(|c| c.get()) {
+        return Err(AetherError::PermissionDenied(format!(
+            "Injected fault: failed to inspect security descriptor on storage parent '{:?}'",
+            parent
+        )));
+    }
+
+    let wide_parent: Vec<u16> = parent.as_os_str().encode_wide().chain(Some(0)).collect();
+
+    unsafe {
+        const SE_FILE_OBJECT: u32 = 1;
+        const OWNER_SECURITY_INFORMATION: u32 = 0x00000001;
+        const DACL_SECURITY_INFORMATION: u32 = 0x00000004;
+        const TOKEN_QUERY: u32 = 0x0008;
+
+        extern "system" {
+            fn GetNamedSecurityInfoW(
+                pObjectName: *const u16,
+                ObjectType: u32,
+                SecurityInfo: u32,
+                ppsidOwner: *mut *mut std::ffi::c_void,
+                ppsidGroup: *mut *mut std::ffi::c_void,
+                ppDacl: *mut *mut std::ffi::c_void,
+                ppSacl: *mut *mut std::ffi::c_void,
+                ppSecurityDescriptor: *mut *mut std::ffi::c_void,
+            ) -> u32;
+            fn OpenProcessToken(
+                ProcessHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn GetTokenInformation(
+                TokenHandle: *mut std::ffi::c_void,
+                TokenInformationClass: u32,
+                TokenInformation: *mut std::ffi::c_void,
+                TokenInformationLength: u32,
+                ReturnLength: *mut u32,
+            ) -> i32;
+            fn CheckTokenMembership(
+                TokenHandle: *mut std::ffi::c_void,
+                SidToCheck: *mut std::ffi::c_void,
+                IsMember: *mut i32,
+            ) -> i32;
+            fn EqualSid(pSid1: *mut std::ffi::c_void, pSid2: *mut std::ffi::c_void) -> i32;
+            fn GetAclInformation(
+                pAcl: *mut std::ffi::c_void,
+                pAclInformation: *mut std::ffi::c_void,
+                nAclInformationLength: u32,
+                dwAclInformationClass: u32,
+            ) -> i32;
+            fn GetAce(
+                pAcl: *mut std::ffi::c_void,
+                dwAceIndex: u32,
+                pAce: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn ConvertSidToStringSidW(Sid: *mut std::ffi::c_void, StringSid: *mut *mut u16) -> i32;
+            fn LocalFree(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        }
+
+        let mut p_owner_sid: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut p_dacl: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut p_sec_desc: *mut std::ffi::c_void = std::ptr::null_mut();
+
+        let sec_res = GetNamedSecurityInfoW(
+            wide_parent.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut p_owner_sid,
+            std::ptr::null_mut(),
+            &mut p_dacl,
+            std::ptr::null_mut(),
+            &mut p_sec_desc,
+        );
+
+        if sec_res != 0 {
             return Err(AetherError::PermissionDenied(format!(
-                "Parent storage path '{:?}' is a reparse point or junction; refusing operation",
+                "Failed to query security descriptor on storage parent '{:?}': Win32 error {}",
+                parent, sec_res
+            )));
+        }
+
+        struct SecDescGuard(*mut std::ffi::c_void);
+        impl Drop for SecDescGuard {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        LocalFree(self.0);
+                    }
+                }
+            }
+        }
+        let _desc_guard = SecDescGuard(p_sec_desc);
+
+        let mut token: *mut std::ffi::c_void = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+        struct TokenGuard(*mut std::ffi::c_void);
+        impl Drop for TokenGuard {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        CloseHandle(self.0);
+                    }
+                }
+            }
+        }
+        let _tok_guard = TokenGuard(token);
+
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct SID_AND_ATTRIBUTES {
+            Sid: *mut std::ffi::c_void,
+            Attributes: u32,
+        }
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct TOKEN_USER {
+            User: SID_AND_ATTRIBUTES,
+        }
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct TOKEN_OWNER {
+            Owner: *mut std::ffi::c_void,
+        }
+
+        #[repr(align(8))]
+        struct AlignedBuffer([u8; 512]);
+        let mut user_buf = AlignedBuffer([0u8; 512]);
+        let mut ret_len = 0u32;
+        #[allow(non_upper_case_globals)]
+        const TokenUser: u32 = 1;
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            user_buf.0.as_mut_ptr() as *mut _,
+            user_buf.0.len() as u32,
+            &mut ret_len,
+        ) == 0
+        {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+        let token_user = &*(user_buf.0.as_ptr() as *const TOKEN_USER);
+
+        let mut owner_buf = AlignedBuffer([0u8; 512]);
+        #[allow(non_upper_case_globals)]
+        const TokenOwner: u32 = 4;
+        let mut tok_owner_sid: *mut std::ffi::c_void = std::ptr::null_mut();
+        if GetTokenInformation(
+            token,
+            TokenOwner,
+            owner_buf.0.as_mut_ptr() as *mut _,
+            owner_buf.0.len() as u32,
+            &mut ret_len,
+        ) != 0
+        {
+            let token_owner = &*(owner_buf.0.as_ptr() as *const TOKEN_OWNER);
+            tok_owner_sid = token_owner.Owner;
+        }
+
+        // Test seam for simulating different owner
+        if FAULT_INJECT_WINDOWS_DIFFERENT_OWNER.with(|c| c.get()) {
+            return Err(AetherError::PermissionDenied(format!(
+                "Parent storage directory '{:?}' is not owned by the current user token (simulated different user)",
                 parent
             )));
         }
-        if (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 {
+
+        // Verify owner SID matches TokenUser, TokenOwner, or CheckTokenMembership
+        let mut is_owner = EqualSid(token_user.User.Sid, p_owner_sid) != 0;
+        if !is_owner && !tok_owner_sid.is_null() {
+            is_owner = EqualSid(tok_owner_sid, p_owner_sid) != 0;
+        }
+        if !is_owner {
+            let mut is_member = 0i32;
+            if CheckTokenMembership(std::ptr::null_mut(), p_owner_sid, &mut is_member) != 0
+                && is_member != 0
+            {
+                is_owner = true;
+            }
+        }
+        if !is_owner {
             return Err(AetherError::PermissionDenied(format!(
-                "Parent storage path '{:?}' is not a directory (attrs 0x{:x})",
-                parent, attrs
+                "Parent storage directory '{:?}' is not owned by the current user token",
+                parent
             )));
         }
 
-        // Verify Windows parent ownership against current process user token
-        let wide_parent: Vec<u16> = parent.as_os_str().encode_wide().chain(Some(0)).collect();
+        // Inspect DACL
+        if p_dacl.is_null() {
+            return Err(AetherError::PermissionDenied(format!(
+                "Parent storage directory '{:?}' has a NULL DACL (unprotected); refusing operation",
+                parent
+            )));
+        }
 
-        unsafe {
-            const SE_FILE_OBJECT: u32 = 1;
-            const OWNER_SECURITY_INFORMATION: u32 = 0x00000001;
-            const DACL_SECURITY_INFORMATION: u32 = 0x00000004;
-            const TOKEN_QUERY: u32 = 0x0008;
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct ACL_SIZE_INFORMATION {
+            AceCount: u32,
+            AclBytesInUse: u32,
+            AclBytesFree: u32,
+        }
+        const ACL_SIZE_INFO_CLASS: u32 = 2;
+        let mut acl_size = ACL_SIZE_INFORMATION {
+            AceCount: 0,
+            AclBytesInUse: 0,
+            AclBytesFree: 0,
+        };
+        if GetAclInformation(
+            p_dacl,
+            &mut acl_size as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            ACL_SIZE_INFO_CLASS,
+        ) == 0
+        {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
 
-            extern "system" {
-                fn GetNamedSecurityInfoW(
-                    pObjectName: *const u16,
-                    ObjectType: u32,
-                    SecurityInfo: u32,
-                    ppsidOwner: *mut *mut std::ffi::c_void,
-                    ppsidGroup: *mut *mut std::ffi::c_void,
-                    ppDacl: *mut *mut std::ffi::c_void,
-                    ppSacl: *mut *mut std::ffi::c_void,
-                    ppSecurityDescriptor: *mut *mut std::ffi::c_void,
-                ) -> u32;
-                fn OpenProcessToken(
-                    ProcessHandle: *mut std::ffi::c_void,
-                    DesiredAccess: u32,
-                    TokenHandle: *mut *mut std::ffi::c_void,
-                ) -> i32;
-                fn GetTokenInformation(
-                    TokenHandle: *mut std::ffi::c_void,
-                    TokenInformationClass: u32,
-                    TokenInformation: *mut std::ffi::c_void,
-                    TokenInformationLength: u32,
-                    ReturnLength: *mut u32,
-                ) -> i32;
-                fn EqualSid(pSid1: *mut std::ffi::c_void, pSid2: *mut std::ffi::c_void) -> i32;
-                fn LocalFree(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
-                fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
-                fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct ACE_HEADER {
+            AceType: u8,
+            AceFlags: u8,
+            AceSize: u16,
+        }
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct ACCESS_ALLOWED_ACE {
+            Header: ACE_HEADER,
+            Mask: u32,
+            SidStart: u32,
+        }
+
+        const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+        const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 9;
+
+        const FILE_ADD_FILE: u32 = 0x0002;
+        const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
+        const FILE_WRITE_DATA: u32 = 0x0002;
+        const FILE_APPEND_DATA: u32 = 0x0004;
+        const FILE_WRITE_EA: u32 = 0x0010;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        const FILE_DELETE_CHILD: u32 = 0x0040;
+        const DELETE: u32 = 0x00010000;
+        const WRITE_DAC: u32 = 0x00040000;
+        const WRITE_OWNER: u32 = 0x00080000;
+        const GENERIC_WRITE: u32 = 0x40000000;
+        const GENERIC_ALL: u32 = 0x10000000;
+
+        const DANGEROUS_PERMISSIONS: u32 = FILE_ADD_FILE
+            | FILE_ADD_SUBDIRECTORY
+            | FILE_WRITE_DATA
+            | FILE_APPEND_DATA
+            | FILE_WRITE_EA
+            | FILE_WRITE_ATTRIBUTES
+            | FILE_DELETE_CHILD
+            | DELETE
+            | WRITE_DAC
+            | WRITE_OWNER
+            | GENERIC_WRITE
+            | GENERIC_ALL;
+
+        for i in 0..acl_size.AceCount {
+            let mut p_ace: *mut std::ffi::c_void = std::ptr::null_mut();
+            if GetAce(p_dacl, i, &mut p_ace) == 0 {
+                return Err(AetherError::Io(std::io::Error::last_os_error()));
             }
+            let ace_hdr = &*(p_ace as *const ACE_HEADER);
+            if ace_hdr.AceType == ACCESS_ALLOWED_ACE_TYPE
+                || ace_hdr.AceType == ACCESS_ALLOWED_CALLBACK_ACE_TYPE
+            {
+                let allowed_ace = &*(p_ace as *const ACCESS_ALLOWED_ACE);
+                let mask = allowed_ace.Mask;
+                if (mask & DANGEROUS_PERMISSIONS) != 0 {
+                    let ace_sid = &allowed_ace.SidStart as *const u32 as *mut std::ffi::c_void;
+                    let is_current_user = EqualSid(token_user.User.Sid, ace_sid) != 0;
+                    let is_token_owner =
+                        !tok_owner_sid.is_null() && EqualSid(tok_owner_sid, ace_sid) != 0;
+                    let is_dir_owner = EqualSid(p_owner_sid, ace_sid) != 0;
 
-            let mut p_owner_sid: *mut std::ffi::c_void = std::ptr::null_mut();
-            let mut p_dacl: *mut std::ffi::c_void = std::ptr::null_mut();
-            let mut p_sec_desc: *mut std::ffi::c_void = std::ptr::null_mut();
+                    if !is_current_user && !is_token_owner && !is_dir_owner {
+                        let mut p_str: *mut u16 = std::ptr::null_mut();
+                        if ConvertSidToStringSidW(ace_sid, &mut p_str) != 0 && !p_str.is_null() {
+                            let mut len = 0;
+                            while *p_str.add(len) != 0 {
+                                len += 1;
+                            }
+                            let s =
+                                String::from_utf16_lossy(std::slice::from_raw_parts(p_str, len));
+                            LocalFree(p_str as *mut _);
 
-            let sec_res = GetNamedSecurityInfoW(
-                wide_parent.as_ptr(),
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                &mut p_owner_sid,
-                std::ptr::null_mut(),
-                &mut p_dacl,
-                std::ptr::null_mut(),
-                &mut p_sec_desc,
-            );
+                            // S-1-5-18 = NT AUTHORITY\SYSTEM
+                            // S-1-5-32-544 = BUILTIN\Administrators
+                            if s == "S-1-5-18" || s == "S-1-5-32-544" {
+                                continue;
+                            }
 
-            if sec_res != 0 {
-                return Err(AetherError::PermissionDenied(format!(
-                    "Failed to query security descriptor on storage parent '{:?}': Win32 error {}",
-                    parent, sec_res
-                )));
-            }
-
-            let mut token: *mut std::ffi::c_void = std::ptr::null_mut();
-            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-                let err = std::io::Error::last_os_error();
-                LocalFree(p_sec_desc);
-                return Err(AetherError::Io(err));
-            }
-
-            #[repr(C)]
-            #[allow(non_snake_case)]
-            struct SID_AND_ATTRIBUTES {
-                Sid: *mut std::ffi::c_void,
-                Attributes: u32,
-            }
-            #[repr(C)]
-            #[allow(non_snake_case)]
-            struct TOKEN_USER {
-                User: SID_AND_ATTRIBUTES,
-            }
-
-            #[repr(align(8))]
-            struct AlignedBuffer([u8; 256]);
-            let mut token_buf = AlignedBuffer([0u8; 256]);
-            let mut ret_len = 0u32;
-            #[allow(non_upper_case_globals)]
-            const TokenUser: u32 = 1;
-            let tok_res = GetTokenInformation(
-                token,
-                TokenUser,
-                token_buf.0.as_mut_ptr() as *mut _,
-                token_buf.0.len() as u32,
-                &mut ret_len,
-            );
-            CloseHandle(token);
-
-            if tok_res == 0 {
-                let err = std::io::Error::last_os_error();
-                LocalFree(p_sec_desc);
-                return Err(AetherError::Io(err));
-            }
-
-            let token_user = &*(token_buf.0.as_ptr() as *const TOKEN_USER);
-            let is_owner = EqualSid(token_user.User.Sid, p_owner_sid) != 0;
-
-            LocalFree(p_sec_desc);
-
-            if !is_owner {
-                return Err(AetherError::PermissionDenied(format!(
-                    "Parent storage directory '{:?}' is not owned by the current user token",
-                    parent
-                )));
+                            return Err(AetherError::PermissionDenied(format!(
+                                "Parent storage directory '{:?}' has unsafe permissions: ACE {} grants dangerous permissions (0x{:08X}) to unauthorized principal {}; refusing operation",
+                                parent, i, mask, s
+                            )));
+                        } else {
+                            return Err(AetherError::PermissionDenied(format!(
+                                "Parent storage directory '{:?}' has unsafe permissions: ACE {} grants dangerous permissions (0x{:08X}) to unknown principal; refusing operation",
+                                parent, i, mask
+                            )));
+                        }
+                    }
+                }
             }
         }
     }
 
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn secure_storage_parent_private_acl(parent: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide_parent: Vec<u16> = parent.as_os_str().encode_wide().chain(Some(0)).collect();
+
+    unsafe {
+        const SE_FILE_OBJECT: u32 = 1;
+        const DACL_SECURITY_INFORMATION: u32 = 0x00000004;
+        const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x80000000;
+        const TOKEN_QUERY: u32 = 0x0008;
+        const ACL_REVISION: u32 = 2;
+        const CONTAINER_INHERIT_ACE: u32 = 0x02;
+        const OBJECT_INHERIT_ACE: u32 = 0x01;
+        const GENERIC_ALL: u32 = 0x10000000;
+        const WIN_LOCAL_SYSTEM_SID: u32 = 22;
+        const WIN_BUILTIN_ADMINISTRATORS_SID: u32 = 26;
+
+        extern "system" {
+            fn OpenProcessToken(
+                ProcessHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn GetTokenInformation(
+                TokenHandle: *mut std::ffi::c_void,
+                TokenInformationClass: u32,
+                TokenInformation: *mut std::ffi::c_void,
+                TokenInformationLength: u32,
+                ReturnLength: *mut u32,
+            ) -> i32;
+            fn CreateWellKnownSid(
+                WellKnownSidType: u32,
+                DomainSid: *mut std::ffi::c_void,
+                pSid: *mut std::ffi::c_void,
+                cbSid: *mut u32,
+            ) -> i32;
+            fn InitializeAcl(
+                pAcl: *mut std::ffi::c_void,
+                nAclLength: u32,
+                dwAclRevision: u32,
+            ) -> i32;
+            fn AddAccessAllowedAceEx(
+                pAcl: *mut std::ffi::c_void,
+                dwAceRevision: u32,
+                AceFlags: u32,
+                AccessMask: u32,
+                pSid: *mut std::ffi::c_void,
+            ) -> i32;
+            fn SetNamedSecurityInfoW(
+                pObjectName: *const u16,
+                ObjectType: u32,
+                SecurityInfo: u32,
+                ppsidOwner: *mut std::ffi::c_void,
+                ppsidGroup: *mut std::ffi::c_void,
+                ppDacl: *mut std::ffi::c_void,
+                ppSacl: *mut std::ffi::c_void,
+            ) -> u32;
+            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        }
+
+        let mut token: *mut std::ffi::c_void = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct SID_AND_ATTRIBUTES {
+            Sid: *mut std::ffi::c_void,
+            Attributes: u32,
+        }
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct TOKEN_USER {
+            User: SID_AND_ATTRIBUTES,
+        }
+
+        #[repr(align(8))]
+        struct AlignedBuffer([u8; 512]);
+        let mut user_buf = AlignedBuffer([0u8; 512]);
+        let mut ret_len = 0u32;
+        #[allow(non_upper_case_globals)]
+        const TokenUser: u32 = 1;
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            user_buf.0.as_mut_ptr() as *mut _,
+            user_buf.0.len() as u32,
+            &mut ret_len,
+        ) == 0
+        {
+            CloseHandle(token);
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+        CloseHandle(token);
+        let token_user = &*(user_buf.0.as_ptr() as *const TOKEN_USER);
+
+        let mut system_sid = vec![0u8; 68];
+        let mut cb_system = system_sid.len() as u32;
+        if CreateWellKnownSid(
+            WIN_LOCAL_SYSTEM_SID,
+            std::ptr::null_mut(),
+            system_sid.as_mut_ptr() as *mut _,
+            &mut cb_system,
+        ) == 0
+        {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+
+        let mut admin_sid = vec![0u8; 68];
+        let mut cb_admin = admin_sid.len() as u32;
+        if CreateWellKnownSid(
+            WIN_BUILTIN_ADMINISTRATORS_SID,
+            std::ptr::null_mut(),
+            admin_sid.as_mut_ptr() as *mut _,
+            &mut cb_admin,
+        ) == 0
+        {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+
+        let mut acl_buf = vec![0u8; 1024];
+        if InitializeAcl(
+            acl_buf.as_mut_ptr() as *mut _,
+            acl_buf.len() as u32,
+            ACL_REVISION,
+        ) == 0
+        {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+
+        let ace_flags = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
+        if AddAccessAllowedAceEx(
+            acl_buf.as_mut_ptr() as *mut _,
+            ACL_REVISION,
+            ace_flags,
+            GENERIC_ALL,
+            token_user.User.Sid,
+        ) == 0
+        {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+
+        if AddAccessAllowedAceEx(
+            acl_buf.as_mut_ptr() as *mut _,
+            ACL_REVISION,
+            ace_flags,
+            GENERIC_ALL,
+            system_sid.as_mut_ptr() as *mut _,
+        ) == 0
+        {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+
+        if AddAccessAllowedAceEx(
+            acl_buf.as_mut_ptr() as *mut _,
+            ACL_REVISION,
+            ace_flags,
+            GENERIC_ALL,
+            admin_sid.as_mut_ptr() as *mut _,
+        ) == 0
+        {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+
+        let set_res = SetNamedSecurityInfoW(
+            wide_parent.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            acl_buf.as_mut_ptr() as *mut _,
+            std::ptr::null_mut(),
+        );
+
+        if set_res != 0 {
+            return Err(AetherError::PermissionDenied(format!(
+                "Failed to set private ACL on storage parent '{:?}': Win32 error {}",
+                parent, set_res
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn verify_storage_parent_acl(_parent: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn secure_storage_parent_private_acl(_parent: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -3483,7 +3947,12 @@ impl WorkspaceCapability {
 
         // Step 2: Atomic rename anchored to directory capability
         if let Err(e) = self.dir.rename(&temp_rel, &self.dir, &rel) {
-            let _ = self.dir.remove_file(&temp_rel);
+            if let Err(rm_err) = self.dir.remove_file(&temp_rel) {
+                return Err(AetherError::Internal(format!(
+                    "Rename of temporary file failed ({}) and cleanup of temporary file '{:?}' failed: {}",
+                    e, temp_rel, rm_err
+                )));
+            }
             return Err(AetherError::Io(e));
         }
 
@@ -3504,7 +3973,12 @@ impl WorkspaceCapability {
     ) -> AetherError {
         // Clean up temporary incoming stage file if present
         if let Some(stage) = stage_rel {
-            let _ = self.dir.remove_file(stage);
+            if let Err(e) = self.dir.remove_file(stage) {
+                warn!(
+                    "perform_rollback: failed to remove staging file '{:?}': {}",
+                    stage, e
+                );
+            }
         }
 
         // Commit-boundary safety check:
@@ -3518,12 +3992,22 @@ impl WorkspaceCapability {
             } else {
                 PathBuf::from(&conflict_name)
             };
-            let _ = self.dir.rename(backup_rel, &self.dir, &conflict_rel);
-            let conflict_abs = self.root_path.join(&conflict_rel);
-            return AetherError::PermissionDenied(format!(
-                "Commit boundary conflict on '{}': {}. Destination was concurrently recreated; competing destination preserved; original data preserved at '{}'.",
-                user_path, cause_msg, conflict_abs.display()
-            ));
+            let backup_abs = self.root_path.join(backup_rel);
+            match self.dir.rename(backup_rel, &self.dir, &conflict_rel) {
+                Ok(()) => {
+                    let conflict_abs = self.root_path.join(&conflict_rel);
+                    return AetherError::PermissionDenied(format!(
+                        "Commit boundary conflict on '{}': {}. Destination was concurrently recreated; competing destination preserved; original data preserved at '{}'.",
+                        user_path, cause_msg, conflict_abs.display()
+                    ));
+                }
+                Err(e) => {
+                    return AetherError::Internal(format!(
+                        "Commit boundary conflict on '{}': {}. Destination was concurrently recreated; preservation rename to conflict path failed ({}); original data retained at '{}'.",
+                        user_path, cause_msg, e, backup_abs.display()
+                    ));
+                }
+            }
         }
 
         let rollback_res = if fault_inject_rollback_failure {
@@ -3704,7 +4188,12 @@ impl WorkspaceCapability {
 
         match link_res {
             Ok(()) => {
-                let _ = self.dir.remove_file(stage_rel);
+                if let Err(e) = self.dir.remove_file(stage_rel) {
+                    warn!(
+                        "atomic_publish_no_replace: failed to remove staging link '{:?}': {}",
+                        stage_rel, e
+                    );
+                }
                 return Ok(());
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -6835,5 +7324,225 @@ mod tests {
         assert!(surviving.exists(), "Surviving file must exist on disk!");
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[cfg(windows)]
+    unsafe fn set_permissive_dacl_for_everyone(path: &Path, inherit: bool) {
+        use std::os::windows::ffi::OsStrExt;
+        let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+
+        const SE_FILE_OBJECT: u32 = 1;
+        const DACL_SECURITY_INFORMATION: u32 = 0x00000004;
+        const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x80000000;
+        const ACL_REVISION: u32 = 2;
+        const WIN_WORLD_SID: u32 = 1;
+        const GENERIC_ALL: u32 = 0x10000000;
+        const CONTAINER_INHERIT_ACE: u32 = 0x02;
+        const OBJECT_INHERIT_ACE: u32 = 0x01;
+
+        extern "system" {
+            fn CreateWellKnownSid(
+                WellKnownSidType: u32,
+                DomainSid: *mut std::ffi::c_void,
+                pSid: *mut std::ffi::c_void,
+                cbSid: *mut u32,
+            ) -> i32;
+            fn InitializeAcl(
+                pAcl: *mut std::ffi::c_void,
+                nAclLength: u32,
+                dwAclRevision: u32,
+            ) -> i32;
+            fn AddAccessAllowedAceEx(
+                pAcl: *mut std::ffi::c_void,
+                dwAceRevision: u32,
+                AceFlags: u32,
+                AccessMask: u32,
+                pSid: *mut std::ffi::c_void,
+            ) -> i32;
+            fn SetNamedSecurityInfoW(
+                pObjectName: *const u16,
+                ObjectType: u32,
+                SecurityInfo: u32,
+                ppsidOwner: *mut std::ffi::c_void,
+                ppsidGroup: *mut std::ffi::c_void,
+                ppDacl: *mut std::ffi::c_void,
+                ppSacl: *mut std::ffi::c_void,
+            ) -> u32;
+        }
+
+        let mut everyone_sid = vec![0u8; 68];
+        let mut cb_everyone = everyone_sid.len() as u32;
+        CreateWellKnownSid(
+            WIN_WORLD_SID,
+            std::ptr::null_mut(),
+            everyone_sid.as_mut_ptr() as *mut _,
+            &mut cb_everyone,
+        );
+
+        let mut acl_buf = vec![0u8; 1024];
+        InitializeAcl(
+            acl_buf.as_mut_ptr() as *mut _,
+            acl_buf.len() as u32,
+            ACL_REVISION,
+        );
+
+        let flags = if inherit {
+            CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
+        } else {
+            0
+        };
+        AddAccessAllowedAceEx(
+            acl_buf.as_mut_ptr() as *mut _,
+            ACL_REVISION,
+            flags,
+            GENERIC_ALL,
+            everyone_sid.as_mut_ptr() as *mut _,
+        );
+
+        SetNamedSecurityInfoW(
+            wide_path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            acl_buf.as_mut_ptr() as *mut _,
+            std::ptr::null_mut(),
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_parent_safe_dacl() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_dacl_safe_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        secure_storage_parent_private_acl(&temp_dir).expect("secure private acl");
+        let res = verify_storage_parent_acl(&temp_dir);
+        assert!(
+            res.is_ok(),
+            "Parent with safe DACL must be accepted: {:?}",
+            res
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_parent_unsafe_permissive_dacl() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_dacl_unsafe_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        unsafe {
+            set_permissive_dacl_for_everyone(&temp_dir, false);
+        }
+
+        let res = verify_storage_parent_acl(&temp_dir);
+        assert!(
+            res.is_err(),
+            "Parent with unsafe permissive DACL must be rejected"
+        );
+        let err_msg = format!("{:?}", res);
+        assert!(
+            err_msg.contains("unsafe permissions"),
+            "Error must indicate unsafe permissions: {}",
+            err_msg
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_parent_different_user() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_dacl_diff_user_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        set_fault_inject_windows_different_owner(true);
+        let res = verify_storage_parent_acl(&temp_dir);
+        set_fault_inject_windows_different_owner(false);
+
+        assert!(
+            res.is_err(),
+            "Parent owned by a different user must be rejected"
+        );
+        let err_msg = format!("{:?}", res);
+        assert!(
+            err_msg.contains("not owned by the current user token"),
+            "Error must indicate ownership mismatch: {}",
+            err_msg
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_parent_inherited_permissive_aces() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_dacl_inherited_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let parent_dir = temp_dir.join("parent_with_inherited");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+
+        unsafe {
+            set_permissive_dacl_for_everyone(&parent_dir, true);
+        }
+
+        let child_storage = parent_dir.join("child_storage");
+        std::fs::create_dir_all(&child_storage).unwrap();
+
+        let res = verify_storage_parent_acl(&child_storage);
+        assert!(
+            res.is_err(),
+            "Parent with inherited permissive ACEs must be rejected"
+        );
+        let err_msg = format!("{:?}", res);
+        assert!(
+            err_msg.contains("unsafe permissions"),
+            "Error must indicate unsafe permissions from inherited ACEs: {}",
+            err_msg
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_parent_inspection_failure() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_dacl_inspect_fail_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        set_fault_inject_windows_security_descriptor_failure(true);
+        let res = verify_storage_parent_acl(&temp_dir);
+        set_fault_inject_windows_security_descriptor_failure(false);
+
+        assert!(
+            res.is_err(),
+            "Inspection failure on security descriptor must fail closed"
+        );
+        let err_msg = format!("{:?}", res);
+        assert!(
+            err_msg.contains("failed to inspect security descriptor"),
+            "Error must indicate inspection failure: {}",
+            err_msg
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

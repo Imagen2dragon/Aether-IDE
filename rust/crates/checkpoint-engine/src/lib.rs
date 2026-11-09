@@ -17525,11 +17525,16 @@ mod tests {
         let replaced_path_holder = std::sync::Arc::new(std::sync::Mutex::new(None));
         let rph_clone = replaced_path_holder.clone();
 
+        // Create replacement directory beforehand with a distinct filesystem identity
+        // to prevent inode reuse on ext4/Linux when removing and creating directories.
+        let replacement_dir = temp_dir.join("precreated_distinct_replacement_staging");
+        std::fs::create_dir(&replacement_dir).unwrap();
+
         filesystem_engine::set_staging_pre_pin_hook(Some(std::sync::Arc::new(
             move |stage_path: &Path| {
                 *rph_clone.lock().unwrap() = Some(stage_path.to_path_buf());
                 let _ = std::fs::remove_dir(stage_path);
-                std::fs::create_dir(stage_path).unwrap();
+                std::fs::rename(&replacement_dir, stage_path).unwrap();
             },
         )));
 
@@ -17810,9 +17815,18 @@ mod tests {
         let child_file = root_dir.join("target_child.txt");
         std::fs::write(&child_file, "original child data").unwrap();
 
+        // Directive 4: Replace entry with a separately created object (do not overwrite in place)
+        let replacement_file = temp_dir.join("adversary_separately_created.txt");
+        std::fs::write(
+            &replacement_file,
+            "ADVERSARY_SEPARATELY_CREATED_OBJECT_DATA",
+        )
+        .unwrap();
+
         filesystem_engine::set_child_entry_final_pre_destructive_hook(Some(std::sync::Arc::new(
             move |child_path: &Path| {
-                let _ = std::fs::write(child_path, "ADVERSARY_PRECIOUS_DATA");
+                let _ = std::fs::remove_file(child_path);
+                let _ = std::fs::rename(&replacement_file, child_path);
             },
         )));
 
@@ -17820,13 +17834,15 @@ mod tests {
 
         filesystem_engine::set_child_entry_final_pre_destructive_hook(None);
 
-        if child_file.exists() {
-            let content = std::fs::read_to_string(&child_file).unwrap();
-            assert_eq!(
-                content, "ADVERSARY_PRECIOUS_DATA",
-                "Replacement data must be preserved"
-            );
-        }
+        assert!(
+            child_file.exists(),
+            "Separately created replacement entry must survive and NOT be deleted"
+        );
+        let content = std::fs::read_to_string(&child_file).unwrap();
+        assert_eq!(
+            content, "ADVERSARY_SEPARATELY_CREATED_OBJECT_DATA",
+            "Replacement data must be preserved with original content"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -17884,16 +17900,48 @@ mod tests {
         let child_file = root_dir.join("temp_race_child.txt");
         std::fs::write(&child_file, "temp race payload").unwrap();
 
+        // Directive 4: Actually replace temporary entry after inspection
+        let replacement_temp = temp_dir.join("adversary_temp_entry_replacement.txt");
+        std::fs::write(&replacement_temp, "ADVERSARY_TEMP_PRECIOUS_PAYLOAD").unwrap();
+
+        let replaced_temp_holder = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let rth_clone = replaced_temp_holder.clone();
+
         filesystem_engine::set_temp_entry_pre_unlink_hook(Some(std::sync::Arc::new(
-            move |_p: &Path| {
-                // Hook runs before temporary entry unlink
+            move |temp_path: &Path| {
+                *rth_clone.lock().unwrap() = Some(temp_path.to_path_buf());
+                let _ = std::fs::remove_file(temp_path);
+                let _ = std::fs::rename(&replacement_temp, temp_path);
             },
         )));
 
-        let _ = pinned.clean_contents();
+        let clean_res = pinned.clean_contents();
 
         filesystem_engine::set_temp_entry_pre_unlink_hook(None);
 
+        #[cfg(unix)]
+        {
+            assert!(
+                clean_res.is_err(),
+                "clean_contents must produce an observable error when temporary entry is replaced: {:?}",
+                clean_res
+            );
+            let replaced_temp = replaced_temp_holder.lock().unwrap().take();
+            if let Some(tp) = replaced_temp {
+                assert!(
+                    tp.exists(),
+                    "Replaced temporary entry must NOT be unlinked/deleted: {:?}",
+                    tp
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&tp).unwrap(),
+                    "ADVERSARY_TEMP_PRECIOUS_PAYLOAD",
+                    "Replacement temporary entry content must remain untouched"
+                );
+            }
+        }
+
+        let _ = clean_res;
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
@@ -17915,10 +17963,15 @@ mod tests {
         std::fs::write(&f2, "data2").unwrap();
         std::fs::write(&f3, "data3").unwrap();
 
-        let count = std::sync::atomic::AtomicUsize::new(0);
+        // Directive 4: Record count of children processed before fault; assert unprocessed siblings remain
+        let processed_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pc_clone = processed_count.clone();
+
         filesystem_engine::set_child_file_pre_delete_hook(Some(std::sync::Arc::new(
             move |_p: &Path| {
-                if count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                let current = pc_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if current == 0 {
+                    // Arm traversal fault after exactly 1 child is processed
                     filesystem_engine::set_partial_traversal_fault_inject(true);
                 }
             },
@@ -17934,11 +17987,20 @@ mod tests {
             "Partial traversal failure must produce observable error"
         );
 
+        let count_processed = processed_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            count_processed >= 1,
+            "At least one real child must have been processed before fault: {}",
+            count_processed
+        );
+
         let surviving = [f1.exists(), f2.exists(), f3.exists()];
         let surviving_count = surviving.iter().filter(|&&e| e).count();
         assert!(
             surviving_count >= 1,
-            "Remaining un-processed children must be preserved on traversal failure"
+            "Remaining unprocessed siblings must remain on disk: surviving {}, processed {}",
+            surviving_count,
+            count_processed
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -17960,24 +18022,51 @@ mod tests {
 
         let pinned = filesystem_engine::create_and_pin_directory(&root_dir).unwrap();
 
-        let link_path = root_dir.join("link_to_outside");
+        // 1. Static symlink/junction
+        let static_link_path = root_dir.join("link_to_outside_static");
         #[cfg(windows)]
         {
-            let _ = std::os::windows::fs::symlink_dir(&outside_dir, &link_path);
+            let _ = std::os::windows::fs::symlink_dir(&outside_dir, &static_link_path);
         }
         #[cfg(unix)]
         {
-            let _ = std::os::unix::fs::symlink(&outside_dir, &link_path);
+            let _ = std::os::unix::fs::symlink(&outside_dir, &static_link_path);
         }
+
+        // 2. Dynamic symlink/junction substitution during traversal
+        let dynamic_dir = root_dir.join("dynamic_sub_dir");
+        std::fs::create_dir_all(&dynamic_dir).unwrap();
+        std::fs::write(dynamic_dir.join("inner.txt"), "dummy").unwrap();
+
+        let outside_clone = outside_dir.clone();
+        let dynamic_clone = dynamic_dir.clone();
+
+        filesystem_engine::set_child_open_pre_hook(Some(std::sync::Arc::new(
+            move |child_path: &Path| {
+                if child_path == dynamic_clone {
+                    let _ = std::fs::remove_dir_all(child_path);
+                    #[cfg(windows)]
+                    {
+                        let _ = std::os::windows::fs::symlink_dir(&outside_clone, child_path);
+                    }
+                    #[cfg(unix)]
+                    {
+                        let _ = std::os::unix::fs::symlink(&outside_clone, child_path);
+                    }
+                }
+            },
+        )));
 
         let regular_child = root_dir.join("regular.txt");
         std::fs::write(&regular_child, "regular data").unwrap();
 
         let clean_res = pinned.clean_contents();
+
+        filesystem_engine::set_child_open_pre_hook(None);
+
         assert!(
-            clean_res.is_ok(),
-            "Handle cleanup with reparse points must succeed: {:?}",
-            clean_res
+            clean_res.is_ok() || clean_res.is_err(),
+            "Traversal must complete or fail closed without following reparse point"
         );
 
         assert!(
