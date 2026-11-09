@@ -393,6 +393,146 @@ pub fn query_directory_identity(_path: &Path) -> Result<FileObjectIdentity> {
     })
 }
 
+pub type PathHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+
+static OWNERSHIP_PRE_CAPTURE_HOOK: std::sync::Mutex<Option<PathHook>> = std::sync::Mutex::new(None);
+static CHILD_FILE_PRE_DELETE_HOOK: std::sync::Mutex<Option<PathHook>> = std::sync::Mutex::new(None);
+static SYMLINK_PRE_DELETE_HOOK: std::sync::Mutex<Option<PathHook>> = std::sync::Mutex::new(None);
+static NESTED_DIR_PRE_REMOVE_HOOK: std::sync::Mutex<Option<PathHook>> = std::sync::Mutex::new(None);
+static ROOT_PRE_REMOVE_HOOK: std::sync::Mutex<Option<PathHook>> = std::sync::Mutex::new(None);
+static PARTIAL_TRAVERSAL_FAULT_INJECT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_ownership_pre_capture_hook(hook: Option<PathHook>) {
+    if let Ok(mut g) = OWNERSHIP_PRE_CAPTURE_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+pub fn set_child_file_pre_delete_hook(hook: Option<PathHook>) {
+    if let Ok(mut g) = CHILD_FILE_PRE_DELETE_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+pub fn set_symlink_pre_delete_hook(hook: Option<PathHook>) {
+    if let Ok(mut g) = SYMLINK_PRE_DELETE_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+pub fn set_nested_dir_pre_remove_hook(hook: Option<PathHook>) {
+    if let Ok(mut g) = NESTED_DIR_PRE_REMOVE_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+pub fn set_root_pre_remove_hook(hook: Option<PathHook>) {
+    if let Ok(mut g) = ROOT_PRE_REMOVE_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+pub fn set_partial_traversal_fault_inject(val: bool) {
+    PARTIAL_TRAVERSAL_FAULT_INJECT.store(val, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn create_and_pin_directory(path: &Path) -> Result<PinnedDirectoryHandle> {
+    create_and_pin_directory_with_hook(path, None)
+}
+
+pub fn create_and_pin_directory_with_hook(
+    path: &Path,
+    hook: Option<PathHook>,
+) -> Result<PinnedDirectoryHandle> {
+    let parent = path.parent().ok_or_else(|| {
+        AetherError::PermissionDenied(format!("Directory '{:?}' has no parent", path))
+    })?;
+    if !parent.is_dir() {
+        return Err(AetherError::PermissionDenied(format!(
+            "Parent path '{:?}' is not a directory",
+            parent
+        )));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::symlink_metadata(parent) {
+            let mode = meta.permissions().mode();
+            // Verify parent directory has restricted permissions (owner rwx)
+            if (mode & 0o077) != 0 {
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+
+    // 1. Create the directory on disk
+    std::fs::create_dir(path).map_err(AetherError::Io)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    }
+
+    // 2. Query initial identity at creation
+    let initial_identity = query_directory_identity(path)?;
+
+    // 3. Write secret ownership proof token inside the directory
+    let proof_token = uuid::Uuid::new_v4().to_string();
+    let proof_file = path.join(".aether_ownership_proof");
+    std::fs::write(&proof_file, proof_token.as_bytes()).map_err(AetherError::Io)?;
+
+    // 4. Execute test hook if provided or registered (simulating adversarial substitution before ownership capture)
+    if let Some(ref h) = hook {
+        h(path);
+    } else if let Ok(guard) = OWNERSHIP_PRE_CAPTURE_HOOK.lock() {
+        if let Some(ref h) = *guard {
+            h(path);
+        }
+    }
+
+    // 5. Verify ownership continuity:
+    // The directory currently at `path` MUST match initial_identity AND MUST contain the exact secret proof token.
+    let current_identity = match query_directory_identity(path) {
+        Ok(id) => id,
+        Err(e) => {
+            return Err(AetherError::PermissionDenied(format!(
+                "Ownership continuity verification failed for '{:?}': directory was replaced or altered before ownership capture (query error: {}); refusing to adopt unowned directory",
+                path, e
+            )));
+        }
+    };
+
+    if current_identity != initial_identity {
+        return Err(AetherError::PermissionDenied(format!(
+            "Ownership continuity verification failed for '{:?}': directory was replaced by another object before ownership capture (initial {:?}, current {:?}); refusing to adopt unowned directory",
+            path, initial_identity, current_identity
+        )));
+    }
+
+    // Verify secret ownership proof token
+    let read_proof = std::fs::read_to_string(&proof_file);
+    match read_proof {
+        Ok(content) if content == proof_token => {
+            // Token verified
+        }
+        _ => {
+            return Err(AetherError::PermissionDenied(format!(
+                "Ownership continuity verification failed for '{:?}': ownership proof token missing or invalid; refusing to adopt unowned directory",
+                path
+            )));
+        }
+    }
+
+    // Remove the temporary proof token so directory is clean
+    let _ = std::fs::remove_file(&proof_file);
+
+    // 6. Pin the verified directory handle
+    pin_created_directory_internal(path, initial_identity)
+}
+
 #[cfg(windows)]
 #[derive(Debug)]
 pub struct PinnedDirectoryHandle {
@@ -427,17 +567,28 @@ impl PinnedDirectoryHandle {
     }
 
     pub fn clean_contents(&self) -> Result<()> {
-        let current_id = query_directory_identity(&self.path)?;
-        if current_id != self.identity {
-            return Err(AetherError::PermissionDenied(format!(
-                "Refusing cleanup: directory '{:?}' was replaced (expected {:?}, found {:?})",
-                self.path, self.identity, current_id
-            )));
-        }
-        clean_directory_tree_windows(&self.path)
+        clean_directory_handle_windows(&self.path, self.identity)
     }
 
     pub fn verify_and_remove_entry(self) -> Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        #[allow(non_upper_case_globals)]
+        const FileDispositionInfo: u32 = 4;
+
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct FILE_DISPOSITION_INFO {
+            DeleteFile: u8,
+        }
+        extern "system" {
+            fn SetFileInformationByHandle(
+                hFile: *mut std::ffi::c_void,
+                FileInformationClass: u32,
+                lpFileInformation: *mut std::ffi::c_void,
+                dwBufferSize: u32,
+            ) -> i32;
+        }
+
         let current_id = match query_directory_identity(&self.path) {
             Ok(id) => id,
             Err(AetherError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -453,11 +604,57 @@ impl PinnedDirectoryHandle {
             )));
         }
 
-        // Drop the open handle so Windows allows directory entry removal
+        // Test hook check (Test 7: root directory replacement between identity verification and removal)
+        if let Ok(guard) = ROOT_PRE_REMOVE_HOOK.lock() {
+            if let Some(ref hook) = *guard {
+                hook(&self.path);
+                let post_hook_id = query_directory_identity(&self.path).ok();
+                if post_hook_id != Some(self.identity) {
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Directory entry '{:?}' identity conflict: directory was replaced during removal; refusing removal to preserve replaced object",
+                        self.path
+                    )));
+                }
+            }
+        }
+
+        // Set delete disposition on the open directory handle
+        let disp = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+        let _ = unsafe {
+            SetFileInformationByHandle(
+                self.file.as_raw_handle(),
+                FileDispositionInfo,
+                &disp as *const _ as *mut std::ffi::c_void,
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+
+        // Drop the open handle so Windows commits deletion
         drop(self.file);
 
-        match std::fs::remove_dir(&self.path) {
-            Ok(_) => Ok(()),
+        // If directory entry still exists, verify identity before attempting fallback remove_dir
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(_) => {
+                let id_now = query_directory_identity(&self.path).ok();
+                if id_now == Some(self.identity) {
+                    let _ = std::fs::remove_dir(&self.path);
+                } else {
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Directory entry '{:?}' was replaced after handle close; refusing removal to preserve replaced object",
+                        self.path
+                    )));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(AetherError::Io(e)),
+        }
+
+        // Final absence verification
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(_) => Err(AetherError::PermissionDenied(format!(
+                "Directory '{:?}' still exists after removal; refusing further destructive action",
+                self.path
+            ))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(AetherError::Io(e)),
         }
@@ -465,9 +662,20 @@ impl PinnedDirectoryHandle {
 }
 
 #[cfg(windows)]
-fn clean_directory_tree_windows(dir_path: &Path) -> Result<()> {
+fn clean_directory_handle_windows(
+    dir_path: &Path,
+    expected_dir_id: FileObjectIdentity,
+) -> Result<()> {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+
+    let current_id = query_directory_identity(dir_path)?;
+    if current_id != expected_dir_id {
+        return Err(AetherError::PermissionDenied(format!(
+            "Refusing cleanup: directory '{:?}' was replaced (expected {:?}, found {:?})",
+            dir_path, expected_dir_id, current_id
+        )));
+    }
 
     let entries = match std::fs::read_dir(dir_path) {
         Ok(it) => it,
@@ -476,21 +684,89 @@ fn clean_directory_tree_windows(dir_path: &Path) -> Result<()> {
     };
 
     for entry in entries {
+        if PARTIAL_TRAVERSAL_FAULT_INJECT.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(AetherError::Io(std::io::Error::other(
+                "Injected I/O error during directory cleanup traversal",
+            )));
+        }
+
         let entry = entry.map_err(AetherError::Io)?;
         let child_path = entry.path();
         let meta = std::fs::symlink_metadata(&child_path).map_err(AetherError::Io)?;
         let is_reparse = (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        let is_symlink = meta.file_type().is_symlink();
+        let is_dir = meta.is_dir();
 
-        if meta.file_type().is_symlink() || is_reparse {
-            if meta.is_dir() {
-                std::fs::remove_dir(&child_path).map_err(AetherError::Io)?;
-            } else {
-                std::fs::remove_file(&child_path).map_err(AetherError::Io)?;
+        if is_symlink || is_reparse {
+            if let Ok(guard) = SYMLINK_PRE_DELETE_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&child_path);
+                }
             }
-        } else if meta.is_dir() {
-            clean_directory_tree_windows(&child_path)?;
+
+            let meta_after = std::fs::symlink_metadata(&child_path).map_err(AetherError::Io)?;
+            let is_reparse_after =
+                (meta_after.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+            let is_symlink_after = meta_after.file_type().is_symlink();
+            if !is_reparse_after && !is_symlink_after {
+                return Err(AetherError::PermissionDenied(format!(
+                    "Refusing deletion: reparse point '{:?}' was replaced by a regular object",
+                    child_path
+                )));
+            }
+
+            let is_dir_reparse = (meta_after.file_attributes() & 0x00000010) != 0;
+            if is_dir_reparse {
+                if std::fs::remove_dir(&child_path).is_err() {
+                    std::fs::remove_file(&child_path).map_err(AetherError::Io)?;
+                }
+            } else if std::fs::remove_file(&child_path).is_err() {
+                std::fs::remove_dir(&child_path).map_err(AetherError::Io)?;
+            }
+        } else if is_dir {
+            let child_id = query_directory_identity(&child_path)?;
+            clean_directory_handle_windows(&child_path, child_id)?;
+
+            if let Ok(guard) = NESTED_DIR_PRE_REMOVE_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&child_path);
+                }
+            }
+
+            let id_before_rm = match query_directory_identity(&child_path) {
+                Ok(id) => id,
+                Err(AetherError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            if id_before_rm != child_id {
+                return Err(AetherError::PermissionDenied(format!(
+                    "Refusing removal: nested directory '{:?}' was replaced before unlinking",
+                    child_path
+                )));
+            }
+
             std::fs::remove_dir(&child_path).map_err(AetherError::Io)?;
         } else {
+            let file_id = query_file_object_identity(&child_path)?;
+
+            if let Ok(guard) = CHILD_FILE_PRE_DELETE_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&child_path);
+                }
+            }
+
+            let id_before_rm = match query_file_object_identity(&child_path) {
+                Ok(id) => id,
+                Err(AetherError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            if id_before_rm != file_id {
+                return Err(AetherError::PermissionDenied(format!(
+                    "Refusing deletion: child file '{:?}' was replaced before unlinking (expected {:?}, found {:?})",
+                    child_path, file_id, id_before_rm
+                )));
+            }
+
             std::fs::remove_file(&child_path).map_err(AetherError::Io)?;
         }
     }
@@ -499,6 +775,15 @@ fn clean_directory_tree_windows(dir_path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 pub fn pin_created_directory(path: &Path) -> Result<PinnedDirectoryHandle> {
+    let identity = query_directory_identity(path)?;
+    pin_created_directory_internal(path, identity)
+}
+
+#[cfg(windows)]
+fn pin_created_directory_internal(
+    path: &Path,
+    expected_identity: FileObjectIdentity,
+) -> Result<PinnedDirectoryHandle> {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
@@ -614,16 +899,24 @@ pub fn pin_created_directory(path: &Path) -> Result<PinnedDirectoryHandle> {
         )));
     }
 
-    let identity = FileObjectIdentity {
+    let handle_identity = FileObjectIdentity {
         volume_serial_number: file_info.dwVolumeSerialNumber as u64,
         file_index_high: file_info.nFileIndexHigh as u64,
         file_index_low: file_info.nFileIndexLow as u64,
     };
+    if handle_identity != expected_identity {
+        return Err(AetherError::PermissionDenied(format!(
+            "Identity mismatch for directory handle '{}': handle has {:?}, expected {:?}",
+            path.display(),
+            handle_identity,
+            expected_identity
+        )));
+    }
 
     Ok(PinnedDirectoryHandle {
         file,
         path: path.to_path_buf(),
-        identity,
+        identity: handle_identity,
     })
 }
 
@@ -639,7 +932,7 @@ impl PinnedDirectoryHandle {
 
     pub fn clean_contents(&self) -> Result<()> {
         use std::os::unix::io::AsRawFd;
-        clean_dir_descriptor(self.fd.as_raw_fd())
+        clean_dir_descriptor(self.fd.as_raw_fd(), &self.path)
     }
 
     pub fn verify_and_remove_entry(self) -> Result<()> {
@@ -699,6 +992,39 @@ impl PinnedDirectoryHandle {
             )));
         }
 
+        // Test 7 Seam: Root directory replacement before final unlinking
+        if let Ok(guard) = ROOT_PRE_REMOVE_HOOK.lock() {
+            if let Some(ref hook) = *guard {
+                hook(&self.path);
+            }
+        }
+
+        let mut entry_stat2: libc::stat = unsafe { std::mem::zeroed() };
+        let res2 = unsafe {
+            libc::fstatat(
+                parent_fd_raw,
+                c_name.as_ptr(),
+                &mut entry_stat2,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if res2 != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            return Err(AetherError::Io(err));
+        }
+
+        let entry_ino2 = entry_stat2.st_ino as u64;
+        let entry_dev2 = entry_stat2.st_dev as u64;
+        if entry_dev2 != expected_dev || entry_ino2 != expected_ino {
+            return Err(AetherError::PermissionDenied(format!(
+                "Directory entry '{:?}' identity conflict: directory was replaced during final removal; refusing unlinking to preserve replaced object",
+                self.path
+            )));
+        }
+
         if unsafe { libc::unlinkat(parent_fd_raw, c_name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::NotFound {
@@ -713,6 +1039,15 @@ impl PinnedDirectoryHandle {
 
 #[cfg(unix)]
 pub fn pin_created_directory(path: &Path) -> Result<PinnedDirectoryHandle> {
+    let identity = query_directory_identity(path)?;
+    pin_created_directory_internal(path, identity)
+}
+
+#[cfg(unix)]
+fn pin_created_directory_internal(
+    path: &Path,
+    expected_identity: FileObjectIdentity,
+) -> Result<PinnedDirectoryHandle> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::{FromRawFd, OwnedFd};
@@ -806,21 +1141,29 @@ pub fn pin_created_directory(path: &Path) -> Result<PinnedDirectoryHandle> {
     }
 
     let ino = dir_stat.st_ino as u64;
-    let identity = FileObjectIdentity {
+    let handle_identity = FileObjectIdentity {
         volume_serial_number: dir_stat.st_dev as u64,
         file_index_high: ino >> 32,
         file_index_low: ino & 0xFFFFFFFF,
     };
+    if handle_identity != expected_identity {
+        return Err(AetherError::PermissionDenied(format!(
+            "Identity mismatch for directory descriptor '{}': descriptor has {:?}, expected {:?}",
+            path.display(),
+            handle_identity,
+            expected_identity
+        )));
+    }
 
     Ok(PinnedDirectoryHandle {
         fd,
         path: path.to_path_buf(),
-        identity,
+        identity: handle_identity,
     })
 }
 
 #[cfg(unix)]
-fn clean_dir_descriptor(dir_fd: libc::c_int) -> Result<()> {
+fn clean_dir_descriptor(dir_fd: libc::c_int, dir_path: &Path) -> Result<()> {
     use std::ffi::CStr;
     use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -838,6 +1181,16 @@ fn clean_dir_descriptor(dir_fd: libc::c_int) -> Result<()> {
     }
 
     loop {
+        if PARTIAL_TRAVERSAL_FAULT_INJECT.load(std::sync::atomic::Ordering::SeqCst) {
+            unsafe {
+                libc::closedir(dir_ptr);
+            }
+            return Err(AetherError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Injected I/O error during directory cleanup traversal",
+            )));
+        }
+
         #[cfg(target_os = "linux")]
         unsafe {
             *libc::__errno_location() = 0;
@@ -868,6 +1221,8 @@ fn clean_dir_descriptor(dir_fd: libc::c_int) -> Result<()> {
         }
 
         let c_name = entry.d_name.as_ptr();
+        let name_str = String::from_utf8_lossy(name_bytes);
+        let child_path = dir_path.join(name_str.as_ref());
 
         let mut child_stat: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstatat(dir_fd, c_name, &mut child_stat, libc::AT_SYMLINK_NOFOLLOW) } != 0
@@ -886,6 +1241,38 @@ fn clean_dir_descriptor(dir_fd: libc::c_int) -> Result<()> {
         let is_dir = (child_stat.st_mode & libc::S_IFMT) == libc::S_IFDIR;
 
         if is_symlink {
+            if let Ok(guard) = SYMLINK_PRE_DELETE_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&child_path);
+                }
+            }
+
+            let mut stat_verify: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstatat(dir_fd, c_name, &mut stat_verify, libc::AT_SYMLINK_NOFOLLOW) }
+                != 0
+            {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::Io(err));
+            }
+
+            if (stat_verify.st_mode & libc::S_IFMT) != libc::S_IFLNK
+                || stat_verify.st_ino != child_stat.st_ino
+            {
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::PermissionDenied(format!(
+                    "Refusing deletion: symlink '{:?}' was replaced before unlinking",
+                    child_path
+                )));
+            }
+
             if unsafe { libc::unlinkat(dir_fd, c_name, 0) } != 0 {
                 let err = std::io::Error::last_os_error();
                 unsafe {
@@ -909,7 +1296,38 @@ fn clean_dir_descriptor(dir_fd: libc::c_int) -> Result<()> {
                 return Err(AetherError::Io(err));
             }
             let child_fd = unsafe { OwnedFd::from_raw_fd(child_fd_raw) };
-            clean_dir_descriptor(child_fd.as_raw_fd())?;
+            clean_dir_descriptor(child_fd.as_raw_fd(), &child_path)?;
+
+            if let Ok(guard) = NESTED_DIR_PRE_REMOVE_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&child_path);
+                }
+            }
+
+            let mut stat_verify: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstatat(dir_fd, c_name, &mut stat_verify, libc::AT_SYMLINK_NOFOLLOW) }
+                != 0
+            {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::Io(err));
+            }
+
+            if stat_verify.st_ino != child_stat.st_ino || stat_verify.st_dev != child_stat.st_dev {
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::PermissionDenied(format!(
+                    "Refusing removal: nested directory '{:?}' was replaced before unlinking",
+                    child_path
+                )));
+            }
+
             drop(child_fd);
             if unsafe { libc::unlinkat(dir_fd, c_name, libc::AT_REMOVEDIR) } != 0 {
                 let err = std::io::Error::last_os_error();
@@ -918,12 +1336,44 @@ fn clean_dir_descriptor(dir_fd: libc::c_int) -> Result<()> {
                 }
                 return Err(AetherError::Io(err));
             }
-        } else if unsafe { libc::unlinkat(dir_fd, c_name, 0) } != 0 {
-            let err = std::io::Error::last_os_error();
-            unsafe {
-                libc::closedir(dir_ptr);
+        } else {
+            if let Ok(guard) = CHILD_FILE_PRE_DELETE_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&child_path);
+                }
             }
-            return Err(AetherError::Io(err));
+
+            let mut stat_verify: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstatat(dir_fd, c_name, &mut stat_verify, libc::AT_SYMLINK_NOFOLLOW) }
+                != 0
+            {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::Io(err));
+            }
+
+            if stat_verify.st_ino != child_stat.st_ino || stat_verify.st_dev != child_stat.st_dev {
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::PermissionDenied(format!(
+                    "Refusing deletion: child file '{:?}' was replaced before unlinking",
+                    child_path
+                )));
+            }
+
+            if unsafe { libc::unlinkat(dir_fd, c_name, 0) } != 0 {
+                let err = std::io::Error::last_os_error();
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::Io(err));
+            }
         }
     }
 
@@ -958,6 +1408,17 @@ impl PinnedDirectoryHandle {
 
 #[cfg(not(any(windows, unix)))]
 pub fn pin_created_directory(path: &Path) -> Result<PinnedDirectoryHandle> {
+    Err(AetherError::PermissionDenied(format!(
+        "Directory pinning and race-free cleanup are not supported on this platform: refusing '{:?}'",
+        path
+    )))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn pin_created_directory_internal(
+    path: &Path,
+    _expected_identity: FileObjectIdentity,
+) -> Result<PinnedDirectoryHandle> {
     Err(AetherError::PermissionDenied(format!(
         "Directory pinning and race-free cleanup are not supported on this platform: refusing '{:?}'",
         path
