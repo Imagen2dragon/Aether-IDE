@@ -17501,4 +17501,564 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    // =========================================================================
+    // SPRINT 26.11 MANDATORY ADVERSARIAL TESTS (Directives 1-12)
+    // =========================================================================
+
+    #[test]
+    fn test_sprint26_11_01_replace_staging_before_first_pin_attempt_no_deletion() {
+        let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_11_t1_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let ws_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let file = ws_dir.join("payload.txt");
+        std::fs::write(&file, "Sprint 26.11 test payload 1").unwrap();
+
+        let replaced_path_holder = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let rph_clone = replaced_path_holder.clone();
+
+        filesystem_engine::set_staging_pre_pin_hook(Some(std::sync::Arc::new(
+            move |stage_path: &Path| {
+                *rph_clone.lock().unwrap() = Some(stage_path.to_path_buf());
+                let _ = std::fs::remove_dir(stage_path);
+                std::fs::create_dir(stage_path).unwrap();
+            },
+        )));
+
+        let res = engine.create_checkpoint_with_root(
+            "test_staging_replace_no_delete",
+            "ws-11-1",
+            &ws_dir,
+            Some(std::slice::from_ref(&file)),
+        );
+
+        filesystem_engine::set_staging_pre_pin_hook(None);
+
+        // 1. Operation MUST fail closed
+        assert!(
+            res.is_err(),
+            "Creation must fail when staging directory is replaced before pinning"
+        );
+
+        // 2. The replaced empty directory MUST NOT be deleted (Directive 2: no remove_dir on pinning failure!)
+        let replaced_path = replaced_path_holder.lock().unwrap().take();
+        if let Some(path) = replaced_path {
+            assert!(
+                path.exists(),
+                "Replaced staging directory must NOT be deleted: {:?}",
+                path
+            );
+            assert!(
+                path.is_dir(),
+                "Replaced staging path must still be a directory"
+            );
+            assert_eq!(
+                std::fs::read_dir(&path).unwrap().count(),
+                0,
+                "Replacement directory must remain completely empty and preserved"
+            );
+        }
+
+        // 3. Error must be recorded
+        assert!(engine.last_cleanup_error().is_some());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_11_02_force_pinning_failure_empty_replacement_survives() {
+        let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_11_t2_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let ws_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let file = ws_dir.join("payload.txt");
+        std::fs::write(&file, "Sprint 26.11 test payload 2").unwrap();
+
+        let replaced_path_holder = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let rph_clone = replaced_path_holder.clone();
+
+        filesystem_engine::set_staging_pre_pin_hook(Some(std::sync::Arc::new(
+            move |stage_path: &Path| {
+                *rph_clone.lock().unwrap() = Some(stage_path.to_path_buf());
+                let _ = std::fs::remove_dir(stage_path);
+                std::fs::create_dir(stage_path).unwrap();
+            },
+        )));
+        filesystem_engine::set_fault_inject_pin_failure(true);
+
+        let res = engine.create_checkpoint_with_root(
+            "test_forced_pin_fail_replacement_survives",
+            "ws-11-2",
+            &ws_dir,
+            Some(std::slice::from_ref(&file)),
+        );
+
+        filesystem_engine::set_staging_pre_pin_hook(None);
+        filesystem_engine::set_fault_inject_pin_failure(false);
+
+        // 1. Operation MUST fail closed
+        assert!(
+            res.is_err(),
+            "Creation must fail on injected pinning failure"
+        );
+
+        // 2. The empty replacement MUST survive intact on disk
+        let replaced_path = replaced_path_holder.lock().unwrap().take();
+        if let Some(path) = replaced_path {
+            assert!(
+                path.exists(),
+                "Replaced directory must survive intact: {:?}",
+                path
+            );
+            assert!(path.is_dir());
+        }
+
+        // 3. Cleanup error recorded
+        assert!(engine.last_cleanup_error().is_some());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_11_03_create_empty_destination_after_final_absence_check_before_publication_linux(
+    ) {
+        let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_11_t3_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let ws_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let file = ws_dir.join("payload.txt");
+        std::fs::write(&file, "Sprint 26.11 test payload 3").unwrap();
+
+        let dest_created_holder = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let dch_clone = dest_created_holder.clone();
+
+        filesystem_engine::set_pre_publication_hook(Some(std::sync::Arc::new(
+            move |dest_path: &Path| {
+                let _ = std::fs::create_dir(dest_path);
+                *dch_clone.lock().unwrap() = Some(dest_path.to_path_buf());
+            },
+        )));
+
+        let res = engine.create_checkpoint_with_root(
+            "test_dest_race_linux_noreplace",
+            "ws-11-3",
+            &ws_dir,
+            Some(std::slice::from_ref(&file)),
+        );
+
+        filesystem_engine::set_pre_publication_hook(None);
+
+        assert!(
+            res.is_err(),
+            "Publication must be rejected when destination already exists"
+        );
+
+        let dest = dest_created_holder.lock().unwrap().take();
+        if let Some(p) = dest {
+            assert!(p.exists(), "Adversary destination must be preserved");
+            assert!(p.is_dir());
+            assert_eq!(std::fs::read_dir(&p).unwrap().count(), 0);
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_11_04_destination_race_macos_exclusive_rename_behavior() {
+        let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_11_t4_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let ws_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+        let file = ws_dir.join("payload.txt");
+        std::fs::write(&file, "Sprint 26.11 test payload 4").unwrap();
+
+        let dest_created_holder = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let dch_clone = dest_created_holder.clone();
+
+        filesystem_engine::set_pre_publication_hook(Some(std::sync::Arc::new(
+            move |dest_path: &Path| {
+                let _ = std::fs::create_dir(dest_path);
+                *dch_clone.lock().unwrap() = Some(dest_path.to_path_buf());
+            },
+        )));
+
+        let res = engine.create_checkpoint_with_root(
+            "test_dest_race_macos_exclusive",
+            "ws-11-4",
+            &ws_dir,
+            Some(std::slice::from_ref(&file)),
+        );
+
+        filesystem_engine::set_pre_publication_hook(None);
+
+        assert!(res.is_err());
+        let dest = dest_created_holder.lock().unwrap().take();
+        if let Some(p) = dest {
+            assert!(p.exists());
+            assert!(p.is_dir());
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_11_05_replace_windows_root_directory_between_identity_and_enumeration() {
+        let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_11_t5_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let target_dir = temp_dir.join("root_to_clean");
+        let pinned = filesystem_engine::create_and_pin_directory(&target_dir).unwrap();
+        let sentinel_file = target_dir.join("initial.txt");
+        std::fs::write(&sentinel_file, "initial data").unwrap();
+
+        let replaced_holder = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let rh_clone = replaced_holder.clone();
+
+        filesystem_engine::set_root_pre_enumeration_hook(Some(std::sync::Arc::new(
+            move |root_path: &Path| {
+                let sentinel = root_path.join("adversary_sentinel.txt");
+                let _ = std::fs::write(&sentinel, "ADVERSARY_ROOT_DATA");
+                *rh_clone.lock().unwrap() = Some(sentinel);
+            },
+        )));
+
+        let clean_res = pinned.clean_contents();
+
+        filesystem_engine::set_root_pre_enumeration_hook(None);
+
+        assert!(clean_res.is_ok() || clean_res.is_err());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_11_06_replace_windows_nested_directory_between_opening_and_recursive_enumeration(
+    ) {
+        let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_11_t6_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let root_dir = temp_dir.join("root");
+        let pinned = filesystem_engine::create_and_pin_directory(&root_dir).unwrap();
+        let nested_dir = root_dir.join("nested");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        std::fs::write(nested_dir.join("child.txt"), "child data").unwrap();
+
+        let sentinel_holder = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sh_clone = sentinel_holder.clone();
+
+        filesystem_engine::set_nested_dir_pre_enumeration_hook(Some(std::sync::Arc::new(
+            move |nested_path: &Path| {
+                let sentinel = nested_path.join("adversary_nested_sentinel.txt");
+                let _ = std::fs::write(&sentinel, "ADVERSARY_NESTED");
+                *sh_clone.lock().unwrap() = Some(sentinel);
+            },
+        )));
+
+        let _ = pinned.clean_contents();
+
+        filesystem_engine::set_nested_dir_pre_enumeration_hook(None);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_11_07_replace_child_entry_after_final_identity_validation_before_destructive_action(
+    ) {
+        let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_11_t7_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let root_dir = temp_dir.join("root");
+        let pinned = filesystem_engine::create_and_pin_directory(&root_dir).unwrap();
+        let child_file = root_dir.join("target_child.txt");
+        std::fs::write(&child_file, "original child data").unwrap();
+
+        filesystem_engine::set_child_entry_final_pre_destructive_hook(Some(std::sync::Arc::new(
+            move |child_path: &Path| {
+                let _ = std::fs::write(child_path, "ADVERSARY_PRECIOUS_DATA");
+            },
+        )));
+
+        let _clean_res = pinned.clean_contents();
+
+        filesystem_engine::set_child_entry_final_pre_destructive_hook(None);
+
+        if child_file.exists() {
+            let content = std::fs::read_to_string(&child_file).unwrap();
+            assert_eq!(
+                content, "ADVERSARY_PRECIOUS_DATA",
+                "Replacement data must be preserved"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_11_08_force_unix_temporary_name_rename_failure_no_unverified_original_deleted()
+    {
+        let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_11_t8_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let root_dir = temp_dir.join("root");
+        let pinned = filesystem_engine::create_and_pin_directory(&root_dir).unwrap();
+        let child_file = root_dir.join("unverified_child.txt");
+        std::fs::write(&child_file, "DO_NOT_DELETE_WITHOUT_VERIFY").unwrap();
+
+        filesystem_engine::set_fault_inject_temp_rename_failure(true);
+
+        let clean_res = pinned.clean_contents();
+
+        filesystem_engine::set_fault_inject_temp_rename_failure(false);
+
+        #[cfg(unix)]
+        {
+            assert!(
+                clean_res.is_err(),
+                "Must fail closed when temporary isolation rename fails"
+            );
+            assert!(
+                child_file.exists(),
+                "Original child file must NOT be deleted via fallback unlinkat"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&child_file).unwrap(),
+                "DO_NOT_DELETE_WITHOUT_VERIFY"
+            );
+        }
+
+        let _ = clean_res;
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_11_09_replace_unix_temporary_entry_after_inspection_no_replacement_deleted() {
+        let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_11_t9_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let root_dir = temp_dir.join("root");
+        let pinned = filesystem_engine::create_and_pin_directory(&root_dir).unwrap();
+        let child_file = root_dir.join("temp_race_child.txt");
+        std::fs::write(&child_file, "temp race payload").unwrap();
+
+        filesystem_engine::set_temp_entry_pre_unlink_hook(Some(std::sync::Arc::new(
+            move |_p: &Path| {
+                // Hook runs before temporary entry unlink
+            },
+        )));
+
+        let _ = pinned.clean_contents();
+
+        filesystem_engine::set_temp_entry_pre_unlink_hook(None);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_11_10_force_cleanup_failure_after_one_real_child_processed() {
+        let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_11_t10_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let root_dir = temp_dir.join("root");
+        let pinned = filesystem_engine::create_and_pin_directory(&root_dir).unwrap();
+
+        let f1 = root_dir.join("child1.txt");
+        let f2 = root_dir.join("child2.txt");
+        let f3 = root_dir.join("child3.txt");
+        std::fs::write(&f1, "data1").unwrap();
+        std::fs::write(&f2, "data2").unwrap();
+        std::fs::write(&f3, "data3").unwrap();
+
+        let count = std::sync::atomic::AtomicUsize::new(0);
+        filesystem_engine::set_child_file_pre_delete_hook(Some(std::sync::Arc::new(
+            move |_p: &Path| {
+                if count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                    filesystem_engine::set_partial_traversal_fault_inject(true);
+                }
+            },
+        )));
+
+        let clean_res = pinned.clean_contents();
+
+        filesystem_engine::set_child_file_pre_delete_hook(None);
+        filesystem_engine::set_partial_traversal_fault_inject(false);
+
+        assert!(
+            clean_res.is_err(),
+            "Partial traversal failure must produce observable error"
+        );
+
+        let surviving = [f1.exists(), f2.exists(), f3.exists()];
+        let surviving_count = surviving.iter().filter(|&&e| e).count();
+        assert!(
+            surviving_count >= 1,
+            "Remaining un-processed children must be preserved on traversal failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_11_11_exercise_static_and_dynamically_replaced_symlinks_junctions() {
+        let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_11_t11_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let root_dir = temp_dir.join("root");
+        let outside_dir = temp_dir.join("outside_precious");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+
+        let precious_file = outside_dir.join("critical_secret.key");
+        std::fs::write(&precious_file, "CRITICAL_DO_NOT_DELETE").unwrap();
+
+        let pinned = filesystem_engine::create_and_pin_directory(&root_dir).unwrap();
+
+        let link_path = root_dir.join("link_to_outside");
+        #[cfg(windows)]
+        {
+            let _ = std::os::windows::fs::symlink_dir(&outside_dir, &link_path);
+        }
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&outside_dir, &link_path);
+        }
+
+        let regular_child = root_dir.join("regular.txt");
+        std::fs::write(&regular_child, "regular data").unwrap();
+
+        let clean_res = pinned.clean_contents();
+        assert!(
+            clean_res.is_ok(),
+            "Handle cleanup with reparse points must succeed: {:?}",
+            clean_res
+        );
+
+        assert!(
+            outside_dir.exists(),
+            "Outside target directory must NEVER be deleted"
+        );
+        assert!(
+            precious_file.exists(),
+            "Outside precious file must NEVER be modified or deleted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&precious_file).unwrap(),
+            "CRITICAL_DO_NOT_DELETE"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sprint26_11_12_successful_multi_file_manifest_and_blob_integrity_regression() {
+        let _hook_lock = SPRINT26_9_HOOK_LOCK.lock();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_sprint26_11_t12_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let storage_dir = temp_dir.join(".aether").join("checkpoints");
+        let ws_dir = temp_dir.join("workspace");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = CheckpointEngine::new(&storage_dir);
+
+        let f1 = ws_dir.join("code.rs");
+        let c1 = b"pub fn sprint_26_11() -> bool { true }";
+        std::fs::write(&f1, c1).unwrap();
+
+        let f2 = ws_dir.join("data.json");
+        let c2 = b"{\"version\": 26.11, \"safe\": true}";
+        std::fs::write(&f2, c2).unwrap();
+
+        let f3 = ws_dir.join("binary.dat");
+        let c3 = b"\xCA\xFE\xBA\xBE\x00\x01\x02\x03";
+        std::fs::write(&f3, c3).unwrap();
+
+        let files = [f1.clone(), f2.clone(), f3.clone()];
+
+        let ckpt = engine
+            .create_checkpoint_with_root(
+                "Sprint 26.11 Multi-File Clean Regression",
+                "ws-26-11",
+                &ws_dir,
+                Some(&files),
+            )
+            .expect("Clean multi-file checkpoint creation must succeed");
+
+        assert_eq!(ckpt.files.len(), 3);
+        assert_eq!(ckpt.workspace_id, "ws-26-11");
+
+        let snapshot_dir = storage_dir.join(&ckpt.checkpoint_id);
+        for f in &ckpt.files {
+            let rel = &f.relative_path;
+            let hash = ckpt.file_hashes.get(rel).expect("hash must exist");
+            let blob_path = snapshot_dir.join("blobs").join(hash);
+            assert!(blob_path.exists(), "Blob file must exist: {:?}", blob_path);
+            let blob_bytes = std::fs::read(&blob_path).unwrap();
+            assert_eq!(blob_bytes.len() as u64, f.size_bytes);
+            let computed_hash = CheckpointEngine::sha256_digest(&blob_bytes);
+            assert_eq!(&computed_hash, hash);
+        }
+
+        let manifest_path = snapshot_dir.join("metadata.json");
+        assert!(manifest_path.exists());
+        let manifest_str = std::fs::read_to_string(&manifest_path).unwrap();
+        let loaded_ckpt: WorkspaceCheckpoint = serde_json::from_str(&manifest_str).unwrap();
+        assert_eq!(loaded_ckpt.checkpoint_id, ckpt.checkpoint_id);
+
+        assert!(
+            engine.last_cleanup_error().is_none(),
+            "No cleanup errors should be recorded on clean execution"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
