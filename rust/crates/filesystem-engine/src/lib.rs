@@ -7832,18 +7832,23 @@ mod tests {
     #[cfg(windows)]
     fn test_windows_parent_broad_group_owner_cannot_bypass_private_acl() {
         let temp_dir = std::env::temp_dir().join(format!(
-            "aether_win_dacl_broad_group_{}",
+            "aether_win_dacl_broad_group_owner_{}",
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
-        // 1. Directory owned by broad group BUILTIN\Users (SID 27):
-        // Must be rejected at ownership check (broad groups are not accepted as private owner)
+        // 1. Establish an otherwise secure, valid private DACL first so that DACL inspection
+        // cannot trigger rejection; the test strictly isolates the owner-validation check.
+        secure_storage_parent_private_acl(&temp_dir).expect("secure private acl");
+
+        // 2. Simulate owner as broad group BUILTIN\Users (Well-Known SID type 27: WinBuiltinUsersSid = S-1-5-32-545)
         const WIN_BUILTIN_USERS_SID: u32 = 27;
         set_fault_inject_windows_simulated_owner_sid(Some(WIN_BUILTIN_USERS_SID));
         let res = verify_storage_parent_acl(&temp_dir);
         set_fault_inject_windows_simulated_owner_sid(None);
 
+        // 3. Confirm that validation fails specifically because owner is not an accepted private owner,
+        // and does NOT fail due to DACL inspection.
         assert!(
             res.is_err(),
             "Parent directory owned by BUILTIN\\Users must be rejected"
@@ -7854,25 +7859,63 @@ mod tests {
             "Error must indicate rejection of broad group owner: {}",
             err_msg
         );
+        assert!(
+            !err_msg.contains("unsafe permissions"),
+            "Rejection must be strictly due to broad group owner, not DACL inspection: {}",
+            err_msg
+        );
 
-        // 2. Directory owned by BUILTIN\Users AND having dangerous permissions granted to BUILTIN\Users in DACL:
-        // Neither check may be bypassed.
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_parent_broad_group_dangerous_dacl_rejected() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_dacl_broad_group_dacl_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Directory is owned by the current individual TokenUser (unmodified creator).
+        // Ensure fault injection is clear so owner verification passes cleanly and execution reaches DACL inspection.
+        set_fault_inject_windows_simulated_owner_sid(None);
+        set_fault_inject_windows_simulated_admin_token(false);
+
+        // 2. Grant dangerous permissions (GENERIC_ALL = 0x10000000, which includes write/modify/delete)
+        // to broad group BUILTIN\Users (Well-Known SID type 27: WinBuiltinUsersSid = S-1-5-32-545).
+        const WIN_BUILTIN_USERS_SID: u32 = 27;
         unsafe {
             set_permissive_dacl_for_sid(&temp_dir, WIN_BUILTIN_USERS_SID, false);
         }
-        set_fault_inject_windows_simulated_owner_sid(Some(WIN_BUILTIN_USERS_SID));
-        let res_dacl = verify_storage_parent_acl(&temp_dir);
-        set_fault_inject_windows_simulated_owner_sid(None);
 
+        // 3. Invoke the production security verifier. Rejection must be triggered specifically by DACL inspection.
+        let res_dacl = verify_storage_parent_acl(&temp_dir);
         assert!(
             res_dacl.is_err(),
-            "Parent directory with broad group owner and permissive group DACL must be rejected"
+            "Parent directory with dangerous broad-group DACL must be rejected"
+        );
+        let err_msg = format!("{:?}", res_dacl);
+        assert!(
+            err_msg.contains("unsafe permissions"),
+            "Error must indicate rejection due to unsafe DACL permissions: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("S-1-5-32-545"),
+            "Error must identify BUILTIN\\Users SID (S-1-5-32-545) as unauthorized principal: {}",
+            err_msg
+        );
+        assert!(
+            !err_msg.contains("not owned by an authorized private owner"),
+            "Directory owner is the current TokenUser; must NOT fail owner validation: {}",
+            err_msg
         );
 
-        // 3. Secure remediation: secure_storage_parent_private_acl reconfigures DACL to private,
-        // eliminating dangerous permissions for other users.
+        // 4. Secure remediation: replace unsafe ACL with a valid private ACL
         secure_storage_parent_private_acl(&temp_dir).expect("remediation must succeed");
-        // After securing, verify that broad group BUILTIN\Users is no longer in DACL
+
+        // 5. Confirm that the valid configuration is accepted
         let verify_safe = verify_storage_parent_acl(&temp_dir);
         assert!(
             verify_safe.is_ok(),
