@@ -7604,6 +7604,180 @@ mod tests {
     }
 
     #[cfg(windows)]
+    unsafe fn set_directory_owner_to_token_user(path: &Path) -> std::result::Result<(), String> {
+        use std::os::windows::ffi::OsStrExt;
+
+        const SE_FILE_OBJECT: u32 = 1;
+        const OWNER_SECURITY_INFORMATION: u32 = 0x00000001;
+        const TOKEN_QUERY: u32 = 0x0008;
+        const TOKEN_ADJUST_PRIVILEGES: u32 = 0x0020;
+        #[allow(non_upper_case_globals)]
+        const TokenUser: u32 = 1;
+
+        extern "system" {
+            fn OpenProcessToken(
+                ProcessHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn GetTokenInformation(
+                TokenHandle: *mut std::ffi::c_void,
+                TokenInformationClass: u32,
+                TokenInformation: *mut std::ffi::c_void,
+                TokenInformationLength: u32,
+                ReturnLength: *mut u32,
+            ) -> i32;
+            fn LookupPrivilegeValueW(
+                lpSystemName: *const u16,
+                lpName: *const u16,
+                lpLuid: *mut std::ffi::c_void,
+            ) -> i32;
+            fn AdjustTokenPrivileges(
+                TokenHandle: *mut std::ffi::c_void,
+                DisableAllPrivileges: i32,
+                NewState: *mut std::ffi::c_void,
+                BufferLength: u32,
+                PreviousState: *mut std::ffi::c_void,
+                ReturnLength: *mut u32,
+            ) -> i32;
+            fn SetNamedSecurityInfoW(
+                pObjectName: *const u16,
+                ObjectType: u32,
+                SecurityInfo: u32,
+                ppsidOwner: *mut std::ffi::c_void,
+                ppsidGroup: *mut std::ffi::c_void,
+                ppDacl: *mut std::ffi::c_void,
+                ppSacl: *mut std::ffi::c_void,
+            ) -> u32;
+            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn GetLastError() -> u32;
+        }
+
+        let mut token: *mut std::ffi::c_void = std::ptr::null_mut();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+            &mut token,
+        ) == 0
+        {
+            // Fallback to TOKEN_QUERY if adjust privileges is denied
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return Err(format!(
+                    "OpenProcessToken failed with Win32 error {}",
+                    GetLastError()
+                ));
+            }
+        }
+
+        // Attempt to enable SeRestorePrivilege and SeTakeOwnershipPrivilege if available in token
+        #[repr(C)]
+        #[allow(clippy::upper_case_acronyms)]
+        struct LUID {
+            low_part: u32,
+            high_part: i32,
+        }
+        #[repr(C)]
+        #[allow(clippy::upper_case_acronyms)]
+        struct LUID_AND_ATTRIBUTES {
+            luid: LUID,
+            attributes: u32,
+        }
+        #[repr(C)]
+        #[allow(clippy::upper_case_acronyms)]
+        struct TOKEN_PRIVILEGES {
+            privilege_count: u32,
+            privileges: [LUID_AND_ATTRIBUTES; 1],
+        }
+        const SE_PRIVILEGE_ENABLED: u32 = 0x00000002;
+
+        for priv_name in &["SeRestorePrivilege", "SeTakeOwnershipPrivilege"] {
+            let wide_name: Vec<u16> = priv_name.encode_utf16().chain(Some(0)).collect();
+            let mut luid = LUID {
+                low_part: 0,
+                high_part: 0,
+            };
+            if LookupPrivilegeValueW(
+                std::ptr::null(),
+                wide_name.as_ptr(),
+                &mut luid as *mut _ as *mut _,
+            ) != 0
+            {
+                let mut tp = TOKEN_PRIVILEGES {
+                    privilege_count: 1,
+                    privileges: [LUID_AND_ATTRIBUTES {
+                        luid,
+                        attributes: SE_PRIVILEGE_ENABLED,
+                    }],
+                };
+                AdjustTokenPrivileges(
+                    token,
+                    0,
+                    &mut tp as *mut _ as *mut _,
+                    std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct SID_AND_ATTRIBUTES {
+            Sid: *mut std::ffi::c_void,
+            Attributes: u32,
+        }
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct TOKEN_USER {
+            User: SID_AND_ATTRIBUTES,
+        }
+
+        #[repr(align(8))]
+        struct AlignedBuffer([u8; 512]);
+        let mut user_buf = AlignedBuffer([0u8; 512]);
+        let mut ret_len = 0u32;
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            user_buf.0.as_mut_ptr() as *mut _,
+            user_buf.0.len() as u32,
+            &mut ret_len,
+        ) == 0
+        {
+            CloseHandle(token);
+            return Err(format!(
+                "GetTokenInformation(TokenUser) failed with Win32 error {}",
+                GetLastError()
+            ));
+        }
+        let token_user = &*(user_buf.0.as_ptr() as *const TOKEN_USER);
+        let p_token_user_sid = token_user.User.Sid;
+
+        let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let set_res = SetNamedSecurityInfoW(
+            wide_path.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            p_token_user_sid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+
+        CloseHandle(token);
+
+        if set_res != 0 {
+            return Err(format!(
+                "SetNamedSecurityInfoW(OWNER_SECURITY_INFORMATION) failed with Win32 error {}",
+                set_res
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(windows)]
     unsafe fn query_directory_owner_and_token_user_sids(
         path: &Path,
     ) -> std::result::Result<(String, String, bool), String> {
@@ -8098,7 +8272,14 @@ mod tests {
         ));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
-        // 1. Explicitly verify and prove that the directory's actual owner SID is exactly
+        // 1. Establish individual TokenUser ownership explicitly rather than relying on
+        // test runner default ownership (which on elevated Windows runners defaults to BUILTIN\Administrators).
+        unsafe {
+            set_directory_owner_to_token_user(&temp_dir)
+                .expect("Failed to set directory owner to individual TokenUser");
+        }
+
+        // Explicitly verify and prove that the directory's actual owner SID is exactly
         // the current process's individual TokenUser SID.
         // Fails fixture setup if identities do not match (no fallback to Administrators/SYSTEM).
         let (owner_sid, token_user_sid) =
@@ -8177,6 +8358,13 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Establish individual TokenUser ownership explicitly rather than relying on
+        // test runner default ownership (which on elevated Windows runners defaults to BUILTIN\Administrators).
+        unsafe {
+            set_directory_owner_to_token_user(&temp_dir)
+                .expect("Failed to set directory owner to individual TokenUser");
+        }
 
         let (owner_sid, token_user_sid, is_equal) = unsafe {
             query_directory_owner_and_token_user_sids(&temp_dir)
