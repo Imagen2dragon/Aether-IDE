@@ -7604,7 +7604,195 @@ mod tests {
     }
 
     #[cfg(windows)]
-    unsafe fn set_permissive_dacl_for_sid(path: &Path, well_known_sid: u32, inherit: bool) {
+    unsafe fn query_directory_owner_and_token_user_sids(
+        path: &Path,
+    ) -> std::result::Result<(String, String, bool), String> {
+        use std::os::windows::ffi::OsStrExt;
+
+        const SE_FILE_OBJECT: u32 = 1;
+        const OWNER_SECURITY_INFORMATION: u32 = 0x00000001;
+        const TOKEN_QUERY: u32 = 0x0008;
+        #[allow(non_upper_case_globals)]
+        const TokenUser: u32 = 1;
+
+        extern "system" {
+            fn GetNamedSecurityInfoW(
+                pObjectName: *const u16,
+                ObjectType: u32,
+                SecurityInfo: u32,
+                ppsidOwner: *mut *mut std::ffi::c_void,
+                ppsidGroup: *mut *mut std::ffi::c_void,
+                ppDacl: *mut *mut std::ffi::c_void,
+                ppSacl: *mut *mut std::ffi::c_void,
+                ppSecurityDescriptor: *mut *mut std::ffi::c_void,
+            ) -> u32;
+            fn OpenProcessToken(
+                ProcessHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn GetTokenInformation(
+                TokenHandle: *mut std::ffi::c_void,
+                TokenInformationClass: u32,
+                TokenInformation: *mut std::ffi::c_void,
+                TokenInformationLength: u32,
+                ReturnLength: *mut u32,
+            ) -> i32;
+            fn EqualSid(pSid1: *mut std::ffi::c_void, pSid2: *mut std::ffi::c_void) -> i32;
+            fn ConvertSidToStringSidW(Sid: *mut std::ffi::c_void, StringSid: *mut *mut u16) -> i32;
+            fn LocalFree(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn GetLastError() -> u32;
+        }
+
+        unsafe fn sid_to_string(sid: *mut std::ffi::c_void) -> std::result::Result<String, String> {
+            let mut p_str: *mut u16 = std::ptr::null_mut();
+            if ConvertSidToStringSidW(sid, &mut p_str) == 0 || p_str.is_null() {
+                return Err(format!(
+                    "ConvertSidToStringSidW failed with Win32 error {}",
+                    GetLastError()
+                ));
+            }
+            let mut len = 0;
+            while *p_str.add(len) != 0 {
+                len += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(p_str, len));
+            LocalFree(p_str as *mut _);
+            Ok(s)
+        }
+
+        let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut p_owner_sid: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut p_sec_desc: *mut std::ffi::c_void = std::ptr::null_mut();
+
+        let sec_res = GetNamedSecurityInfoW(
+            wide_path.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut p_owner_sid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut p_sec_desc,
+        );
+        if sec_res != 0 {
+            return Err(format!(
+                "GetNamedSecurityInfoW(OWNER_SECURITY_INFORMATION) failed with Win32 error {}",
+                sec_res
+            ));
+        }
+        if p_owner_sid.is_null() {
+            if !p_sec_desc.is_null() {
+                LocalFree(p_sec_desc);
+            }
+            return Err("GetNamedSecurityInfoW returned a NULL owner SID".to_string());
+        }
+
+        let owner_sid_str = match sid_to_string(p_owner_sid) {
+            Ok(s) => s,
+            Err(e) => {
+                if !p_sec_desc.is_null() {
+                    LocalFree(p_sec_desc);
+                }
+                return Err(e);
+            }
+        };
+
+        let mut token: *mut std::ffi::c_void = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            if !p_sec_desc.is_null() {
+                LocalFree(p_sec_desc);
+            }
+            return Err(format!(
+                "OpenProcessToken failed with Win32 error {}",
+                GetLastError()
+            ));
+        }
+
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct SID_AND_ATTRIBUTES {
+            Sid: *mut std::ffi::c_void,
+            Attributes: u32,
+        }
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct TOKEN_USER {
+            User: SID_AND_ATTRIBUTES,
+        }
+
+        #[repr(align(8))]
+        struct AlignedBuffer([u8; 512]);
+        let mut user_buf = AlignedBuffer([0u8; 512]);
+        let mut ret_len = 0u32;
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            user_buf.0.as_mut_ptr() as *mut _,
+            user_buf.0.len() as u32,
+            &mut ret_len,
+        ) == 0
+        {
+            CloseHandle(token);
+            if !p_sec_desc.is_null() {
+                LocalFree(p_sec_desc);
+            }
+            return Err(format!(
+                "GetTokenInformation(TokenUser) failed with Win32 error {}",
+                GetLastError()
+            ));
+        }
+        let token_user = &*(user_buf.0.as_ptr() as *const TOKEN_USER);
+        let p_token_user_sid = token_user.User.Sid;
+
+        let token_user_sid_str = match sid_to_string(p_token_user_sid) {
+            Ok(s) => s,
+            Err(e) => {
+                CloseHandle(token);
+                if !p_sec_desc.is_null() {
+                    LocalFree(p_sec_desc);
+                }
+                return Err(e);
+            }
+        };
+
+        let is_equal = EqualSid(p_owner_sid, p_token_user_sid) != 0;
+
+        CloseHandle(token);
+        if !p_sec_desc.is_null() {
+            LocalFree(p_sec_desc);
+        }
+
+        Ok((owner_sid_str, token_user_sid_str, is_equal))
+    }
+
+    #[cfg(windows)]
+    unsafe fn assert_directory_owner_is_token_user(path: &Path) -> (String, String) {
+        let (owner_sid_str, token_user_sid_str, is_equal) =
+            query_directory_owner_and_token_user_sids(path)
+                .expect("Failed to query directory owner and TokenUser SIDs");
+
+        assert!(
+            is_equal,
+            "Directory actual owner SID ({}) does not match process TokenUser SID ({}); fixture requires exact individual TokenUser ownership",
+            owner_sid_str, token_user_sid_str
+        );
+        assert_eq!(
+            owner_sid_str, token_user_sid_str,
+            "Owner SID string representation must match TokenUser SID string"
+        );
+
+        (owner_sid_str, token_user_sid_str)
+    }
+
+    #[cfg(windows)]
+    unsafe fn set_permissive_dacl_for_sid(
+        path: &Path,
+        well_known_sid: u32,
+        inherit: bool,
+    ) -> std::result::Result<(), String> {
         use std::os::windows::ffi::OsStrExt;
         let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
 
@@ -7644,38 +7832,58 @@ mod tests {
                 ppDacl: *mut std::ffi::c_void,
                 ppSacl: *mut std::ffi::c_void,
             ) -> u32;
+            fn GetLastError() -> u32;
         }
 
         let mut sid_buf = vec![0u8; 68];
         let mut cb_sid = sid_buf.len() as u32;
-        CreateWellKnownSid(
+        if CreateWellKnownSid(
             well_known_sid,
             std::ptr::null_mut(),
             sid_buf.as_mut_ptr() as *mut _,
             &mut cb_sid,
-        );
+        ) == 0
+        {
+            return Err(format!(
+                "CreateWellKnownSid(type={}) failed with Win32 error {}",
+                well_known_sid,
+                GetLastError()
+            ));
+        }
 
         let mut acl_buf = vec![0u8; 1024];
-        InitializeAcl(
+        if InitializeAcl(
             acl_buf.as_mut_ptr() as *mut _,
             acl_buf.len() as u32,
             ACL_REVISION,
-        );
+        ) == 0
+        {
+            return Err(format!(
+                "InitializeAcl failed with Win32 error {}",
+                GetLastError()
+            ));
+        }
 
         let flags = if inherit {
             CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
         } else {
             0
         };
-        AddAccessAllowedAceEx(
+        if AddAccessAllowedAceEx(
             acl_buf.as_mut_ptr() as *mut _,
             ACL_REVISION,
             flags,
             GENERIC_ALL,
             sid_buf.as_mut_ptr() as *mut _,
-        );
+        ) == 0
+        {
+            return Err(format!(
+                "AddAccessAllowedAceEx failed with Win32 error {}",
+                GetLastError()
+            ));
+        }
 
-        SetNamedSecurityInfoW(
+        let set_res = SetNamedSecurityInfoW(
             wide_path.as_ptr(),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
@@ -7684,12 +7892,23 @@ mod tests {
             acl_buf.as_mut_ptr() as *mut _,
             std::ptr::null_mut(),
         );
+        if set_res != 0 {
+            return Err(format!(
+                "SetNamedSecurityInfoW failed with Win32 error {}",
+                set_res
+            ));
+        }
+
+        Ok(())
     }
 
     #[cfg(windows)]
-    unsafe fn set_permissive_dacl_for_everyone(path: &Path, inherit: bool) {
+    unsafe fn set_permissive_dacl_for_everyone(
+        path: &Path,
+        inherit: bool,
+    ) -> std::result::Result<(), String> {
         const WIN_WORLD_SID: u32 = 1;
-        set_permissive_dacl_for_sid(path, WIN_WORLD_SID, inherit);
+        set_permissive_dacl_for_sid(path, WIN_WORLD_SID, inherit)
     }
 
     #[test]
@@ -7722,7 +7941,8 @@ mod tests {
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         unsafe {
-            set_permissive_dacl_for_everyone(&temp_dir, false);
+            set_permissive_dacl_for_everyone(&temp_dir, false)
+                .expect("Failed to set unsafe permissive DACL for Everyone");
         }
 
         let res = verify_storage_parent_acl(&temp_dir);
@@ -7780,7 +8000,8 @@ mod tests {
         std::fs::create_dir_all(&parent_dir).unwrap();
 
         unsafe {
-            set_permissive_dacl_for_everyone(&parent_dir, true);
+            set_permissive_dacl_for_everyone(&parent_dir, true)
+                .expect("Failed to set inherited permissive DACL for Everyone");
         }
 
         let child_storage = parent_dir.join("child_storage");
@@ -7877,17 +8098,34 @@ mod tests {
         ));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
-        // 1. Directory is owned by the current individual TokenUser (unmodified creator).
-        // Ensure fault injection is clear so owner verification passes cleanly and execution reaches DACL inspection.
+        // 1. Explicitly verify and prove that the directory's actual owner SID is exactly
+        // the current process's individual TokenUser SID.
+        // Fails fixture setup if identities do not match (no fallback to Administrators/SYSTEM).
+        let (owner_sid, token_user_sid) =
+            unsafe { assert_directory_owner_is_token_user(&temp_dir) };
+        println!("test_windows_parent_broad_group_dangerous_dacl_rejected: directory actual owner SID: {}", owner_sid);
+        println!("test_windows_parent_broad_group_dangerous_dacl_rejected: process actual TokenUser SID: {}", token_user_sid);
+        assert_eq!(
+            owner_sid, token_user_sid,
+            "Directory actual owner SID must match current individual TokenUser SID"
+        );
+
+        // Ensure fault injection seams are cleared so owner verification passes cleanly
+        // and execution reaches DACL inspection.
         set_fault_inject_windows_simulated_owner_sid(None);
         set_fault_inject_windows_simulated_admin_token(false);
 
         // 2. Grant dangerous permissions (GENERIC_ALL = 0x10000000, which includes write/modify/delete)
-        // to broad group BUILTIN\Users (Well-Known SID type 27: WinBuiltinUsersSid = S-1-5-32-545).
+        // to broad group BUILTIN\Users (Well-Known SID type 27: WinBuiltinUsersSid = S-1-5-32-545)
+        // using the verified ACL fixture constructor.
         const WIN_BUILTIN_USERS_SID: u32 = 27;
-        unsafe {
-            set_permissive_dacl_for_sid(&temp_dir, WIN_BUILTIN_USERS_SID, false);
-        }
+        let dacl_res =
+            unsafe { set_permissive_dacl_for_sid(&temp_dir, WIN_BUILTIN_USERS_SID, false) };
+        assert!(
+            dacl_res.is_ok(),
+            "Installing dangerous DACL fixture must succeed: {:?}",
+            dacl_res.err()
+        );
 
         // 3. Invoke the production security verifier. Rejection must be triggered specifically by DACL inspection.
         let res_dacl = verify_storage_parent_acl(&temp_dir);
@@ -7907,8 +8145,13 @@ mod tests {
             err_msg
         );
         assert!(
+            err_msg.contains("0x001F01FF") || err_msg.contains("0x10000000"),
+            "Error must identify dangerous permissions mask (GENERIC_ALL 0x10000000 or NTFS mapped FILE_ALL_ACCESS 0x001F01FF): {}",
+            err_msg
+        );
+        assert!(
             !err_msg.contains("not owned by an authorized private owner"),
-            "Directory owner is the current TokenUser; must NOT fail owner validation: {}",
+            "Directory owner is verified TokenUser; must NOT fail owner validation: {}",
             err_msg
         );
 
@@ -7922,6 +8165,42 @@ mod tests {
             "Secured parent directory must pass verification: {:?}",
             verify_safe
         );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_parent_token_user_identity_proof() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_dacl_token_user_proof_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let (owner_sid, token_user_sid, is_equal) = unsafe {
+            query_directory_owner_and_token_user_sids(&temp_dir)
+                .expect("query_directory_owner_and_token_user_sids must succeed")
+        };
+        println!(
+            "test_windows_parent_token_user_identity_proof: directory actual owner SID: {}",
+            owner_sid
+        );
+        println!(
+            "test_windows_parent_token_user_identity_proof: process actual TokenUser SID: {}",
+            token_user_sid
+        );
+        println!(
+            "test_windows_parent_token_user_identity_proof: EqualSid result: {}",
+            is_equal
+        );
+
+        assert!(
+            is_equal,
+            "Created directory must be owned by current individual TokenUser"
+        );
+        assert_eq!(owner_sid, token_user_sid);
+        assert!(!owner_sid.is_empty());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
