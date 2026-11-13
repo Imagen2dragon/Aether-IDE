@@ -61,7 +61,7 @@ Set-Content -Path $shaFile -Value $checksumLines -Encoding utf8
 Write-Host "Wrote checksum manifest: $shaFile" -ForegroundColor Green
 
 $manifest = @{
-    release = "v0.1.0-beta.2"
+    release = "v0.1.0-beta.3"
     generated_at = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
     artifacts = $manifestEntries
 }
