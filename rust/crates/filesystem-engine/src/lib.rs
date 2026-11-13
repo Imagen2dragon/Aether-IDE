@@ -7604,6 +7604,265 @@ mod tests {
     }
 
     #[cfg(windows)]
+    thread_local! {
+        static FAULT_INJECT_WINDOWS_IMPERSONATION_EARLY_RETURN_ERR: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        static FAULT_INJECT_WINDOWS_IMPERSONATION_EARLY_PANIC: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    #[cfg(windows)]
+    fn set_fault_inject_windows_impersonation_early_return_err(inject: bool) {
+        FAULT_INJECT_WINDOWS_IMPERSONATION_EARLY_RETURN_ERR.with(|c| c.set(inject));
+    }
+
+    #[cfg(windows)]
+    fn set_fault_inject_windows_impersonation_early_panic(inject: bool) {
+        FAULT_INJECT_WINDOWS_IMPERSONATION_EARLY_PANIC.with(|c| c.set(inject));
+    }
+
+    #[cfg(windows)]
+    struct HandleGuard(*mut std::ffi::c_void);
+    #[cfg(windows)]
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                extern "system" {
+                    fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+                }
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    struct ThreadImpersonationGuard {
+        active: bool,
+    }
+
+    #[cfg(windows)]
+    impl ThreadImpersonationGuard {
+        unsafe fn revert(&mut self) -> std::result::Result<(), String> {
+            if !self.active {
+                return Ok(());
+            }
+            extern "system" {
+                fn RevertToSelf() -> i32;
+                fn GetCurrentThread() -> *mut std::ffi::c_void;
+                fn OpenThreadToken(
+                    ThreadHandle: *mut std::ffi::c_void,
+                    DesiredAccess: u32,
+                    OpenAsSelf: i32,
+                    TokenHandle: *mut *mut std::ffi::c_void,
+                ) -> i32;
+                fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+                fn GetLastError() -> u32;
+            }
+
+            if RevertToSelf() == 0 {
+                let err = GetLastError();
+                return Err(format!("RevertToSelf failed with Win32 error {}", err));
+            }
+            self.active = false;
+
+            const TOKEN_QUERY: u32 = 0x0008;
+            const ERROR_NO_TOKEN: u32 = 1008;
+            let mut check_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+            if OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut check_tok) != 0 {
+                CloseHandle(check_tok);
+                panic!("FATAL: Thread still has active impersonation token after RevertToSelf");
+            }
+            let thread_err = GetLastError();
+            if thread_err != ERROR_NO_TOKEN {
+                panic!(
+                    "FATAL: OpenThreadToken returned unexpected error {} after RevertToSelf; expected ERROR_NO_TOKEN (1008)",
+                    thread_err
+                );
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for ThreadImpersonationGuard {
+        fn drop(&mut self) {
+            if self.active {
+                extern "system" {
+                    fn RevertToSelf() -> i32;
+                    fn GetCurrentThread() -> *mut std::ffi::c_void;
+                    fn OpenThreadToken(
+                        ThreadHandle: *mut std::ffi::c_void,
+                        DesiredAccess: u32,
+                        OpenAsSelf: i32,
+                        TokenHandle: *mut *mut std::ffi::c_void,
+                    ) -> i32;
+                    fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+                    fn GetLastError() -> u32;
+                }
+                unsafe {
+                    if RevertToSelf() == 0 {
+                        let err = GetLastError();
+                        panic!(
+                            "FATAL: Emergency RevertToSelf failed in ThreadImpersonationGuard with Win32 error {}",
+                            err
+                        );
+                    }
+                    self.active = false;
+                    const TOKEN_QUERY: u32 = 0x0008;
+                    const ERROR_NO_TOKEN: u32 = 1008;
+                    let mut check_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+                    if OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut check_tok) != 0 {
+                        CloseHandle(check_tok);
+                        panic!(
+                            "FATAL: Thread still has active impersonation token after emergency RevertToSelf"
+                        );
+                    }
+                    let thread_err = GetLastError();
+                    if thread_err != ERROR_NO_TOKEN {
+                        panic!(
+                            "FATAL: OpenThreadToken returned unexpected error {} after emergency RevertToSelf; expected ERROR_NO_TOKEN (1008)",
+                            thread_err
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[repr(C)]
+    #[allow(clippy::upper_case_acronyms)]
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    struct LUID {
+        low_part: u32,
+        high_part: i32,
+    }
+
+    #[cfg(windows)]
+    #[repr(C)]
+    #[allow(clippy::upper_case_acronyms)]
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    struct LUID_AND_ATTRIBUTES {
+        luid: LUID,
+        attributes: u32,
+    }
+
+    #[cfg(windows)]
+    unsafe fn query_token_privileges(
+        token: *mut std::ffi::c_void,
+    ) -> std::result::Result<Vec<LUID_AND_ATTRIBUTES>, String> {
+        #[allow(non_upper_case_globals)]
+        const TokenPrivileges: u32 = 3;
+
+        extern "system" {
+            fn GetTokenInformation(
+                TokenHandle: *mut std::ffi::c_void,
+                TokenInformationClass: u32,
+                TokenInformation: *mut std::ffi::c_void,
+                TokenInformationLength: u32,
+                ReturnLength: *mut u32,
+            ) -> i32;
+            fn GetLastError() -> u32;
+        }
+
+        // 1. Query required buffer size and validate size
+        let mut req_len = 0u32;
+        GetTokenInformation(
+            token,
+            TokenPrivileges,
+            std::ptr::null_mut(),
+            0,
+            &mut req_len,
+        );
+        let min_required = std::mem::size_of::<u32>();
+        if (req_len as usize) < min_required {
+            return Err(format!(
+                "GetTokenInformation(TokenPrivileges) returned invalid required size: {} bytes (minimum required header is {} bytes)",
+                req_len, min_required
+            ));
+        }
+
+        // 2. Allocate explicitly aligned buffer using Vec<u64> (8-byte alignment, exceeding 4-byte LUID_AND_ATTRIBUTES requirement)
+        let num_u64 = (req_len as usize).div_ceil(8);
+        let mut priv_buf: Vec<u64> = vec![0u64; num_u64];
+        let buf_capacity_bytes = num_u64 * std::mem::size_of::<u64>();
+        if buf_capacity_bytes < req_len as usize {
+            return Err("Allocated buffer capacity does not cover required size".to_string());
+        }
+
+        let mut actual_len = 0u32;
+        if GetTokenInformation(
+            token,
+            TokenPrivileges,
+            priv_buf.as_mut_ptr() as *mut std::ffi::c_void,
+            buf_capacity_bytes as u32,
+            &mut actual_len,
+        ) == 0
+        {
+            let err = GetLastError();
+            return Err(format!(
+                "GetTokenInformation(TokenPrivileges) failed with Win32 error {}",
+                err
+            ));
+        }
+
+        if (actual_len as usize) < min_required {
+            return Err(format!(
+                "GetTokenInformation returned actual length {} less than minimum header {}",
+                actual_len, min_required
+            ));
+        }
+
+        // 3. Validate privilege count fits within the actual allocated and returned length
+        let priv_count = *(priv_buf.as_ptr() as *const u32) as usize;
+        let entry_size = std::mem::size_of::<LUID_AND_ATTRIBUTES>();
+        let entry_align = std::mem::align_of::<LUID_AND_ATTRIBUTES>();
+
+        let required_bytes = priv_count
+            .checked_mul(entry_size)
+            .and_then(|entries_len| min_required.checked_add(entries_len))
+            .ok_or_else(|| "Privilege buffer length calculation overflowed".to_string())?;
+
+        if required_bytes > (actual_len as usize) {
+            return Err(format!(
+                "Privilege count {} requires {} bytes, but returned buffer contains only {} bytes",
+                priv_count, required_bytes, actual_len
+            ));
+        }
+
+        // 4. Validate each entry is read from a properly aligned address within bounds
+        let base_ptr = priv_buf.as_ptr() as *const u8;
+        let mut privileges = Vec::with_capacity(priv_count);
+
+        for i in 0..priv_count {
+            let offset = min_required + i * entry_size;
+            // Bounds check: ensure entry does not exceed actual returned length or buffer capacity
+            if offset + entry_size > (actual_len as usize)
+                || offset + entry_size > buf_capacity_bytes
+            {
+                return Err(format!(
+                    "Privilege entry {} range [{}..{}] exceeds validated buffer bounds (actual_len={}, capacity={})",
+                    i, offset, offset + entry_size, actual_len, buf_capacity_bytes
+                ));
+            }
+            let entry_ptr = base_ptr.add(offset) as *const LUID_AND_ATTRIBUTES;
+            // Explicit address alignment check
+            let addr = entry_ptr as usize;
+            if !addr.is_multiple_of(entry_align) {
+                return Err(format!(
+                    "Privilege entry {} address {:#x} violates alignment requirement {}",
+                    i, addr, entry_align
+                ));
+            }
+            privileges.push(*entry_ptr);
+        }
+
+        Ok(privileges)
+    }
+
+    #[cfg(windows)]
     unsafe fn set_directory_owner_to_token_user(path: &Path) -> std::result::Result<(), String> {
         use std::os::windows::ffi::OsStrExt;
 
@@ -7617,11 +7876,10 @@ mod tests {
         const TOKEN_IMPERSONATION: u32 = 2;
         #[allow(non_upper_case_globals)]
         const TokenUser: u32 = 1;
-        #[allow(non_upper_case_globals)]
-        const TokenPrivileges: u32 = 3;
         const SE_PRIVILEGE_ENABLED: u32 = 0x00000002;
         const ERROR_SUCCESS: u32 = 0;
         const ERROR_NOT_ALL_ASSIGNED: u32 = 1300;
+        const ERROR_NO_TOKEN: u32 = 1008;
 
         extern "system" {
             fn OpenProcessToken(
@@ -7641,7 +7899,6 @@ mod tests {
                 Thread: *mut *mut std::ffi::c_void,
                 Token: *mut std::ffi::c_void,
             ) -> i32;
-            fn RevertToSelf() -> i32;
             fn GetCurrentThread() -> *mut std::ffi::c_void;
             fn OpenThreadToken(
                 ThreadHandle: *mut std::ffi::c_void,
@@ -7684,28 +7941,28 @@ mod tests {
             fn GetLastError() -> u32;
         }
 
-        struct HandleGuard(*mut std::ffi::c_void);
-        impl Drop for HandleGuard {
-            fn drop(&mut self) {
-                if !self.0.is_null() {
-                    unsafe {
-                        CloseHandle(self.0);
-                    }
-                }
-            }
+        // Requirement A: Query the current thread's impersonation token using OpenThreadToken.
+        // If the thread is already impersonating, reject before making any security-context changes.
+        let mut pre_existing_thread_token: *mut std::ffi::c_void = std::ptr::null_mut();
+        if OpenThreadToken(
+            GetCurrentThread(),
+            TOKEN_QUERY,
+            1,
+            &mut pre_existing_thread_token,
+        ) != 0
+        {
+            CloseHandle(pre_existing_thread_token);
+            return Err(
+                "Thread is already impersonating an existing security context; rejecting operation to protect existing context without overwriting or discarding it"
+                    .to_string(),
+            );
         }
-
-        struct ThreadImpersonationGuard {
-            active: bool,
-        }
-        impl Drop for ThreadImpersonationGuard {
-            fn drop(&mut self) {
-                if self.active {
-                    unsafe {
-                        RevertToSelf();
-                    }
-                }
-            }
+        let initial_thread_err = GetLastError();
+        if initial_thread_err != ERROR_NO_TOKEN {
+            return Err(format!(
+                "Initial OpenThreadToken check failed with unexpected Win32 error {}; expected ERROR_NO_TOKEN (1008)",
+                initial_thread_err
+            ));
         }
 
         // 1. Open process token with minimum required access (TOKEN_QUERY | TOKEN_DUPLICATE)
@@ -7755,52 +8012,8 @@ mod tests {
         let token_user = &*(user_buf.0.as_ptr() as *const TOKEN_USER);
         let p_token_user_sid = token_user.User.Sid;
 
-        // Query privileges present in the process token
-        #[repr(C)]
-        #[allow(clippy::upper_case_acronyms)]
-        struct LUID {
-            low_part: u32,
-            high_part: i32,
-        }
-        #[repr(C)]
-        #[allow(clippy::upper_case_acronyms)]
-        struct LUID_AND_ATTRIBUTES {
-            luid: LUID,
-            attributes: u32,
-        }
-        #[repr(C)]
-        #[allow(clippy::upper_case_acronyms)]
-        struct TOKEN_PRIVILEGES {
-            privilege_count: u32,
-            privileges: [LUID_AND_ATTRIBUTES; 1],
-        }
-
-        let mut priv_len = 0u32;
-        GetTokenInformation(
-            proc_token,
-            TokenPrivileges,
-            std::ptr::null_mut(),
-            0,
-            &mut priv_len,
-        );
-        let mut priv_buf = vec![0u8; priv_len as usize];
-        if GetTokenInformation(
-            proc_token,
-            TokenPrivileges,
-            priv_buf.as_mut_ptr() as *mut _,
-            priv_len,
-            &mut priv_len,
-        ) == 0
-        {
-            let err = GetLastError();
-            return Err(format!(
-                "GetTokenInformation(TokenPrivileges) failed with Win32 error {}",
-                err
-            ));
-        }
-        let priv_count = *(priv_buf.as_ptr() as *const u32);
-        let priv_entries =
-            priv_buf.as_ptr().add(std::mem::size_of::<u32>()) as *const LUID_AND_ATTRIBUTES;
+        // Requirement C: Query privileges present in the process token using aligned parsing
+        let present_privileges = query_token_privileges(proc_token)?;
 
         // 2. Duplicate process token into thread impersonation token with TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES | TOKEN_IMPERSONATE
         let mut imp_token: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -7819,6 +8032,13 @@ mod tests {
         let _imp_guard = HandleGuard(imp_token);
 
         // 3. Enable only privileges required and actually present in the token on the duplicated token
+        #[repr(C)]
+        #[allow(clippy::upper_case_acronyms)]
+        struct TOKEN_PRIVILEGES {
+            privilege_count: u32,
+            privileges: [LUID_AND_ATTRIBUTES; 1],
+        }
+
         for priv_name in &["SeRestorePrivilege", "SeTakeOwnershipPrivilege"] {
             let wide_name: Vec<u16> = priv_name.encode_utf16().chain(Some(0)).collect();
             let mut luid = LUID {
@@ -7839,8 +8059,7 @@ mod tests {
             }
 
             let mut is_present = false;
-            for i in 0..priv_count {
-                let entry = &*priv_entries.add(i as usize);
+            for entry in &present_privileges {
                 if entry.luid.low_part == luid.low_part && entry.luid.high_part == luid.high_part {
                     is_present = true;
                     break;
@@ -7893,6 +8112,14 @@ mod tests {
         }
         let mut impersonation_guard = ThreadImpersonationGuard { active: true };
 
+        // Test fault injection hooks for verifying emergency cleanup in Drop
+        if FAULT_INJECT_WINDOWS_IMPERSONATION_EARLY_RETURN_ERR.with(|c| c.get()) {
+            return Err("Fault injection: simulated early error while impersonating".to_string());
+        }
+        if FAULT_INJECT_WINDOWS_IMPERSONATION_EARLY_PANIC.with(|c| c.get()) {
+            panic!("Fault injection: simulated panic while impersonating");
+        }
+
         // 5. Call SetNamedSecurityInfoW under thread impersonation context
         let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         let set_res = SetNamedSecurityInfoW(
@@ -7906,28 +8133,7 @@ mod tests {
         );
 
         // 6. Explicitly revert thread impersonation and verify success
-        if RevertToSelf() == 0 {
-            let err = GetLastError();
-            return Err(format!("RevertToSelf failed with Win32 error {}", err));
-        }
-        impersonation_guard.active = false;
-
-        // Verify that thread impersonation has been cleanly removed and thread has reverted to process context
-        const ERROR_NO_TOKEN: u32 = 1008;
-        let mut check_tok: *mut std::ffi::c_void = std::ptr::null_mut();
-        if OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut check_tok) != 0 {
-            CloseHandle(check_tok);
-            return Err(
-                "Thread still has an active impersonation token after RevertToSelf".to_string(),
-            );
-        }
-        let thread_err = GetLastError();
-        if thread_err != ERROR_NO_TOKEN {
-            return Err(format!(
-                "OpenThreadToken returned unexpected error {}; expected ERROR_NO_TOKEN (1008)",
-                thread_err
-            ));
-        }
+        impersonation_guard.revert()?;
 
         // 7. Verify SetNamedSecurityInfoW result
         if set_res != 0 {
@@ -8587,8 +8793,6 @@ mod tests {
     #[cfg(windows)]
     unsafe fn get_process_token_privileges() -> std::result::Result<Vec<(u32, i32, u32)>, String> {
         const TOKEN_QUERY: u32 = 0x0008;
-        #[allow(non_upper_case_globals)]
-        const TokenPrivileges: u32 = 3;
 
         extern "system" {
             fn OpenProcessToken(
@@ -8596,29 +8800,8 @@ mod tests {
                 DesiredAccess: u32,
                 TokenHandle: *mut *mut std::ffi::c_void,
             ) -> i32;
-            fn GetTokenInformation(
-                TokenHandle: *mut std::ffi::c_void,
-                TokenInformationClass: u32,
-                TokenInformation: *mut std::ffi::c_void,
-                TokenInformationLength: u32,
-                ReturnLength: *mut u32,
-            ) -> i32;
-            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
             fn GetCurrentProcess() -> *mut std::ffi::c_void;
             fn GetLastError() -> u32;
-        }
-
-        #[repr(C)]
-        #[allow(clippy::upper_case_acronyms)]
-        struct LUID {
-            low_part: u32,
-            high_part: i32,
-        }
-        #[repr(C)]
-        #[allow(clippy::upper_case_acronyms)]
-        struct LUID_AND_ATTRIBUTES {
-            luid: LUID,
-            attributes: u32,
         }
 
         let mut token: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -8628,33 +8811,13 @@ mod tests {
                 GetLastError()
             ));
         }
+        let _guard = HandleGuard(token);
 
-        let mut len = 0u32;
-        GetTokenInformation(token, TokenPrivileges, std::ptr::null_mut(), 0, &mut len);
-        let mut buf = vec![0u8; len as usize];
-        if GetTokenInformation(
-            token,
-            TokenPrivileges,
-            buf.as_mut_ptr() as *mut _,
-            len,
-            &mut len,
-        ) == 0
-        {
-            CloseHandle(token);
-            return Err(format!(
-                "GetTokenInformation(TokenPrivileges) failed with Win32 error {}",
-                GetLastError()
-            ));
-        }
-        CloseHandle(token);
-
-        let count = *(buf.as_ptr() as *const u32);
-        let entries = buf.as_ptr().add(std::mem::size_of::<u32>()) as *const LUID_AND_ATTRIBUTES;
-        let mut privs = Vec::with_capacity(count as usize);
-        for i in 0..count {
-            let entry = &*entries.add(i as usize);
-            privs.push((entry.luid.low_part, entry.luid.high_part, entry.attributes));
-        }
+        let privileges = query_token_privileges(token)?;
+        let mut privs: Vec<(u32, i32, u32)> = privileges
+            .into_iter()
+            .map(|p| (p.luid.low_part, p.luid.high_part, p.attributes))
+            .collect();
         privs.sort_by_key(|p| (p.0, p.1));
         Ok(privs)
     }
@@ -8745,6 +8908,213 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_set_directory_owner_rejects_existing_thread_impersonation() {
+        const TOKEN_QUERY: u32 = 0x0008;
+        const TOKEN_DUPLICATE: u32 = 0x0002;
+        const TOKEN_IMPERSONATE: u32 = 0x0004;
+        const SECURITY_IMPERSONATION: u32 = 2;
+        const TOKEN_IMPERSONATION: u32 = 2;
+
+        extern "system" {
+            fn OpenProcessToken(
+                ProcessHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn DuplicateTokenEx(
+                hExistingToken: *mut std::ffi::c_void,
+                dwDesiredAccess: u32,
+                lpTokenAttributes: *mut std::ffi::c_void,
+                ImpersonationLevel: u32,
+                TokenType: u32,
+                phNewToken: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn SetThreadToken(
+                Thread: *mut *mut std::ffi::c_void,
+                Token: *mut std::ffi::c_void,
+            ) -> i32;
+            fn RevertToSelf() -> i32;
+            fn GetCurrentThread() -> *mut std::ffi::c_void;
+            fn OpenThreadToken(
+                ThreadHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                OpenAsSelf: i32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        }
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_existing_impersonation_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Verify thread is initially clean (process context)
+        unsafe {
+            assert_thread_not_impersonating();
+        }
+
+        // 2. Create an impersonation token and install it on the current thread
+        let mut proc_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+        let open_res = unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_DUPLICATE,
+                &mut proc_tok,
+            )
+        };
+        assert_ne!(open_res, 0);
+        let _proc_guard = HandleGuard(proc_tok);
+
+        let mut pre_imp_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+        let dup_res = unsafe {
+            DuplicateTokenEx(
+                proc_tok,
+                TOKEN_QUERY | TOKEN_IMPERSONATE,
+                std::ptr::null_mut(),
+                SECURITY_IMPERSONATION,
+                TOKEN_IMPERSONATION,
+                &mut pre_imp_tok,
+            )
+        };
+        assert_ne!(dup_res, 0);
+        let _imp_guard = HandleGuard(pre_imp_tok);
+
+        let set_res = unsafe { SetThreadToken(std::ptr::null_mut(), pre_imp_tok) };
+        assert_ne!(set_res, 0);
+
+        // Verify thread is now actively impersonating
+        let mut active_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+        let check_res =
+            unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut active_tok) };
+        assert_ne!(check_res, 0, "Thread must be actively impersonating");
+        let _active_guard = HandleGuard(active_tok);
+
+        // 3. Call set_directory_owner_to_token_user: must REJECT because thread is already impersonating
+        let res = unsafe { set_directory_owner_to_token_user(&temp_dir) };
+        assert!(
+            res.is_err(),
+            "Operation must reject when thread is already impersonating"
+        );
+        let err = res.err().unwrap();
+        assert!(
+            err.contains("already impersonating"),
+            "Error must indicate rejection due to existing thread impersonation: {}",
+            err
+        );
+
+        // 4. Verify thread security context was NOT silently replaced or removed: thread must STILL be impersonating
+        let mut still_active_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+        let still_active =
+            unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut still_active_tok) };
+        assert_ne!(
+            still_active, 0,
+            "Thread impersonation context must remain preserved and NOT discarded by RevertToSelf"
+        );
+        let _still_guard = HandleGuard(still_active_tok);
+
+        // Clean up thread impersonation back to process context
+        let revert_res = unsafe { RevertToSelf() };
+        assert_ne!(revert_res, 0);
+        unsafe {
+            assert_thread_not_impersonating();
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_impersonation_emergency_cleanup_on_early_exit_and_panic() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_cleanup_recovery_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Initial check: thread is in process context
+        unsafe {
+            assert_thread_not_impersonating();
+        }
+
+        // Scenario 1: Early exit / error return after installing impersonation
+        set_fault_inject_windows_impersonation_early_return_err(true);
+        let err_res = unsafe { set_directory_owner_to_token_user(&temp_dir) };
+        set_fault_inject_windows_impersonation_early_return_err(false);
+
+        assert!(
+            err_res.is_err(),
+            "Expected early error return from fault injection"
+        );
+        let err_msg = err_res.err().unwrap();
+        assert!(
+            err_msg.contains("simulated early error while impersonating"),
+            "Unexpected error: {}",
+            err_msg
+        );
+        // Verify ThreadImpersonationGuard::drop restored ordinary process context
+        unsafe {
+            assert_thread_not_impersonating();
+        }
+
+        // Scenario 2: Panic unwinding after installing impersonation
+        set_fault_inject_windows_impersonation_early_panic(true);
+        let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            let _ = set_directory_owner_to_token_user(&temp_dir);
+        }));
+        set_fault_inject_windows_impersonation_early_panic(false);
+
+        assert!(panic_res.is_err(), "Expected panic during fault injection");
+        // Verify ThreadImpersonationGuard::drop restored ordinary process context during unwind
+        unsafe {
+            assert_thread_not_impersonating();
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_token_privileges_aligned_parsing_and_bounds_validation() {
+        const TOKEN_QUERY: u32 = 0x0008;
+
+        extern "system" {
+            fn OpenProcessToken(
+                ProcessHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        }
+
+        let mut token: *mut std::ffi::c_void = std::ptr::null_mut();
+        let open_res = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+        assert_ne!(open_res, 0);
+        let _guard = HandleGuard(token);
+
+        // Verify successful parsing of process token privileges with explicit 8-byte aligned buffer
+        let privs = unsafe { query_token_privileges(token) }
+            .expect("query_token_privileges must succeed on valid process token");
+        assert!(
+            !privs.is_empty(),
+            "Process token must contain at least one privilege entry"
+        );
+
+        // Verify entry alignment
+        for (i, entry) in privs.iter().enumerate() {
+            let addr = entry as *const _ as usize;
+            assert!(
+                addr.is_multiple_of(std::mem::align_of::<LUID_AND_ATTRIBUTES>()),
+                "Entry {} at {:#x} must be naturally aligned",
+                i,
+                addr
+            );
+        }
     }
 
     #[test]
