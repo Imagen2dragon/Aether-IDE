@@ -7609,10 +7609,19 @@ mod tests {
 
         const SE_FILE_OBJECT: u32 = 1;
         const OWNER_SECURITY_INFORMATION: u32 = 0x00000001;
+        const TOKEN_DUPLICATE: u32 = 0x0002;
+        const TOKEN_IMPERSONATE: u32 = 0x0004;
         const TOKEN_QUERY: u32 = 0x0008;
         const TOKEN_ADJUST_PRIVILEGES: u32 = 0x0020;
+        const SECURITY_IMPERSONATION: u32 = 2;
+        const TOKEN_IMPERSONATION: u32 = 2;
         #[allow(non_upper_case_globals)]
         const TokenUser: u32 = 1;
+        #[allow(non_upper_case_globals)]
+        const TokenPrivileges: u32 = 3;
+        const SE_PRIVILEGE_ENABLED: u32 = 0x00000002;
+        const ERROR_SUCCESS: u32 = 0;
+        const ERROR_NOT_ALL_ASSIGNED: u32 = 1300;
 
         extern "system" {
             fn OpenProcessToken(
@@ -7620,6 +7629,27 @@ mod tests {
                 DesiredAccess: u32,
                 TokenHandle: *mut *mut std::ffi::c_void,
             ) -> i32;
+            fn DuplicateTokenEx(
+                hExistingToken: *mut std::ffi::c_void,
+                dwDesiredAccess: u32,
+                lpTokenAttributes: *mut std::ffi::c_void,
+                ImpersonationLevel: u32,
+                TokenType: u32,
+                phNewToken: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn SetThreadToken(
+                Thread: *mut *mut std::ffi::c_void,
+                Token: *mut std::ffi::c_void,
+            ) -> i32;
+            fn RevertToSelf() -> i32;
+            fn GetCurrentThread() -> *mut std::ffi::c_void;
+            fn OpenThreadToken(
+                ThreadHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                OpenAsSelf: i32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn SetLastError(dwErrCode: u32);
             fn GetTokenInformation(
                 TokenHandle: *mut std::ffi::c_void,
                 TokenInformationClass: u32,
@@ -7654,23 +7684,78 @@ mod tests {
             fn GetLastError() -> u32;
         }
 
-        let mut token: *mut std::ffi::c_void = std::ptr::null_mut();
-        if OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
-            &mut token,
-        ) == 0
-        {
-            // Fallback to TOKEN_QUERY if adjust privileges is denied
-            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-                return Err(format!(
-                    "OpenProcessToken failed with Win32 error {}",
-                    GetLastError()
-                ));
+        struct HandleGuard(*mut std::ffi::c_void);
+        impl Drop for HandleGuard {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        CloseHandle(self.0);
+                    }
+                }
             }
         }
 
-        // Attempt to enable SeRestorePrivilege and SeTakeOwnershipPrivilege if available in token
+        struct ThreadImpersonationGuard {
+            active: bool,
+        }
+        impl Drop for ThreadImpersonationGuard {
+            fn drop(&mut self) {
+                if self.active {
+                    unsafe {
+                        RevertToSelf();
+                    }
+                }
+            }
+        }
+
+        // 1. Open process token with minimum required access (TOKEN_QUERY | TOKEN_DUPLICATE)
+        let mut proc_token: *mut std::ffi::c_void = std::ptr::null_mut();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_DUPLICATE,
+            &mut proc_token,
+        ) == 0
+        {
+            let err = GetLastError();
+            return Err(format!("OpenProcessToken failed with Win32 error {}", err));
+        }
+        let _proc_guard = HandleGuard(proc_token);
+
+        // Query the process token's individual TokenUser SID
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct SID_AND_ATTRIBUTES {
+            Sid: *mut std::ffi::c_void,
+            Attributes: u32,
+        }
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct TOKEN_USER {
+            User: SID_AND_ATTRIBUTES,
+        }
+
+        #[repr(align(8))]
+        struct AlignedBuffer([u8; 512]);
+        let mut user_buf = AlignedBuffer([0u8; 512]);
+        let mut ret_len = 0u32;
+        if GetTokenInformation(
+            proc_token,
+            TokenUser,
+            user_buf.0.as_mut_ptr() as *mut _,
+            user_buf.0.len() as u32,
+            &mut ret_len,
+        ) == 0
+        {
+            let err = GetLastError();
+            return Err(format!(
+                "GetTokenInformation(TokenUser) failed with Win32 error {}",
+                err
+            ));
+        }
+        let token_user = &*(user_buf.0.as_ptr() as *const TOKEN_USER);
+        let p_token_user_sid = token_user.User.Sid;
+
+        // Query privileges present in the process token
         #[repr(C)]
         #[allow(clippy::upper_case_acronyms)]
         struct LUID {
@@ -7689,8 +7774,51 @@ mod tests {
             privilege_count: u32,
             privileges: [LUID_AND_ATTRIBUTES; 1],
         }
-        const SE_PRIVILEGE_ENABLED: u32 = 0x00000002;
 
+        let mut priv_len = 0u32;
+        GetTokenInformation(
+            proc_token,
+            TokenPrivileges,
+            std::ptr::null_mut(),
+            0,
+            &mut priv_len,
+        );
+        let mut priv_buf = vec![0u8; priv_len as usize];
+        if GetTokenInformation(
+            proc_token,
+            TokenPrivileges,
+            priv_buf.as_mut_ptr() as *mut _,
+            priv_len,
+            &mut priv_len,
+        ) == 0
+        {
+            let err = GetLastError();
+            return Err(format!(
+                "GetTokenInformation(TokenPrivileges) failed with Win32 error {}",
+                err
+            ));
+        }
+        let priv_count = *(priv_buf.as_ptr() as *const u32);
+        let priv_entries =
+            priv_buf.as_ptr().add(std::mem::size_of::<u32>()) as *const LUID_AND_ATTRIBUTES;
+
+        // 2. Duplicate process token into thread impersonation token with TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES | TOKEN_IMPERSONATE
+        let mut imp_token: *mut std::ffi::c_void = std::ptr::null_mut();
+        if DuplicateTokenEx(
+            proc_token,
+            TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES | TOKEN_IMPERSONATE,
+            std::ptr::null_mut(),
+            SECURITY_IMPERSONATION,
+            TOKEN_IMPERSONATION,
+            &mut imp_token,
+        ) == 0
+        {
+            let err = GetLastError();
+            return Err(format!("DuplicateTokenEx failed with Win32 error {}", err));
+        }
+        let _imp_guard = HandleGuard(imp_token);
+
+        // 3. Enable only privileges required and actually present in the token on the duplicated token
         for priv_name in &["SeRestorePrivilege", "SeTakeOwnershipPrivilege"] {
             let wide_name: Vec<u16> = priv_name.encode_utf16().chain(Some(0)).collect();
             let mut luid = LUID {
@@ -7701,8 +7829,25 @@ mod tests {
                 std::ptr::null(),
                 wide_name.as_ptr(),
                 &mut luid as *mut _ as *mut _,
-            ) != 0
+            ) == 0
             {
+                let err = GetLastError();
+                return Err(format!(
+                    "LookupPrivilegeValueW({}) failed with Win32 error {}",
+                    priv_name, err
+                ));
+            }
+
+            let mut is_present = false;
+            for i in 0..priv_count {
+                let entry = &*priv_entries.add(i as usize);
+                if entry.luid.low_part == luid.low_part && entry.luid.high_part == luid.high_part {
+                    is_present = true;
+                    break;
+                }
+            }
+
+            if is_present {
                 let mut tp = TOKEN_PRIVILEGES {
                     privilege_count: 1,
                     privileges: [LUID_AND_ATTRIBUTES {
@@ -7710,50 +7855,45 @@ mod tests {
                         attributes: SE_PRIVILEGE_ENABLED,
                     }],
                 };
-                AdjustTokenPrivileges(
-                    token,
+                SetLastError(0);
+                let adj_res = AdjustTokenPrivileges(
+                    imp_token,
                     0,
                     &mut tp as *mut _ as *mut _,
                     std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                 );
+                let adj_err = GetLastError();
+                if adj_res == 0 {
+                    return Err(format!(
+                        "AdjustTokenPrivileges({}) failed with Win32 error {}",
+                        priv_name, adj_err
+                    ));
+                }
+                if adj_err == ERROR_NOT_ALL_ASSIGNED {
+                    return Err(format!(
+                        "AdjustTokenPrivileges({}) failed: ERROR_NOT_ALL_ASSIGNED (1300)",
+                        priv_name
+                    ));
+                }
+                if adj_err != ERROR_SUCCESS {
+                    return Err(format!(
+                        "AdjustTokenPrivileges({}) returned unexpected error {}",
+                        priv_name, adj_err
+                    ));
+                }
             }
         }
 
-        #[repr(C)]
-        #[allow(non_snake_case)]
-        struct SID_AND_ATTRIBUTES {
-            Sid: *mut std::ffi::c_void,
-            Attributes: u32,
+        // 4. Apply duplicated impersonation token to the current thread
+        if SetThreadToken(std::ptr::null_mut(), imp_token) == 0 {
+            let err = GetLastError();
+            return Err(format!("SetThreadToken failed with Win32 error {}", err));
         }
-        #[repr(C)]
-        #[allow(non_snake_case)]
-        struct TOKEN_USER {
-            User: SID_AND_ATTRIBUTES,
-        }
+        let mut impersonation_guard = ThreadImpersonationGuard { active: true };
 
-        #[repr(align(8))]
-        struct AlignedBuffer([u8; 512]);
-        let mut user_buf = AlignedBuffer([0u8; 512]);
-        let mut ret_len = 0u32;
-        if GetTokenInformation(
-            token,
-            TokenUser,
-            user_buf.0.as_mut_ptr() as *mut _,
-            user_buf.0.len() as u32,
-            &mut ret_len,
-        ) == 0
-        {
-            CloseHandle(token);
-            return Err(format!(
-                "GetTokenInformation(TokenUser) failed with Win32 error {}",
-                GetLastError()
-            ));
-        }
-        let token_user = &*(user_buf.0.as_ptr() as *const TOKEN_USER);
-        let p_token_user_sid = token_user.User.Sid;
-
+        // 5. Call SetNamedSecurityInfoW under thread impersonation context
         let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         let set_res = SetNamedSecurityInfoW(
             wide_path.as_ptr(),
@@ -7765,8 +7905,31 @@ mod tests {
             std::ptr::null_mut(),
         );
 
-        CloseHandle(token);
+        // 6. Explicitly revert thread impersonation and verify success
+        if RevertToSelf() == 0 {
+            let err = GetLastError();
+            return Err(format!("RevertToSelf failed with Win32 error {}", err));
+        }
+        impersonation_guard.active = false;
 
+        // Verify that thread impersonation has been cleanly removed and thread has reverted to process context
+        const ERROR_NO_TOKEN: u32 = 1008;
+        let mut check_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+        if OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut check_tok) != 0 {
+            CloseHandle(check_tok);
+            return Err(
+                "Thread still has an active impersonation token after RevertToSelf".to_string(),
+            );
+        }
+        let thread_err = GetLastError();
+        if thread_err != ERROR_NO_TOKEN {
+            return Err(format!(
+                "OpenThreadToken returned unexpected error {}; expected ERROR_NO_TOKEN (1008)",
+                thread_err
+            ));
+        }
+
+        // 7. Verify SetNamedSecurityInfoW result
         if set_res != 0 {
             return Err(format!(
                 "SetNamedSecurityInfoW(OWNER_SECURITY_INFORMATION) failed with Win32 error {}",
@@ -8416,6 +8579,169 @@ mod tests {
             res.is_ok(),
             "Authorized elevated Administrators-owned parent must be accepted: {:?}",
             res
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[cfg(windows)]
+    unsafe fn get_process_token_privileges() -> std::result::Result<Vec<(u32, i32, u32)>, String> {
+        const TOKEN_QUERY: u32 = 0x0008;
+        #[allow(non_upper_case_globals)]
+        const TokenPrivileges: u32 = 3;
+
+        extern "system" {
+            fn OpenProcessToken(
+                ProcessHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn GetTokenInformation(
+                TokenHandle: *mut std::ffi::c_void,
+                TokenInformationClass: u32,
+                TokenInformation: *mut std::ffi::c_void,
+                TokenInformationLength: u32,
+                ReturnLength: *mut u32,
+            ) -> i32;
+            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn GetLastError() -> u32;
+        }
+
+        #[repr(C)]
+        #[allow(clippy::upper_case_acronyms)]
+        struct LUID {
+            low_part: u32,
+            high_part: i32,
+        }
+        #[repr(C)]
+        #[allow(clippy::upper_case_acronyms)]
+        struct LUID_AND_ATTRIBUTES {
+            luid: LUID,
+            attributes: u32,
+        }
+
+        let mut token: *mut std::ffi::c_void = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(format!(
+                "OpenProcessToken failed with Win32 error {}",
+                GetLastError()
+            ));
+        }
+
+        let mut len = 0u32;
+        GetTokenInformation(token, TokenPrivileges, std::ptr::null_mut(), 0, &mut len);
+        let mut buf = vec![0u8; len as usize];
+        if GetTokenInformation(
+            token,
+            TokenPrivileges,
+            buf.as_mut_ptr() as *mut _,
+            len,
+            &mut len,
+        ) == 0
+        {
+            CloseHandle(token);
+            return Err(format!(
+                "GetTokenInformation(TokenPrivileges) failed with Win32 error {}",
+                GetLastError()
+            ));
+        }
+        CloseHandle(token);
+
+        let count = *(buf.as_ptr() as *const u32);
+        let entries = buf.as_ptr().add(std::mem::size_of::<u32>()) as *const LUID_AND_ATTRIBUTES;
+        let mut privs = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let entry = &*entries.add(i as usize);
+            privs.push((entry.luid.low_part, entry.luid.high_part, entry.attributes));
+        }
+        privs.sort_by_key(|p| (p.0, p.1));
+        Ok(privs)
+    }
+
+    #[cfg(windows)]
+    unsafe fn assert_thread_not_impersonating() {
+        const TOKEN_QUERY: u32 = 0x0008;
+        const ERROR_NO_TOKEN: u32 = 1008;
+        extern "system" {
+            fn GetCurrentThread() -> *mut std::ffi::c_void;
+            fn OpenThreadToken(
+                ThreadHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                OpenAsSelf: i32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+            fn GetLastError() -> u32;
+        }
+
+        let mut thread_token: *mut std::ffi::c_void = std::ptr::null_mut();
+        let res = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut thread_token);
+        if res != 0 {
+            CloseHandle(thread_token);
+            panic!("Expected thread NOT to be impersonating, but OpenThreadToken succeeded!");
+        }
+        let err = GetLastError();
+        assert_eq!(
+            err, ERROR_NO_TOKEN,
+            "Expected OpenThreadToken to fail with ERROR_NO_TOKEN (1008), got {}",
+            err
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_token_privilege_isolation_and_thread_impersonation_reversion() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_priv_isolation_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Verify thread is not impersonating before test begins
+        unsafe {
+            assert_thread_not_impersonating();
+        }
+
+        // 2. Query process primary token's privileges before calling set_directory_owner_to_token_user
+        let privs_before = unsafe {
+            get_process_token_privileges().expect("querying process token privileges before")
+        };
+        assert!(
+            !privs_before.is_empty(),
+            "Process token must have privileges"
+        );
+
+        // 3. Call set_directory_owner_to_token_user to set owner to individual TokenUser
+        let set_res = unsafe { set_directory_owner_to_token_user(&temp_dir) };
+        assert!(
+            set_res.is_ok(),
+            "set_directory_owner_to_token_user must succeed: {:?}",
+            set_res.err()
+        );
+
+        // 4. Query process primary token's privileges after calling set_directory_owner_to_token_user
+        let privs_after = unsafe {
+            get_process_token_privileges().expect("querying process token privileges after")
+        };
+
+        // Assert exact privilege equality: process primary token must be completely untouched
+        assert_eq!(
+            privs_before, privs_after,
+            "Process primary token privileges must remain completely untouched after set_directory_owner_to_token_user"
+        );
+
+        // 5. Verify the current thread is not impersonating after the call completes
+        unsafe {
+            assert_thread_not_impersonating();
+        }
+
+        // 6. Verify the directory owner was actually updated to the expected TokenUser SID
+        let (owner_sid, token_user_sid) =
+            unsafe { assert_directory_owner_is_token_user(&temp_dir) };
+        assert_eq!(
+            owner_sid, token_user_sid,
+            "Directory owner SID must match process TokenUser SID"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
