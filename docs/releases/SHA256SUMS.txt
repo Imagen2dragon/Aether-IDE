@@ -1,1 +1,4 @@
-d3de3b7447d6c14ea613f9a4fb54e29223952845d6854804d471297de551742c  AetherIDE-v0.1.0-beta.2-windows-x64-setup.exe
+c7b0ccb4ecd4582bf99bcd4738832d2f3d5c00ef3c81c3608df9db64e4a43fcc  AetherIDE-Setup-0.1.0-beta.3-x64.exe
+aa7c3c2488ad628c7a1c52124a834eaedd0857f38df6ee6cbe31fbd7f0da9b82  AetherIDE-v0.1.0-beta.3-windows-x64.zip
+fd46ccc9fd42455bb1b7775b034182819ba0ca95f85e19c3b2c760eb6064f7e3  AetherIDE-v0.1.0-beta.3-linux-x64.tar.gz
+549bf2bf8133d1c09e135a262e1a9739d53979fa56938912a32a408cf903ecec  AetherIDE-v0.1.0-beta.3-macos-arm64.tar.gz
