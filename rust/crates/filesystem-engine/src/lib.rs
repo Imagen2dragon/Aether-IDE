@@ -7609,6 +7609,16 @@ mod tests {
             const { std::cell::Cell::new(false) };
         static FAULT_INJECT_WINDOWS_IMPERSONATION_EARLY_PANIC: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
+        static FAULT_INJECT_WINDOWS_REVERT_TO_SELF_FAIL: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        static FAULT_INJECT_WINDOWS_POSTCONDITION_ACTIVE_TOKEN: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        static FAULT_INJECT_WINDOWS_POSTCONDITION_UNEXPECTED_ERR: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        static FAULT_INJECT_WINDOWS_EMERGENCY_CLEANUP_FAIL: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        static EMERGENCY_FAIL_STOP_HOOK: std::cell::Cell<Option<fn(&str)>> =
+            const { std::cell::Cell::new(None) };
     }
 
     #[cfg(windows)]
@@ -7619,6 +7629,43 @@ mod tests {
     #[cfg(windows)]
     fn set_fault_inject_windows_impersonation_early_panic(inject: bool) {
         FAULT_INJECT_WINDOWS_IMPERSONATION_EARLY_PANIC.with(|c| c.set(inject));
+    }
+
+    #[cfg(windows)]
+    fn set_fault_inject_windows_revert_to_self_fail(inject: bool) {
+        FAULT_INJECT_WINDOWS_REVERT_TO_SELF_FAIL.with(|c| c.set(inject));
+    }
+
+    #[cfg(windows)]
+    fn set_fault_inject_windows_postcondition_active_token(inject: bool) {
+        FAULT_INJECT_WINDOWS_POSTCONDITION_ACTIVE_TOKEN.with(|c| c.set(inject));
+    }
+
+    #[cfg(windows)]
+    fn set_fault_inject_windows_postcondition_unexpected_err(inject: bool) {
+        FAULT_INJECT_WINDOWS_POSTCONDITION_UNEXPECTED_ERR.with(|c| c.set(inject));
+    }
+
+    #[cfg(windows)]
+    fn set_fault_inject_windows_emergency_cleanup_fail(inject: bool) {
+        FAULT_INJECT_WINDOWS_EMERGENCY_CLEANUP_FAIL.with(|c| c.set(inject));
+    }
+
+    #[cfg(windows)]
+    fn set_emergency_fail_stop_hook(hook: Option<fn(&str)>) {
+        EMERGENCY_FAIL_STOP_HOOK.with(|c| c.set(hook));
+    }
+
+    #[cfg(windows)]
+    fn emergency_cleanup_fail_stop(msg: &str) -> ! {
+        if let Some(hook) = EMERGENCY_FAIL_STOP_HOOK.with(|c| c.get()) {
+            hook(msg);
+        }
+        eprintln!(
+            "FATAL: Thread impersonation emergency cleanup failed: {}",
+            msg
+        );
+        std::process::abort();
     }
 
     #[cfg(windows)]
@@ -7659,28 +7706,59 @@ mod tests {
                 ) -> i32;
                 fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
                 fn GetLastError() -> u32;
+                fn SetLastError(dwErrCode: u32);
             }
 
-            if RevertToSelf() == 0 {
+            // 1. Attempt RevertToSelf
+            let revert_res = if FAULT_INJECT_WINDOWS_REVERT_TO_SELF_FAIL.with(|c| c.get()) {
+                SetLastError(5); // ERROR_ACCESS_DENIED
+                0
+            } else {
+                RevertToSelf()
+            };
+
+            if revert_res == 0 {
                 let err = GetLastError();
+                // Requirement A.1 & A.4: Do NOT disarm guard; active remains true
                 return Err(format!("RevertToSelf failed with Win32 error {}", err));
             }
-            self.active = false;
 
+            // 2. Postcondition verification: OpenThreadToken must fail specifically with ERROR_NO_TOKEN
             const TOKEN_QUERY: u32 = 0x0008;
             const ERROR_NO_TOKEN: u32 = 1008;
             let mut check_tok: *mut std::ffi::c_void = std::ptr::null_mut();
-            if OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut check_tok) != 0 {
-                CloseHandle(check_tok);
-                panic!("FATAL: Thread still has active impersonation token after RevertToSelf");
+
+            if FAULT_INJECT_WINDOWS_POSTCONDITION_ACTIVE_TOKEN.with(|c| c.get()) {
+                // Requirement A.4: Active token detected; do NOT disarm guard
+                return Err("Postcondition verification failed: thread still has active impersonation token after RevertToSelf".to_string());
             }
-            let thread_err = GetLastError();
-            if thread_err != ERROR_NO_TOKEN {
-                panic!(
-                    "FATAL: OpenThreadToken returned unexpected error {} after RevertToSelf; expected ERROR_NO_TOKEN (1008)",
-                    thread_err
+
+            if FAULT_INJECT_WINDOWS_POSTCONDITION_UNEXPECTED_ERR.with(|c| c.get()) {
+                // Requirement A.4: Unexpected error code; do NOT disarm guard
+                return Err(
+                    "Postcondition verification failed: OpenThreadToken returned unexpected error 5; expected ERROR_NO_TOKEN (1008)"
+                        .to_string(),
                 );
             }
+
+            SetLastError(0);
+            if OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut check_tok) != 0 {
+                CloseHandle(check_tok);
+                // Requirement A.4: Active token detected; do NOT disarm guard
+                return Err("Postcondition verification failed: thread still has active impersonation token after RevertToSelf".to_string());
+            }
+
+            let thread_err = GetLastError();
+            if thread_err != ERROR_NO_TOKEN {
+                // Requirement A.4: Unexpected error code; do NOT disarm guard
+                return Err(format!(
+                    "Postcondition verification failed: OpenThreadToken returned unexpected error {}; expected ERROR_NO_TOKEN (1008)",
+                    thread_err
+                ));
+            }
+
+            // Requirement A.3: ONLY disarm the guard after postcondition is confirmed
+            self.active = false;
             Ok(())
         }
     }
@@ -7700,32 +7778,55 @@ mod tests {
                     ) -> i32;
                     fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
                     fn GetLastError() -> u32;
+                    fn SetLastError(dwErrCode: u32);
                 }
                 unsafe {
-                    if RevertToSelf() == 0 {
+                    let emergency_fail =
+                        FAULT_INJECT_WINDOWS_EMERGENCY_CLEANUP_FAIL.with(|c| c.get());
+                    let revert_res = if emergency_fail {
+                        SetLastError(5);
+                        0
+                    } else {
+                        RevertToSelf()
+                    };
+
+                    if revert_res == 0 {
                         let err = GetLastError();
-                        panic!(
-                            "FATAL: Emergency RevertToSelf failed in ThreadImpersonationGuard with Win32 error {}",
+                        // Requirement A.5 & A.6: Follow fail-stop policy; do not silently return control
+                        emergency_cleanup_fail_stop(&format!(
+                            "Emergency RevertToSelf failed in ThreadImpersonationGuard with Win32 error {}",
                             err
-                        );
+                        ));
                     }
-                    self.active = false;
+
                     const TOKEN_QUERY: u32 = 0x0008;
                     const ERROR_NO_TOKEN: u32 = 1008;
                     let mut check_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+
+                    if emergency_fail {
+                        emergency_cleanup_fail_stop(
+                            "Emergency cleanup verification failed: simulated failure in emergency drop",
+                        );
+                    }
+
+                    SetLastError(0);
                     if OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut check_tok) != 0 {
                         CloseHandle(check_tok);
-                        panic!(
-                            "FATAL: Thread still has active impersonation token after emergency RevertToSelf"
+                        emergency_cleanup_fail_stop(
+                            "Emergency cleanup verification failed: thread still has active impersonation token after emergency RevertToSelf",
                         );
                     }
+
                     let thread_err = GetLastError();
                     if thread_err != ERROR_NO_TOKEN {
-                        panic!(
-                            "FATAL: OpenThreadToken returned unexpected error {} after emergency RevertToSelf; expected ERROR_NO_TOKEN (1008)",
+                        emergency_cleanup_fail_stop(&format!(
+                            "Emergency cleanup verification failed: OpenThreadToken returned unexpected error {}; expected ERROR_NO_TOKEN (1008)",
                             thread_err
-                        );
+                        ));
                     }
+
+                    // Only disarm after verification succeeds
+                    self.active = false;
                 }
             }
         }
@@ -7750,6 +7851,150 @@ mod tests {
     }
 
     #[cfg(windows)]
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+    #[cfg(windows)]
+    fn validate_token_privileges_sizing(
+        sizing_ret: i32,
+        last_error: u32,
+        req_len: u32,
+    ) -> std::result::Result<(usize, usize, u32), String> {
+        if sizing_ret != 0 {
+            return Err(
+                "GetTokenInformation sizing query unexpectedly succeeded with a NULL buffer"
+                    .to_string(),
+            );
+        }
+
+        if last_error != ERROR_INSUFFICIENT_BUFFER {
+            return Err(format!(
+                "GetTokenInformation sizing query failed with unexpected Win32 error {}; expected ERROR_INSUFFICIENT_BUFFER (122)",
+                last_error
+            ));
+        }
+
+        let min_required = std::mem::size_of::<u32>();
+        let req_len_usize = usize::try_from(req_len)
+            .map_err(|e| format!("Required buffer length conversion failed: {}", e))?;
+        if req_len_usize < min_required {
+            return Err(format!(
+                "Invalid required buffer length {} less than minimum header size {}",
+                req_len, min_required
+            ));
+        }
+
+        let u64_size = std::mem::size_of::<u64>();
+        let num_u64 = req_len_usize.checked_add(u64_size - 1).ok_or_else(|| {
+            "Required buffer length calculation overflowed during alignment rounding".to_string()
+        })? / u64_size;
+
+        let capacity_bytes = num_u64
+            .checked_mul(u64_size)
+            .ok_or_else(|| "Buffer capacity calculation overflowed".to_string())?;
+
+        if capacity_bytes < req_len_usize {
+            return Err("Calculated buffer capacity does not cover required size".to_string());
+        }
+
+        let capacity_u32 = u32::try_from(capacity_bytes).map_err(|e| {
+            format!(
+                "Buffer capacity {} exceeds u32 range: {}",
+                capacity_bytes, e
+            )
+        })?;
+
+        Ok((num_u64, capacity_bytes, capacity_u32))
+    }
+
+    #[cfg(windows)]
+    unsafe fn parse_token_privileges_buffer(
+        buf_ptr: *const u8,
+        capacity_bytes: usize,
+        actual_len: usize,
+    ) -> std::result::Result<Vec<LUID_AND_ATTRIBUTES>, String> {
+        if buf_ptr.is_null() {
+            return Err("Token privileges buffer pointer is NULL".to_string());
+        }
+
+        if actual_len > capacity_bytes {
+            return Err(format!(
+                "GetTokenInformation returned actual length {} exceeding allocated buffer capacity {}",
+                actual_len, capacity_bytes
+            ));
+        }
+
+        let min_required = std::mem::size_of::<u32>();
+        if actual_len < min_required {
+            return Err(format!(
+                "GetTokenInformation returned actual length {} less than minimum header size {}",
+                actual_len, min_required
+            ));
+        }
+
+        let base_addr = buf_ptr as usize;
+        if !base_addr.is_multiple_of(std::mem::align_of::<u32>()) {
+            return Err(format!(
+                "Buffer pointer {:#x} violates u32 header alignment requirement",
+                base_addr
+            ));
+        }
+
+        let priv_count = *(buf_ptr as *const u32) as usize;
+        let entry_size = std::mem::size_of::<LUID_AND_ATTRIBUTES>();
+        let entry_align = std::mem::align_of::<LUID_AND_ATTRIBUTES>();
+
+        let entries_bytes = priv_count
+            .checked_mul(entry_size)
+            .filter(|&b| b <= (u32::MAX as usize) - min_required)
+            .ok_or_else(|| "Privilege count calculation overflowed multiplication".to_string())?;
+
+        let required_bytes = min_required
+            .checked_add(entries_bytes)
+            .ok_or_else(|| "Privilege buffer length calculation overflowed".to_string())?;
+
+        if required_bytes > actual_len {
+            return Err(format!(
+                "Privilege count {} requires {} bytes, but returned buffer contains only {} bytes",
+                priv_count, required_bytes, actual_len
+            ));
+        }
+
+        let mut privileges = Vec::with_capacity(priv_count);
+        for i in 0..priv_count {
+            let offset = min_required
+                .checked_add(
+                    i.checked_mul(entry_size)
+                        .ok_or_else(|| format!("Offset calculation overflowed for entry {}", i))?,
+                )
+                .ok_or_else(|| format!("Offset calculation overflowed for entry {}", i))?;
+
+            let entry_end = offset
+                .checked_add(entry_size)
+                .ok_or_else(|| format!("Entry end calculation overflowed for entry {}", i))?;
+
+            if entry_end > actual_len || entry_end > capacity_bytes {
+                return Err(format!(
+                    "Privilege entry {} range [{}..{}] exceeds validated buffer bounds (actual_len={}, capacity={})",
+                    i, offset, entry_end, actual_len, capacity_bytes
+                ));
+            }
+
+            let entry_ptr = buf_ptr.add(offset) as *const LUID_AND_ATTRIBUTES;
+            let addr = entry_ptr as usize;
+            if !addr.is_multiple_of(entry_align) {
+                return Err(format!(
+                    "Privilege entry {} address {:#x} violates alignment requirement {}",
+                    i, addr, entry_align
+                ));
+            }
+
+            privileges.push(*entry_ptr);
+        }
+
+        Ok(privileges)
+    }
+
+    #[cfg(windows)]
     unsafe fn query_token_privileges(
         token: *mut std::ffi::c_void,
     ) -> std::result::Result<Vec<LUID_AND_ATTRIBUTES>, String> {
@@ -7765,101 +8010,50 @@ mod tests {
                 ReturnLength: *mut u32,
             ) -> i32;
             fn GetLastError() -> u32;
+            fn SetLastError(dwErrCode: u32);
         }
 
-        // 1. Query required buffer size and validate size
+        SetLastError(0);
         let mut req_len = 0u32;
-        GetTokenInformation(
+        let sizing_ret = GetTokenInformation(
             token,
             TokenPrivileges,
             std::ptr::null_mut(),
             0,
             &mut req_len,
         );
-        let min_required = std::mem::size_of::<u32>();
-        if (req_len as usize) < min_required {
-            return Err(format!(
-                "GetTokenInformation(TokenPrivileges) returned invalid required size: {} bytes (minimum required header is {} bytes)",
-                req_len, min_required
-            ));
-        }
+        let last_err = GetLastError();
 
-        // 2. Allocate explicitly aligned buffer using Vec<u64> (8-byte alignment, exceeding 4-byte LUID_AND_ATTRIBUTES requirement)
-        let num_u64 = (req_len as usize).div_ceil(8);
+        let (num_u64, capacity_bytes, capacity_u32) =
+            validate_token_privileges_sizing(sizing_ret, last_err, req_len)?;
+
         let mut priv_buf: Vec<u64> = vec![0u64; num_u64];
-        let buf_capacity_bytes = num_u64 * std::mem::size_of::<u64>();
-        if buf_capacity_bytes < req_len as usize {
-            return Err("Allocated buffer capacity does not cover required size".to_string());
-        }
 
         let mut actual_len = 0u32;
-        if GetTokenInformation(
+        SetLastError(0);
+        let data_ret = GetTokenInformation(
             token,
             TokenPrivileges,
             priv_buf.as_mut_ptr() as *mut std::ffi::c_void,
-            buf_capacity_bytes as u32,
+            capacity_u32,
             &mut actual_len,
-        ) == 0
-        {
+        );
+        if data_ret == 0 {
             let err = GetLastError();
             return Err(format!(
-                "GetTokenInformation(TokenPrivileges) failed with Win32 error {}",
+                "GetTokenInformation(TokenPrivileges) query failed with Win32 error {}",
                 err
             ));
         }
 
-        if (actual_len as usize) < min_required {
-            return Err(format!(
-                "GetTokenInformation returned actual length {} less than minimum header {}",
-                actual_len, min_required
-            ));
-        }
+        let actual_len_usize = usize::try_from(actual_len)
+            .map_err(|e| format!("Actual returned length conversion failed: {}", e))?;
 
-        // 3. Validate privilege count fits within the actual allocated and returned length
-        let priv_count = *(priv_buf.as_ptr() as *const u32) as usize;
-        let entry_size = std::mem::size_of::<LUID_AND_ATTRIBUTES>();
-        let entry_align = std::mem::align_of::<LUID_AND_ATTRIBUTES>();
-
-        let required_bytes = priv_count
-            .checked_mul(entry_size)
-            .and_then(|entries_len| min_required.checked_add(entries_len))
-            .ok_or_else(|| "Privilege buffer length calculation overflowed".to_string())?;
-
-        if required_bytes > (actual_len as usize) {
-            return Err(format!(
-                "Privilege count {} requires {} bytes, but returned buffer contains only {} bytes",
-                priv_count, required_bytes, actual_len
-            ));
-        }
-
-        // 4. Validate each entry is read from a properly aligned address within bounds
-        let base_ptr = priv_buf.as_ptr() as *const u8;
-        let mut privileges = Vec::with_capacity(priv_count);
-
-        for i in 0..priv_count {
-            let offset = min_required + i * entry_size;
-            // Bounds check: ensure entry does not exceed actual returned length or buffer capacity
-            if offset + entry_size > (actual_len as usize)
-                || offset + entry_size > buf_capacity_bytes
-            {
-                return Err(format!(
-                    "Privilege entry {} range [{}..{}] exceeds validated buffer bounds (actual_len={}, capacity={})",
-                    i, offset, offset + entry_size, actual_len, buf_capacity_bytes
-                ));
-            }
-            let entry_ptr = base_ptr.add(offset) as *const LUID_AND_ATTRIBUTES;
-            // Explicit address alignment check
-            let addr = entry_ptr as usize;
-            if !addr.is_multiple_of(entry_align) {
-                return Err(format!(
-                    "Privilege entry {} address {:#x} violates alignment requirement {}",
-                    i, addr, entry_align
-                ));
-            }
-            privileges.push(*entry_ptr);
-        }
-
-        Ok(privileges)
+        parse_token_privileges_buffer(
+            priv_buf.as_ptr() as *const u8,
+            capacity_bytes,
+            actual_len_usize,
+        )
     }
 
     #[cfg(windows)]
@@ -9115,6 +9309,452 @@ mod tests {
                 addr
             );
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_impersonation_explicit_reversion_succeeds_and_thread_clean() {
+        const TOKEN_QUERY: u32 = 0x0008;
+        const TOKEN_DUPLICATE: u32 = 0x0002;
+        const TOKEN_IMPERSONATE: u32 = 0x0004;
+        const SECURITY_IMPERSONATION: u32 = 2;
+        const TOKEN_IMPERSONATION: u32 = 2;
+
+        extern "system" {
+            fn OpenProcessToken(
+                ProcessHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn DuplicateTokenEx(
+                hExistingToken: *mut std::ffi::c_void,
+                dwDesiredAccess: u32,
+                lpTokenAttributes: *mut std::ffi::c_void,
+                ImpersonationLevel: u32,
+                TokenType: u32,
+                phNewToken: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn SetThreadToken(
+                Thread: *mut *mut std::ffi::c_void,
+                Token: *mut std::ffi::c_void,
+            ) -> i32;
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        }
+
+        unsafe {
+            assert_thread_not_impersonating();
+
+            let mut proc_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+            assert_ne!(
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_QUERY | TOKEN_DUPLICATE,
+                    &mut proc_tok
+                ),
+                0
+            );
+            let _proc_guard = HandleGuard(proc_tok);
+
+            let mut imp_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+            assert_ne!(
+                DuplicateTokenEx(
+                    proc_tok,
+                    TOKEN_QUERY | TOKEN_IMPERSONATE,
+                    std::ptr::null_mut(),
+                    SECURITY_IMPERSONATION,
+                    TOKEN_IMPERSONATION,
+                    &mut imp_tok,
+                ),
+                0
+            );
+            let _imp_guard = HandleGuard(imp_tok);
+
+            assert_ne!(SetThreadToken(std::ptr::null_mut(), imp_tok), 0);
+
+            let mut guard = ThreadImpersonationGuard { active: true };
+            let rev_res = guard.revert();
+            assert!(rev_res.is_ok(), "revert() must succeed: {:?}", rev_res);
+            assert!(
+                !guard.active,
+                "Guard must be disarmed after confirmed reversion"
+            );
+
+            assert_thread_not_impersonating();
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_impersonation_explicit_reversion_error_triggers_emergency_cleanup() {
+        const TOKEN_QUERY: u32 = 0x0008;
+        const TOKEN_DUPLICATE: u32 = 0x0002;
+        const TOKEN_IMPERSONATE: u32 = 0x0004;
+        const SECURITY_IMPERSONATION: u32 = 2;
+        const TOKEN_IMPERSONATION: u32 = 2;
+
+        extern "system" {
+            fn OpenProcessToken(
+                ProcessHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn DuplicateTokenEx(
+                hExistingToken: *mut std::ffi::c_void,
+                dwDesiredAccess: u32,
+                lpTokenAttributes: *mut std::ffi::c_void,
+                ImpersonationLevel: u32,
+                TokenType: u32,
+                phNewToken: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn SetThreadToken(
+                Thread: *mut *mut std::ffi::c_void,
+                Token: *mut std::ffi::c_void,
+            ) -> i32;
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        }
+
+        unsafe {
+            assert_thread_not_impersonating();
+
+            let mut proc_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+            assert_ne!(
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_QUERY | TOKEN_DUPLICATE,
+                    &mut proc_tok
+                ),
+                0
+            );
+            let _proc_guard = HandleGuard(proc_tok);
+
+            let mut imp_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+            assert_ne!(
+                DuplicateTokenEx(
+                    proc_tok,
+                    TOKEN_QUERY | TOKEN_IMPERSONATE,
+                    std::ptr::null_mut(),
+                    SECURITY_IMPERSONATION,
+                    TOKEN_IMPERSONATION,
+                    &mut imp_tok,
+                ),
+                0
+            );
+            let _imp_guard = HandleGuard(imp_tok);
+
+            assert_ne!(SetThreadToken(std::ptr::null_mut(), imp_tok), 0);
+
+            // Inject fault in explicit revert
+            set_fault_inject_windows_revert_to_self_fail(true);
+            let mut guard = ThreadImpersonationGuard { active: true };
+            let rev_res = guard.revert();
+            set_fault_inject_windows_revert_to_self_fail(false);
+
+            assert!(
+                rev_res.is_err(),
+                "Explicit revert must report error when RevertToSelf fails"
+            );
+            assert!(
+                guard.active,
+                "Guard must remain armed (active == true) when explicit revert fails"
+            );
+
+            // When guard is dropped, emergency cleanup runs
+            drop(guard);
+
+            // Verify emergency cleanup restored clean thread state
+            assert_thread_not_impersonating();
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_impersonation_postcondition_active_token_rejection() {
+        unsafe {
+            assert_thread_not_impersonating();
+            set_fault_inject_windows_postcondition_active_token(true);
+            let mut guard = ThreadImpersonationGuard { active: true };
+            let rev_res = guard.revert();
+            set_fault_inject_windows_postcondition_active_token(false);
+
+            assert!(
+                rev_res.is_err(),
+                "revert() must report error on active token postcondition"
+            );
+            assert!(
+                guard.active,
+                "Guard must NOT be disarmed when postcondition finds an active token"
+            );
+            let err = rev_res.unwrap_err();
+            assert!(
+                err.contains("thread still has active impersonation token"),
+                "Error must indicate active token: {}",
+                err
+            );
+            drop(guard);
+            assert_thread_not_impersonating();
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_impersonation_postcondition_unexpected_error_rejection() {
+        unsafe {
+            assert_thread_not_impersonating();
+            set_fault_inject_windows_postcondition_unexpected_err(true);
+            let mut guard = ThreadImpersonationGuard { active: true };
+            let rev_res = guard.revert();
+            set_fault_inject_windows_postcondition_unexpected_err(false);
+
+            assert!(
+                rev_res.is_err(),
+                "revert() must report error on unexpected Win32 postcondition error"
+            );
+            assert!(
+                guard.active,
+                "Guard must NOT be disarmed when postcondition returns unexpected error"
+            );
+            let err = rev_res.unwrap_err();
+            assert!(
+                err.contains("unexpected error 5"),
+                "Error must indicate unexpected error: {}",
+                err
+            );
+            drop(guard);
+            assert_thread_not_impersonating();
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_impersonation_emergency_cleanup_fail_stop_policy() {
+        unsafe {
+            assert_thread_not_impersonating();
+
+            fn panic_hook(msg: &str) {
+                panic!("FAIL_STOP_TRIGGERED: {}", msg);
+            }
+
+            set_emergency_fail_stop_hook(Some(panic_hook));
+            set_fault_inject_windows_emergency_cleanup_fail(true);
+
+            let res = std::panic::catch_unwind(|| {
+                let _guard = ThreadImpersonationGuard { active: true };
+            });
+
+            set_emergency_fail_stop_hook(None);
+            set_fault_inject_windows_emergency_cleanup_fail(false);
+
+            assert!(
+                res.is_err(),
+                "Emergency cleanup failure must trigger fail-stop policy"
+            );
+            let panic_err = res.unwrap_err();
+            let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                String::new()
+            };
+            assert!(
+                msg.contains("FAIL_STOP_TRIGGERED: Emergency RevertToSelf failed"),
+                "Fail-stop must execute with diagnostic message: {}",
+                msg
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_impersonation_emergency_cleanup_subprocess_abort() {
+        if std::env::var("AETHER_TEST_SUBPROCESS_ABORT").is_ok() {
+            set_fault_inject_windows_emergency_cleanup_fail(true);
+            let guard = ThreadImpersonationGuard { active: true };
+            drop(guard);
+            std::process::exit(0);
+        }
+
+        let current_exe = std::env::current_exe().expect("current test exe");
+        let output = std::process::Command::new(current_exe)
+            .arg("tests::test_windows_impersonation_emergency_cleanup_subprocess_abort")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("AETHER_TEST_SUBPROCESS_ABORT", "1")
+            .output()
+            .expect("spawning test subprocess");
+
+        assert!(
+            !output.status.success(),
+            "Subprocess must fail-stop / abort when emergency cleanup fails; got exit status: {:?}",
+            output.status
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_token_privileges_strict_sizing_validation() {
+        // 1. Sizing query unexpectedly succeeded with NULL buffer
+        let res_succ = validate_token_privileges_sizing(1, ERROR_INSUFFICIENT_BUFFER, 16);
+        assert!(res_succ.is_err());
+        assert!(res_succ
+            .unwrap_err()
+            .contains("sizing query unexpectedly succeeded with a NULL buffer"));
+
+        // 2. Sizing query unexpected Win32 error
+        let res_err = validate_token_privileges_sizing(0, 5, 16); // 5 = ERROR_ACCESS_DENIED
+        assert!(res_err.is_err());
+        assert!(res_err
+            .unwrap_err()
+            .contains("unexpected Win32 error 5; expected ERROR_INSUFFICIENT_BUFFER (122)"));
+
+        // 3. Zero required length
+        let res_zero = validate_token_privileges_sizing(0, ERROR_INSUFFICIENT_BUFFER, 0);
+        assert!(res_zero.is_err());
+        assert!(res_zero
+            .unwrap_err()
+            .contains("Invalid required buffer length 0 less than minimum header size 4"));
+
+        // 4. Undersized required length (< sizeof(u32))
+        let res_short = validate_token_privileges_sizing(0, ERROR_INSUFFICIENT_BUFFER, 3);
+        assert!(res_short.is_err());
+        assert!(res_short
+            .unwrap_err()
+            .contains("Invalid required buffer length 3 less than minimum header size 4"));
+
+        // 5. Valid sizing values and aligned allocation calculation
+        let (num_u64_1, cap_bytes_1, cap_u32_1) =
+            validate_token_privileges_sizing(0, ERROR_INSUFFICIENT_BUFFER, 4).unwrap();
+        assert_eq!(num_u64_1, 1);
+        assert_eq!(cap_bytes_1, 8);
+        assert_eq!(cap_u32_1, 8);
+
+        let (num_u64_2, cap_bytes_2, cap_u32_2) =
+            validate_token_privileges_sizing(0, ERROR_INSUFFICIENT_BUFFER, 16).unwrap();
+        assert_eq!(num_u64_2, 2);
+        assert_eq!(cap_bytes_2, 16);
+        assert_eq!(cap_u32_2, 16);
+
+        let (num_u64_3, cap_bytes_3, cap_u32_3) =
+            validate_token_privileges_sizing(0, ERROR_INSUFFICIENT_BUFFER, 17).unwrap();
+        assert_eq!(num_u64_3, 3);
+        assert_eq!(cap_bytes_3, 24);
+        assert_eq!(cap_u32_3, 24);
+
+        // 6. Checked arithmetic overflow or rejected size conversion on extreme required length
+        let res_overflow = validate_token_privileges_sizing(0, ERROR_INSUFFICIENT_BUFFER, u32::MAX);
+        assert!(res_overflow.is_err());
+        let err_overflow = res_overflow.unwrap_err();
+        assert!(
+            err_overflow.contains("overflow") || err_overflow.contains("exceeds u32 range"),
+            "Error must indicate overflow or rejected size conversion: {}",
+            err_overflow
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_token_privileges_malformed_buffer_conditions() {
+        // 1. NULL pointer rejection
+        let res_null = unsafe { parse_token_privileges_buffer(std::ptr::null(), 16, 16) };
+        assert!(res_null.is_err());
+        assert!(res_null.unwrap_err().contains("pointer is NULL"));
+
+        // 2. Actual length greater than allocated buffer capacity
+        let buf_cap = [0u64; 2]; // 16 bytes
+        let res_cap =
+            unsafe { parse_token_privileges_buffer(buf_cap.as_ptr() as *const u8, 16, 24) };
+        assert!(res_cap.is_err());
+        assert!(res_cap
+            .unwrap_err()
+            .contains("exceeding allocated buffer capacity 16"));
+
+        // 3. Header shorter than sizeof(u32)
+        let buf_short = [0u64; 2];
+        let res_short =
+            unsafe { parse_token_privileges_buffer(buf_short.as_ptr() as *const u8, 16, 2) };
+        assert!(res_short.is_err());
+        assert!(res_short
+            .unwrap_err()
+            .contains("less than minimum header size 4"));
+
+        // 4. Misaligned buffer pointer
+        let raw_bytes = [0u8; 32];
+        let unaligned_ptr = unsafe { raw_bytes.as_ptr().add(1) };
+        let res_align = unsafe { parse_token_privileges_buffer(unaligned_ptr, 30, 28) };
+        assert!(res_align.is_err());
+        assert!(res_align
+            .unwrap_err()
+            .contains("violates u32 header alignment requirement"));
+
+        // 5. Privilege count exceeding available data
+        let mut buf_count = vec![0u64; 2]; // 16 bytes
+        unsafe {
+            *(buf_count.as_mut_ptr() as *mut u32) = 5;
+        }
+        let res_count =
+            unsafe { parse_token_privileges_buffer(buf_count.as_ptr() as *const u8, 16, 16) };
+        assert!(res_count.is_err());
+        assert!(res_count.unwrap_err().contains(
+            "Privilege count 5 requires 64 bytes, but returned buffer contains only 16 bytes"
+        ));
+
+        // 6. Truncated final privilege entry
+        let mut buf_trunc = vec![0u64; 4]; // 32 bytes capacity
+        unsafe {
+            *(buf_trunc.as_mut_ptr() as *mut u32) = 2; // 2 entries require 4 + 2 * 12 = 28 bytes
+        }
+        // actual_len is 20: entry 0 is in [4..16], entry 1 requires [16..28] which exceeds actual_len 20
+        let res_trunc =
+            unsafe { parse_token_privileges_buffer(buf_trunc.as_ptr() as *const u8, 32, 20) };
+        assert!(res_trunc.is_err());
+        assert!(res_trunc
+            .unwrap_err()
+            .contains("requires 28 bytes, but returned buffer contains only 20 bytes"));
+
+        // 7. Arithmetic overflow in privilege count calculation
+        let mut buf_overflow = vec![0u64; 2];
+        unsafe {
+            *(buf_overflow.as_mut_ptr() as *mut u32) = u32::MAX;
+        }
+        let res_overflow =
+            unsafe { parse_token_privileges_buffer(buf_overflow.as_ptr() as *const u8, 16, 16) };
+        assert!(res_overflow.is_err());
+        assert!(res_overflow.unwrap_err().contains("overflow"));
+
+        // 8. Properly aligned valid input with 2 entries
+        let mut buf_valid = vec![0u64; 4]; // 32 bytes
+        unsafe {
+            let p_u32 = buf_valid.as_mut_ptr() as *mut u32;
+            *p_u32 = 2;
+            let base_ptr = buf_valid.as_mut_ptr() as *mut u8;
+            let entry0 = base_ptr.add(4) as *mut LUID_AND_ATTRIBUTES;
+            *entry0 = LUID_AND_ATTRIBUTES {
+                luid: LUID {
+                    low_part: 100,
+                    high_part: 0,
+                },
+                attributes: 2,
+            };
+            let entry1 = base_ptr.add(16) as *mut LUID_AND_ATTRIBUTES;
+            *entry1 = LUID_AND_ATTRIBUTES {
+                luid: LUID {
+                    low_part: 200,
+                    high_part: 0,
+                },
+                attributes: 3,
+            };
+        }
+        let res_valid =
+            unsafe { parse_token_privileges_buffer(buf_valid.as_ptr() as *const u8, 32, 28) };
+        assert!(res_valid.is_ok(), "Valid buffer must parse successfully");
+        let privs = res_valid.unwrap();
+        assert_eq!(privs.len(), 2);
+        assert_eq!(privs[0].luid.low_part, 100);
+        assert_eq!(privs[0].luid.high_part, 0);
+        assert_eq!(privs[0].attributes, 2);
+        assert_eq!(privs[1].luid.low_part, 200);
+        assert_eq!(privs[1].luid.high_part, 0);
+        assert_eq!(privs[1].attributes, 3);
     }
 
     #[test]
