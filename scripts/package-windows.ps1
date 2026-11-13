@@ -2,7 +2,7 @@
 # Produces production-grade standalone portable distribution and Inno Setup installer
 
 param (
-    [string]$Version = "0.1.0-beta.2",
+    [string]$Version = "0.1.0-beta.3",
     [string]$OutputDir = "",
     [string]$TargetDir = "",
     [ValidateSet("portable", "installer", "all")]
@@ -81,7 +81,7 @@ if (Test-Path "$IDE_ROOT\apps\desktop\workbench") {
     Copy-Item "$IDE_ROOT\apps\desktop\workbench\*" "$STAGE_DIR\workbench\" -Recurse -Force
 }
 if (Test-Path "$IDE_ROOT\apps\desktop\dist") {
-    Copy-Item "$IDE_ROOT\apps\desktop\dist" "$STAGE_DIR\workbench\" -Recurse -Force
+    Copy-Item "$IDE_ROOT\apps\desktop\dist\*" "$STAGE_DIR\workbench\" -Recurse -Force
 }
 if (Test-Path "$IDE_ROOT\apps\desktop\package.json") {
     Copy-Item "$IDE_ROOT\apps\desktop\package.json" "$STAGE_DIR\workbench\" -Force

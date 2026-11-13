@@ -1605,7 +1605,7 @@ Connected to daemon at 127.0.0.1:44888 via IPC protocol.</pre>
       </div>
       <div class="dialog-body">
         <p><strong>AetherIDE — AI-Native Engineering Studio</strong></p>
-        <p style="color:#94a3b8; margin: 4px 0 12px 0;">Release: <strong>v0.1.0-beta.2 (x64 MSVC)</strong></p>
+        <p style="color:#94a3b8; margin: 4px 0 12px 0;">Release: <strong>v0.1.0-beta.3 (x64 MSVC)</strong></p>
         <p>A unified desktop development environment with persistent Monaco workbench, ConPTY terminal manager, capability-based filesystem security, and integrated AI agent workflows.</p>
         <div style="margin-top: 14px; padding: 10px; background: #1e293b; border-radius: 6px; font-family: Consolas, monospace; font-size: 11px;">
           Architecture: 24 Rust Crates + Native Win32 Host<br>
@@ -1823,7 +1823,7 @@ pub struct AeadChannel;
       },
       'rust/services/aether-daemon/src/main.rs': {
         lang: 'rust',
-        content: `// AetherIDE Native Daemon v0.1.0-beta.2
+        content: `// AetherIDE Native Daemon v0.1.0-beta.3
 use application_core::AetherConfig;
 use database_engine::DatabaseEngine;
 use model_gateway::ModelGateway;
@@ -1840,7 +1840,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         content: `{
   "name": "aether-desktop",
   "productName": "AetherIDE",
-  "version": "0.1.0-beta.2",
+  "version": "0.1.0-beta.3",
   "description": "Production-Grade Rust-First AI-Native IDE"
 }
 `
@@ -3107,7 +3107,7 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
       </div>
       <div class="dialog-body">
         <p><strong>AetherIDE — AI-Native Engineering Environment</strong></p>
-        <p style="color:#94a3b8; margin: 4px 0 12px 0;">Release: <strong>v0.1.0-beta.2 (x64 MSVC)</strong></p>
+        <p style="color:#94a3b8; margin: 4px 0 12px 0;">Release: <strong>v0.1.0-beta.3 (x64 MSVC)</strong></p>
         <p>AetherIDE delivers high-performance developer workflows through a 24-crate Rust core architecture, Microsoft WebView2 native host, Monaco editor, ConPTY terminal manager, and capability-based filesystem sandboxing.</p>
         <div style="margin-top: 14px; padding: 12px; background: #1e293b; border-radius: 8px; font-size: 11px; font-family: monospace;">
           OS: Windows 10/11 x64<br>
@@ -4127,7 +4127,7 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
     function runBuildTask() {
       selectPanelTab('output');
       const log = document.getElementById('output-log-text');
-      log.innerText += `\n[Task] cargo build --workspace (Release)...\n   Compiling aetheride v0.1.0-beta.2\n    Finished release [optimized] target(s) in 2.14s\n`;
+      log.innerText += `\n[Task] cargo build --workspace (Release)...\n   Compiling aetheride v0.1.0-beta.3\n    Finished release [optimized] target(s) in 2.14s\n`;
       log.scrollTop = log.scrollHeight;
       notify('Build completed successfully: 0 errors.', 'success');
     }
@@ -4303,7 +4303,7 @@ Advanced Developer Workbench, Interactive Terminal Studio, Project Brain Visuali
       </div>
       <div class="dialog-body">
         <p><strong>AetherIDE — AI-Native Engineering Environment</strong></p>
-        <p style="color:#94a3b8; margin: 4px 0 12px 0;">Release: <strong>v0.1.0-beta.2 (x64 MSVC)</strong></p>
+        <p style="color:#94a3b8; margin: 4px 0 12px 0;">Release: <strong>v0.1.0-beta.3 (x64 MSVC)</strong></p>
         <p>AetherIDE delivers high-performance developer workflows through a 24-crate Rust core architecture, Microsoft WebView2 native host, Monaco editor, ConPTY terminal manager, and capability-based filesystem sandboxing.</p>
         <div style="margin-top: 14px; padding: 12px; background: #1e293b; border-radius: 8px; font-size: 11px; font-family: monospace;">
           OS: Windows 10/11 x64<br>

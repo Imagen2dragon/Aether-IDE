@@ -1,5 +1,44 @@
 # AetherIDE — Release Notes
 
+## v0.1.0-beta.3 — Expanded Obsidian Pro Workbench & Reliability Update (November 13, 2026)
+
+### Highlights:
+- **Expanded Obsidian Pro Workbench Experience:**
+  - Full-featured Obsidian Pro desktop developer workbench with dark high-contrast styling, responsive split editor panes, file explorer, integrated ConPTY/PTY terminal panels, and command palette.
+  - Multi-tab Monaco editor with syntax highlighting, AST navigation, symbol definitions, and live output stream tabs.
+  - AI Assistant side panel with autonomous multi-persona workflows, inline change previews, and diff acceptance controls.
+- **Filesystem Engine Reliability & Continuity Hardening:**
+  - Strict handle-bound directory pinning and atomic publication preventing concurrent namespace substitution.
+  - Fail-closed cleanup paths: unpinned pathname deletions eliminated; ownership continuity established through retained OS handles before destructive actions.
+  - Windows NTFS access-control hardening: verified private owner SID checks (`TokenUser`, authorized Administrators, SYSTEM) and comprehensive dangerous-DACL inspection rejecting permissive or inherited non-owner write access.
+- **Cross-Platform Release Packaging & Distribution:**
+  - **Universal Download Portal:** Permanent public download endpoint at `https://github.com/Imagen2dragon/Aether-IDE/releases/latest`.
+  - **Windows 10/11 x64:** Non-administrative per-user installer (`AetherIDE-Setup-0.1.0-beta.3-x64.exe`) and portable standalone archive (`AetherIDE-v0.1.0-beta.3-windows-x64.zip`).
+  - **Linux x64 (glibc 2.35+):** Standalone portable distribution (`AetherIDE-v0.1.0-beta.3-linux-x64.tar.gz`).
+  - **macOS ARM64 (Apple Silicon):** Standalone portable distribution (`AetherIDE-v0.1.0-beta.3-macos-arm64.tar.gz`).
+  - Cryptographic SHA-256 digests generated and verified for all release artifacts.
+- **Official Public Download URLs:**
+  - **Latest Universal Portal:** [AetherIDE Latest Release](https://github.com/Imagen2dragon/Aether-IDE/releases/latest)
+  - **Windows Setup Installer:** [AetherIDE-Setup-0.1.0-beta.3-x64.exe](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.3/AetherIDE-Setup-0.1.0-beta.3-x64.exe)
+  - **Windows Installer SHA-256:** [AetherIDE-Setup-0.1.0-beta.3-x64.exe.sha256](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.3/AetherIDE-Setup-0.1.0-beta.3-x64.exe.sha256)
+  - **Windows Portable ZIP:** [AetherIDE-v0.1.0-beta.3-windows-x64.zip](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.3/AetherIDE-v0.1.0-beta.3-windows-x64.zip)
+  - **Windows Portable SHA-256:** [AetherIDE-v0.1.0-beta.3-windows-x64.zip.sha256](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.3/AetherIDE-v0.1.0-beta.3-windows-x64.zip.sha256)
+  - **Linux x64 Tarball:** [AetherIDE-v0.1.0-beta.3-linux-x64.tar.gz](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.3/AetherIDE-v0.1.0-beta.3-linux-x64.tar.gz)
+  - **Linux x64 SHA-256:** [AetherIDE-v0.1.0-beta.3-linux-x64.tar.gz.sha256](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.3/AetherIDE-v0.1.0-beta.3-linux-x64.tar.gz.sha256)
+  - **macOS ARM64 Tarball:** [AetherIDE-v0.1.0-beta.3-macos-arm64.tar.gz](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.3/AetherIDE-v0.1.0-beta.3-macos-arm64.tar.gz)
+  - **macOS ARM64 SHA-256:** [AetherIDE-v0.1.0-beta.3-macos-arm64.tar.gz.sha256](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.3/AetherIDE-v0.1.0-beta.3-macos-arm64.tar.gz.sha256)
+- **Security & Code-Signing Disclosure:**
+  - As an open-source beta release, binaries are compiled deterministically and published with authoritative SHA-256 checksums. They are not yet signed with a commercial Extended Validation (EV) code-signing certificate.
+  - Windows SmartScreen or "Unknown Publisher" dialogs may appear during installation. Users can independently verify the published SHA-256 checksum and click **More info** -> **Run anyway**.
+- **System Requirements:**
+  - Windows: 64-bit Windows 10 (version 1809+) or Windows 11.
+  - Linux: x86_64 Linux distribution with glibc 2.35+ (Ubuntu 22.04+, Debian 12+, Fedora 38+).
+  - macOS: Apple Silicon (M1/M2/M3/M4) running macOS 13 (Ventura) or newer.
+- **Known Limitations:**
+  - EV code signing and macOS Gatekeeper notarization are scheduled for the General Availability (GA) milestone.
+
+---
+
 ## v0.1.0-beta.2 — Production Release, Atomic Checkpoint Hardening & Verified Installer (November 7, 2026)
 
 ### Highlights:

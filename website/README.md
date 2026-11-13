@@ -1,6 +1,6 @@
 # AetherIDE Download Portal & Static Website
 
-This directory contains the public static download portal for **AetherIDE `v0.1.0-beta.2`**, designed for zero-dependency hosting on GitHub Pages.
+This directory contains the public static download portal for **AetherIDE `v0.1.0-beta.3`**, designed for zero-dependency hosting on GitHub Pages.
 
 ## Directory Layout
 

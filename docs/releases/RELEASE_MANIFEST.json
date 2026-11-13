@@ -1,15 +1,36 @@
 {
-  "version": "0.1.0-beta.2",
-  "release_name": "AetherIDE Beta.2 \u2014 Sprint 23 Release Candidate Hardening",
-  "release_date": "2026-11-04",
+  "version": "0.1.0-beta.3",
+  "release_name": "AetherIDE Beta.3 — Expanded Obsidian Pro Workbench & Reliability Update",
+  "release_date": "2026-11-13",
   "framework": "Tauri 2 + React 19 + Monaco Editor + Rust Core",
   "artifacts": [
     {
-      "name": "AetherIDE-v0.1.0-beta.2-windows-x64-setup.exe",
+      "name": "AetherIDE-Setup-0.1.0-beta.3-x64.exe",
       "platform": "windows-x64",
-      "format": "nsis-installer",
-      "size_bytes": 6901954,
-      "sha256": "d3de3b7447d6c14ea613f9a4fb54e29223952845d6854804d471297de551742c"
+      "format": "inno-setup",
+      "size_bytes": 8985166,
+      "sha256": "c7b0ccb4ecd4582bf99bcd4738832d2f3d5c00ef3c81c3608df9db64e4a43fcc"
+    },
+    {
+      "name": "AetherIDE-v0.1.0-beta.3-windows-x64.zip",
+      "platform": "windows-x64",
+      "format": "portable-zip",
+      "size_bytes": 12140843,
+      "sha256": "aa7c3c2488ad628c7a1c52124a834eaedd0857f38df6ee6cbe31fbd7f0da9b82"
+    },
+    {
+      "name": "AetherIDE-v0.1.0-beta.3-linux-x64.tar.gz",
+      "platform": "linux-x64",
+      "format": "tar-gz",
+      "size_bytes": 17256261,
+      "sha256": "fd46ccc9fd42455bb1b7775b034182819ba0ca95f85e19c3b2c760eb6064f7e3"
+    },
+    {
+      "name": "AetherIDE-v0.1.0-beta.3-macos-arm64.tar.gz",
+      "platform": "macos-arm64",
+      "format": "tar-gz",
+      "size_bytes": 13472760,
+      "sha256": "549bf2bf8133d1c09e135a262e1a9739d53979fa56938912a32a408cf903ecec"
     }
   ]
 }

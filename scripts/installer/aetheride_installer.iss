@@ -1,9 +1,9 @@
-; Inno Setup 6 Script for AetherIDE Beta.2
+; Inno Setup 6 Script for AetherIDE Beta.3
 ; Architecture: Windows 10/11 x64 (MSVC)
 ; Standard: Non-administrative per-user installation with dependency detection, shell branding, and zero-telemetry preservation.
 
 #define MyAppName "AetherIDE"
-#define MyAppVersion "0.1.0-beta.2"
+#define MyAppVersion "0.1.0-beta.3"
 #define MyAppPublisher "AetherIDE Open Source Project"
 #define MyAppURL "https://github.com/Imagen2dragon/Aether-IDE"
 #define MyAppExeName "AetherIDE.exe"

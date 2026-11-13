@@ -1,6 +1,6 @@
 [package]
 name = "aether-desktop"
-version = "0.1.0"
+version = "0.1.0-beta.3"
 description = "AetherIDE — AI-Native Engineering Studio"
 edition = "2021"
 authors = ["Aether Engineering Team"]
@@ -33,6 +33,7 @@ tokio-util = "0.7"
 parking_lot = "0.12"
 tracing = "0.1"
 sha2 = "0.10"
+regex = "1.10"
 
 # AetherIDE Workspace Crates
 application-core = { path = "../../../rust/crates/application-core" }
@@ -65,6 +66,9 @@ windows = { version = "0.58", features = [
     "Win32_System_Console",
     "Win32_System_Threading",
 ] }
+
+[dev-dependencies]
+tempfile = "3.17"
 
 [profile.release]
 lto = true

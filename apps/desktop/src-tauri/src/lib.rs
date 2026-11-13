@@ -24,6 +24,9 @@ pub fn run() {
             let session: workspace_bridge::SharedWorkspace = Arc::new(parking_lot::Mutex::new(
                 workspace_bridge::WorkspaceSession::new(data_dir.clone()),
             ));
+            if let Ok(cwd) = std::env::current_dir() {
+                let _ = session.lock().set_single_root(cwd);
+            }
 
             // 2. Terminal Manager
             let term_mgr: commands::terminal::SharedTerminalManager = Arc::new(
@@ -104,11 +107,14 @@ pub fn run() {
             commands::workspace_delete_entry,
             commands::workspace_reveal_in_explorer,
             commands::workspace_set_trust,
+            commands::workspace_search,
+            commands::workspace_replace_in_file,
             // Terminal
             commands::terminal_spawn,
             commands::terminal_write,
             commands::terminal_resize,
             commands::terminal_kill,
+            commands::terminal_list_sessions,
             // System
             commands::app_ping,
             commands::app_version,
