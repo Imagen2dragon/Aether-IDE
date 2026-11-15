@@ -133,7 +133,9 @@ impl WorkspaceSession {
             });
         }
 
+        let primary_name = roots.first().and_then(|r| r.file_name()).map(|s| s.to_string_lossy().to_string());
         Ok(serde_json::json!({
+            "name": primary_name,
             "roots": root_infos,
             "root_count": root_infos.len(),
             "primary_path": roots.first().map(|p| p.to_string_lossy().to_string()),
@@ -353,11 +355,20 @@ impl WorkspaceSession {
     /// Returns (Root PathBuf, Normalized Relative Path String).
     fn resolve_in_workspace(&self, user_path: &str) -> Result<(PathBuf, String), String> {
         let roots = self.roots.lock().unwrap().clone();
+        let p = Path::new(user_path);
+
         if roots.is_empty() {
+            if p.is_absolute() && p.is_file() {
+                let canon = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+                if let Some(parent) = canon.parent() {
+                    let _ = self.set_single_root(parent.to_path_buf());
+                    if let Ok(rel) = canon.strip_prefix(parent) {
+                        return Ok((parent.to_path_buf(), rel.to_string_lossy().replace('\\', "/")));
+                    }
+                }
+            }
             return Err("No active workspace is open".into());
         }
-
-        let p = Path::new(user_path);
 
         // Case 1: Absolute path
         if p.is_absolute() {
@@ -366,6 +377,15 @@ impl WorkspaceSession {
                 if filesystem_engine::FilesystemEngine::is_within_boundary(&canon, root) {
                     if let Ok(rel) = canon.strip_prefix(root) {
                         return Ok((root.clone(), rel.to_string_lossy().replace('\\', "/")));
+                    }
+                }
+            }
+            // Safely authorize parent folder of explicitly accessed file
+            if canon.is_file() {
+                if let Some(parent) = canon.parent() {
+                    let _ = self.add_root(parent.to_path_buf());
+                    if let Ok(rel) = canon.strip_prefix(parent) {
+                        return Ok((parent.to_path_buf(), rel.to_string_lossy().replace('\\', "/")));
                     }
                 }
             }

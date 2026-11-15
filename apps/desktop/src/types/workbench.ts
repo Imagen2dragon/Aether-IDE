@@ -3,12 +3,8 @@ export type ActiveSidebarView =
   | "search"
   | "git"
   | "debug"
-  | "brain"
   | "extensions"
   | "testing"
-  | "agents"
-  | "mobile"
-  | "build"
   | "settings";
 
 export type BottomPanelTab =
@@ -17,7 +13,8 @@ export type BottomPanelTab =
   | "output"
   | "debug"
   | "tests"
-  | "doctor";
+  | "doctor"
+  | "ports";
 
 export interface WorkspaceNode {
   name: string;
@@ -318,6 +315,8 @@ export interface GitStatusResult {
   modified_files: string[];
   staged_files: string[];
   untracked_files: string[];
+  is_repo?: boolean;
+  files?: Array<{ path: string; status: string; staged: boolean }>;
 }
 
 // LSP Client

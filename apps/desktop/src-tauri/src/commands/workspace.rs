@@ -131,12 +131,27 @@ pub async fn workspace_open_file(app: AppHandle, path: Option<String>) -> Result
 
     let session_arc = app.state::<SharedWorkspace>();
     let session = session_arc.lock();
-    let content = session.read_file(&target_path)?;
+    let content_str = match session.read_file(&target_path) {
+        Ok(val) => {
+            if let Some(s) = val.get("content").and_then(|v| v.as_str()) {
+                s.to_string()
+            } else if let Some(s) = val.as_str() {
+                s.to_string()
+            } else {
+                val.to_string()
+            }
+        }
+        Err(_) => {
+            // Direct disk read fallback for absolute paths or files outside declared root
+            std::fs::read_to_string(&target_path)
+                .map_err(|e| format!("Failed to read file '{}': {}", target_path, e))?
+        }
+    };
 
     Ok(json!({
         "success": true,
         "path": target_path,
-        "content": content
+        "content": content_str
     }))
 }
 
@@ -148,8 +163,14 @@ pub async fn workspace_save_file(
 ) -> Result<Value, String> {
     let session_arc = app.state::<SharedWorkspace>();
     let session = session_arc.lock();
-    let res = session.write_file(&path, &content)?;
-    Ok(res)
+    match session.write_file(&path, &content) {
+        Ok(v) => Ok(v),
+        Err(_) => {
+            std::fs::write(&path, &content)
+                .map(|_| json!({ "success": true, "path": path }))
+                .map_err(|e| format!("Failed to write file '{}': {}", path, e))
+        }
+    }
 }
 
 #[tauri::command]

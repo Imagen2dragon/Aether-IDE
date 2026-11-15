@@ -24,8 +24,15 @@ pub fn run() {
             let session: workspace_bridge::SharedWorkspace = Arc::new(parking_lot::Mutex::new(
                 workspace_bridge::WorkspaceSession::new(data_dir.clone()),
             ));
-            if let Ok(cwd) = std::env::current_dir() {
-                let _ = session.lock().set_single_root(cwd);
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            for arg in &args {
+                if !arg.starts_with('-') {
+                    let p = std::path::PathBuf::from(arg);
+                    if p.is_dir() {
+                        let _ = session.lock().set_single_root(p);
+                        break;
+                    }
+                }
             }
 
             // 2. Terminal Manager
