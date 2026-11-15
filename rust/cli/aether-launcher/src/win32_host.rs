@@ -708,7 +708,9 @@ pub mod native {
                         if p.is_file() {
                             if let Some(parent) = p.parent() {
                                 let _ = WORKSPACE_SESSION.with(|s| {
-                                    s.borrow().as_ref().map(|ws| ws.add_root(parent.to_path_buf()))
+                                    s.borrow()
+                                        .as_ref()
+                                        .map(|ws| ws.add_root(parent.to_path_buf()))
                                 });
                             }
                             match std::fs::read_to_string(p) {
@@ -723,7 +725,7 @@ pub mod native {
                                     "action": action,
                                     "error": format!("Read error for '{}': {}", target, read_err),
                                     "result": null
-                                })
+                                }),
                             }
                         } else {
                             serde_json::json!({ "id": req_id, "action": action, "error": e, "result": null })
@@ -749,8 +751,8 @@ pub mod native {
                             let _ = std::fs::create_dir_all(parent);
                         }
                         let tmp = p.with_extension("tmp_atomic_save");
-                        let write_res = std::fs::write(&tmp, content)
-                            .and_then(|()| std::fs::rename(&tmp, p));
+                        let write_res =
+                            std::fs::write(&tmp, content).and_then(|()| std::fs::rename(&tmp, p));
                         match write_res {
                             Ok(()) => serde_json::json!({
                                 "id": req_id,
@@ -763,7 +765,7 @@ pub mod native {
                                 "action": action,
                                 "error": format!("Save error for '{}': {}", target, save_err),
                                 "result": null
-                            })
+                            }),
                         }
                     }
                 }
@@ -875,7 +877,8 @@ pub mod native {
                     }
                 }
             } else if action == "GitGetStatus" {
-                let root = WORKSPACE_SESSION.with(|s| s.borrow().as_ref().and_then(|ws| ws.primary_root()));
+                let root = WORKSPACE_SESSION
+                    .with(|s| s.borrow().as_ref().and_then(|ws| ws.primary_root()));
                 match root {
                     Some(repo) => {
                         let git_dir = repo.join(".git");
@@ -922,13 +925,18 @@ pub mod native {
                                         if idx_st == "?" {
                                             untracked.push(f);
                                         } else {
-                                            if idx_st != " " && idx_st != "?" { staged.push(f.clone()); }
-                                            if wt_st != " " { modified.push(f); }
+                                            if idx_st != " " && idx_st != "?" {
+                                                staged.push(f.clone());
+                                            }
+                                            if wt_st != " " {
+                                                modified.push(f);
+                                            }
                                         }
                                     }
                                 }
                             }
-                            let is_clean = modified.is_empty() && staged.is_empty() && untracked.is_empty();
+                            let is_clean =
+                                modified.is_empty() && staged.is_empty() && untracked.is_empty();
                             serde_json::json!({
                                 "id": req_id,
                                 "action": action,
@@ -961,15 +969,25 @@ pub mod native {
                     }
                 }
             } else if action == "GitGetDiff" {
-                let root = WORKSPACE_SESSION.with(|s| s.borrow().as_ref().and_then(|ws| ws.primary_root()));
+                let root = WORKSPACE_SESSION
+                    .with(|s| s.borrow().as_ref().and_then(|ws| ws.primary_root()));
                 match root {
                     Some(repo) => {
-                        let staged = params.get("staged").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let staged = params
+                            .get("staged")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
                         let mut cmd = std::process::Command::new("git");
                         cmd.arg("diff");
-                        if staged { cmd.arg("--staged"); }
+                        if staged {
+                            cmd.arg("--staged");
+                        }
                         cmd.current_dir(&repo);
-                        let diff_text = cmd.output().ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+                        let diff_text = cmd
+                            .output()
+                            .ok()
+                            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                            .unwrap_or_default();
                         serde_json::json!({
                             "id": req_id,
                             "action": action,
@@ -982,7 +1000,8 @@ pub mod native {
                     }
                 }
             } else if action == "GitStageFile" {
-                let root = WORKSPACE_SESSION.with(|s| s.borrow().as_ref().and_then(|ws| ws.primary_root()));
+                let root = WORKSPACE_SESSION
+                    .with(|s| s.borrow().as_ref().and_then(|ws| ws.primary_root()));
                 let file = params.get("file").and_then(|v| v.as_str()).unwrap_or(".");
                 match root {
                     Some(repo) => {
@@ -991,15 +1010,24 @@ pub mod native {
                             .current_dir(&repo)
                             .output();
                         match res {
-                            Ok(o) if o.status.success() => serde_json::json!({ "id": req_id, "action": action, "result": true, "error": null }),
-                            Ok(o) => serde_json::json!({ "id": req_id, "action": action, "error": String::from_utf8_lossy(&o.stderr).to_string(), "result": null }),
-                            Err(e) => serde_json::json!({ "id": req_id, "action": action, "error": format!("{:?}", e), "result": null }),
+                            Ok(o) if o.status.success() => {
+                                serde_json::json!({ "id": req_id, "action": action, "result": true, "error": null })
+                            }
+                            Ok(o) => {
+                                serde_json::json!({ "id": req_id, "action": action, "error": String::from_utf8_lossy(&o.stderr).to_string(), "result": null })
+                            }
+                            Err(e) => {
+                                serde_json::json!({ "id": req_id, "action": action, "error": format!("{:?}", e), "result": null })
+                            }
                         }
                     }
-                    None => serde_json::json!({ "id": req_id, "action": action, "error": "No open workspace root", "result": null })
+                    None => {
+                        serde_json::json!({ "id": req_id, "action": action, "error": "No open workspace root", "result": null })
+                    }
                 }
             } else if action == "GitUnstageFile" {
-                let root = WORKSPACE_SESSION.with(|s| s.borrow().as_ref().and_then(|ws| ws.primary_root()));
+                let root = WORKSPACE_SESSION
+                    .with(|s| s.borrow().as_ref().and_then(|ws| ws.primary_root()));
                 let file = params.get("file").and_then(|v| v.as_str()).unwrap_or(".");
                 match root {
                     Some(repo) => {
@@ -1008,15 +1036,24 @@ pub mod native {
                             .current_dir(&repo)
                             .output();
                         match res {
-                            Ok(o) if o.status.success() => serde_json::json!({ "id": req_id, "action": action, "result": true, "error": null }),
-                            Ok(o) => serde_json::json!({ "id": req_id, "action": action, "error": String::from_utf8_lossy(&o.stderr).to_string(), "result": null }),
-                            Err(e) => serde_json::json!({ "id": req_id, "action": action, "error": format!("{:?}", e), "result": null }),
+                            Ok(o) if o.status.success() => {
+                                serde_json::json!({ "id": req_id, "action": action, "result": true, "error": null })
+                            }
+                            Ok(o) => {
+                                serde_json::json!({ "id": req_id, "action": action, "error": String::from_utf8_lossy(&o.stderr).to_string(), "result": null })
+                            }
+                            Err(e) => {
+                                serde_json::json!({ "id": req_id, "action": action, "error": format!("{:?}", e), "result": null })
+                            }
                         }
                     }
-                    None => serde_json::json!({ "id": req_id, "action": action, "error": "No open workspace root", "result": null })
+                    None => {
+                        serde_json::json!({ "id": req_id, "action": action, "error": "No open workspace root", "result": null })
+                    }
                 }
             } else if action == "GitCommit" {
-                let root = WORKSPACE_SESSION.with(|s| s.borrow().as_ref().and_then(|ws| ws.primary_root()));
+                let root = WORKSPACE_SESSION
+                    .with(|s| s.borrow().as_ref().and_then(|ws| ws.primary_root()));
                 let message = params.get("message").and_then(|v| v.as_str()).unwrap_or("");
                 match root {
                     Some(repo) => {
@@ -1025,12 +1062,20 @@ pub mod native {
                             .current_dir(&repo)
                             .output();
                         match res {
-                            Ok(o) if o.status.success() => serde_json::json!({ "id": req_id, "action": action, "result": String::from_utf8_lossy(&o.stdout).to_string(), "error": null }),
-                            Ok(o) => serde_json::json!({ "id": req_id, "action": action, "error": String::from_utf8_lossy(&o.stderr).to_string(), "result": null }),
-                            Err(e) => serde_json::json!({ "id": req_id, "action": action, "error": format!("{:?}", e), "result": null }),
+                            Ok(o) if o.status.success() => {
+                                serde_json::json!({ "id": req_id, "action": action, "result": String::from_utf8_lossy(&o.stdout).to_string(), "error": null })
+                            }
+                            Ok(o) => {
+                                serde_json::json!({ "id": req_id, "action": action, "error": String::from_utf8_lossy(&o.stderr).to_string(), "result": null })
+                            }
+                            Err(e) => {
+                                serde_json::json!({ "id": req_id, "action": action, "error": format!("{:?}", e), "result": null })
+                            }
                         }
                     }
-                    None => serde_json::json!({ "id": req_id, "action": action, "error": "No open workspace root", "result": null })
+                    None => {
+                        serde_json::json!({ "id": req_id, "action": action, "error": "No open workspace root", "result": null })
+                    }
                 }
             } else if action == "WindowMinimize" {
                 let hwnd = MAIN_HWND.with(|h| h.borrow().unwrap_or_default());
@@ -1038,8 +1083,10 @@ pub mod native {
                 serde_json::json!({ "id": req_id, "action": action, "result": true, "error": null })
             } else if action == "WindowMaximize" {
                 let hwnd = MAIN_HWND.with(|h| h.borrow().unwrap_or_default());
-                let mut placement = WINDOWPLACEMENT::default();
-                placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+                let mut placement = WINDOWPLACEMENT {
+                    length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                    ..Default::default()
+                };
                 let _ = GetWindowPlacement(hwnd, &mut placement);
                 if placement.showCmd == SW_SHOWMAXIMIZED.0 as u32 {
                     let _ = ShowWindow(hwnd, SW_RESTORE);
