@@ -1090,7 +1090,7 @@ export class TauriService {
   }
 
   static async getDoctorReport(): Promise<any> {
-    return { all_healthy: true, diagnostics: [], timestamp: new Date().toISOString() };
+    throw new Error("System diagnostics are not implemented by the current desktop backend.");
   }
 
   static async discoverMobileDevices(): Promise<MobileDeviceInfo[]> {

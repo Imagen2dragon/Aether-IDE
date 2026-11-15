@@ -45,6 +45,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
   onShowNotification,
 }) => {
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
+  const isNativeRuntime = TauriService.isTauriAvailable();
 
   // Close menus on outside click
   useEffect(() => {
@@ -505,7 +506,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
 
       {/* 3. Right Group: Engine Pill, Layout Toggles, Settings, and Native Windows Caption Controls */}
       <div style={{ display: "flex", alignItems: "center", height: "100%" }}>
-        {/* Rust Engine Online Pill */}
+        {/* Report the shell only; engine health is not yet probed. */}
         <div
           style={{
             display: "flex",
@@ -513,19 +514,18 @@ export const TitleBar: React.FC<TitleBarProps> = ({
             gap: 5,
             padding: "2px 8px",
             borderRadius: 10,
-            backgroundColor: "rgba(16, 185, 129, 0.12)",
-            border: "1px solid rgba(16, 185, 129, 0.3)",
+            backgroundColor: isNativeRuntime ? "rgba(16, 185, 129, 0.12)" : "rgba(234, 179, 8, 0.12)",
+            border: `1px solid ${isNativeRuntime ? "rgba(16, 185, 129, 0.3)" : "rgba(234, 179, 8, 0.3)"}`,
             fontSize: 11,
-            color: "#34d399",
+            color: isNativeRuntime ? "#34d399" : "#facc15",
             marginRight: 8,
             userSelect: "none",
           }}
-          title="Rust Native Engine: Online (ConPTY / Tokio / Tokio-Util)"
+          title={isNativeRuntime ? "Running in the AetherIDE Tauri desktop shell; subsystem health has not been checked" : "Running in browser preview; native commands are unavailable"}
         >
-          <span style={{ width: 6, height: 6, borderRadius: "50%", backgroundColor: "#10b981" }} />
-          <span>Rust Engine Online</span>
+          <span style={{ width: 6, height: 6, borderRadius: 6, backgroundColor: isNativeRuntime ? "#10b981" : "#facc15" }} />
+          <span>{isNativeRuntime ? "Desktop Runtime" : "Browser Preview"}</span>
         </div>
-
         {/* Toggle Primary Sidebar */}
         <button
           onClick={onToggleSidebar}

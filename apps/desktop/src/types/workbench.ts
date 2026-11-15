@@ -34,6 +34,7 @@ export interface WorkspaceSummary {
   is_trusted?: boolean;
   open_editors?: string[];
   active_editor?: string;
+  cancelled?: boolean;
 }
 
 export interface OpenFileTab {
