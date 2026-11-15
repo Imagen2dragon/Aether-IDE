@@ -133,7 +133,10 @@ impl WorkspaceSession {
             });
         }
 
-        let primary_name = roots.first().and_then(|r| r.file_name()).map(|s| s.to_string_lossy().to_string());
+        let primary_name = roots
+            .first()
+            .and_then(|r| r.file_name())
+            .map(|s| s.to_string_lossy().to_string());
         Ok(serde_json::json!({
             "name": primary_name,
             "roots": root_infos,
@@ -363,7 +366,10 @@ impl WorkspaceSession {
                 if let Some(parent) = canon.parent() {
                     let _ = self.set_single_root(parent.to_path_buf());
                     if let Ok(rel) = canon.strip_prefix(parent) {
-                        return Ok((parent.to_path_buf(), rel.to_string_lossy().replace('\\', "/")));
+                        return Ok((
+                            parent.to_path_buf(),
+                            rel.to_string_lossy().replace('\\', "/"),
+                        ));
                     }
                 }
             }
@@ -385,7 +391,10 @@ impl WorkspaceSession {
                 if let Some(parent) = canon.parent() {
                     let _ = self.add_root(parent.to_path_buf());
                     if let Ok(rel) = canon.strip_prefix(parent) {
-                        return Ok((parent.to_path_buf(), rel.to_string_lossy().replace('\\', "/")));
+                        return Ok((
+                            parent.to_path_buf(),
+                            rel.to_string_lossy().replace('\\', "/"),
+                        ));
                     }
                 }
             }

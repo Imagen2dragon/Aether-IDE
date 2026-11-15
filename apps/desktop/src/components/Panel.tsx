@@ -6,6 +6,7 @@ import type { BottomPanelTab, Diagnostic } from "../types/workbench";
 
 interface PanelProps {
   activeTab: BottomPanelTab;
+  workspaceRoot?: string;
   onSelectTab: (tab: BottomPanelTab) => void;
   onClose: () => void;
   isOpen: boolean;
@@ -16,6 +17,7 @@ interface PanelProps {
 
 export const Panel: React.FC<PanelProps> = ({
   activeTab,
+  workspaceRoot,
   onSelectTab,
   onClose,
   isOpen,
@@ -67,7 +69,7 @@ export const Panel: React.FC<PanelProps> = ({
       fitAddonRef.current = fitAddon;
 
       // Connect to native ConPTY terminal session
-      TauriService.spawnTerminal(term.cols || 100, term.rows || 24, "powershell")
+      TauriService.spawnTerminal(term.cols || 100, term.rows || 24, "powershell", workspaceRoot)
         .then((sid) => {
           sessionIdRef.current = sid;
           const cleanup = TauriService.listenTerminalOutput(sid, (chunk) => {
@@ -76,37 +78,13 @@ export const Panel: React.FC<PanelProps> = ({
           unlistenRef.current = cleanup;
         })
         .catch((err) => {
-          term.writeln("\x1b[33m[Aether ConPTY Notice] Background terminal daemon unavailable: " + (err?.message || err) + "\x1b[0m");
-          term.writeln("\x1b[90mEntering local terminal session...\x1b[0m");
-          term.write("\x1b[32mPS C:\\Users\\abdal\\OneDrive\\Desktop\\ide>\x1b[0m ");
+          term.writeln("\x1b[33mNative ConPTY terminal could not start: " + (err?.message || err) + "\x1b[0m");
+          term.writeln("\x1b[90mTerminal input is disabled until a native session is available.\x1b[0m");
         });
 
-      let localBuffer = "";
       term.onData((data) => {
-        if (sessionIdRef.current !== null) {
-          TauriService.writeTerminal(sessionIdRef.current, data);
-        } else {
-          // Local fallback echo when daemon is not yet ready
-          if (data === "\r") {
-            term.writeln("");
-            const cmd = localBuffer.trim();
-            if (cmd === "cls" || cmd === "clear") {
-              term.clear();
-            } else if (cmd) {
-              term.writeln(`Executed: ${cmd}`);
-            }
-            localBuffer = "";
-            term.write("\x1b[32mPS C:\\Users\\abdal\\OneDrive\\Desktop\\ide>\x1b[0m ");
-          } else if (data === "\u007F") {
-            if (localBuffer.length > 0) {
-              localBuffer = localBuffer.slice(0, -1);
-              term.write("\b \b");
-            }
-          } else {
-            localBuffer += data;
-            term.write(data);
-          }
-        }
+        const sessionId = sessionIdRef.current;
+        if (sessionId !== null) void TauriService.writeTerminal(sessionId, data);
       });
     }
 
@@ -137,7 +115,7 @@ export const Panel: React.FC<PanelProps> = ({
         sessionIdRef.current = null;
       }
     };
-  }, [isOpen, activeTab]);
+  }, [isOpen, activeTab, workspaceRoot]);
 
   if (!isOpen) return null;
 
@@ -288,7 +266,7 @@ export const Panel: React.FC<PanelProps> = ({
 
         {activeTab === "problems" && (
           <div style={{ padding: 16, color: "var(--vscode-text-dim)", fontSize: 12 }}>
-            No problems have been detected in the workspace.
+            No diagnostics have been reported by a connected language server.
           </div>
         )}
 
@@ -304,15 +282,13 @@ export const Panel: React.FC<PanelProps> = ({
               height: "100%",
             }}
           >
-            <div>[rust-analyzer] LSP server initialized in 0.18s.</div>
-            <div>[rust-analyzer] Indexing crates completed (24 crates analyzed).</div>
-            <div>[rust-analyzer] Status: OK (0 errors, 0 warnings).</div>
+            <div>No output has been reported by a connected language server.</div>
           </div>
         )}
 
         {activeTab === "debug" && (
           <div style={{ padding: 16, color: "var(--vscode-text-dim)", fontSize: 12 }}>
-            Debug console is ready. Press F5 to start debugging session.
+            No active debug session. Start a supported debug configuration to use the Debug Console.
           </div>
         )}
 
@@ -323,51 +299,8 @@ export const Panel: React.FC<PanelProps> = ({
         )}
 
         {activeTab === "doctor" && (
-          <div style={{ padding: "14px 18px", overflowY: "auto", height: "100%", fontSize: 12 }}>
-            <div style={{ fontSize: 11, fontWeight: 700, color: "var(--vscode-text-dim)", textTransform: "uppercase", marginBottom: 10 }}>
-              System Health & Subsystem Diagnostics (Aether Engine v0.1.0-beta.3)
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 12px", backgroundColor: "rgba(255, 255, 255, 0.02)", border: "1px solid var(--vscode-border)" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ color: "#89d185", fontWeight: 800 }}>✓</span>
-                  <span style={{ color: "var(--vscode-text-primary)", fontWeight: 600 }}>Rust MSVC Compiler Toolchain</span>
-                </div>
-                <span style={{ color: "var(--vscode-text-dim)", fontSize: 11 }}>1.80+ (x86_64-pc-windows-msvc) · 0.12ms</span>
-              </div>
-
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 12px", backgroundColor: "rgba(255, 255, 255, 0.02)", border: "1px solid var(--vscode-border)" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ color: "#89d185", fontWeight: 800 }}>✓</span>
-                  <span style={{ color: "var(--vscode-text-primary)", fontWeight: 600 }}>Node.js & NPM Runtime Engine</span>
-                </div>
-                <span style={{ color: "var(--vscode-text-dim)", fontSize: 11 }}>v20+ (V8 Engine) · Ready</span>
-              </div>
-
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 12px", backgroundColor: "rgba(255, 255, 255, 0.02)", border: "1px solid var(--vscode-border)" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ color: "#89d185", fontWeight: 800 }}>✓</span>
-                  <span style={{ color: "var(--vscode-text-primary)", fontWeight: 600 }}>ConPTY Terminal Engine</span>
-                </div>
-                <span style={{ color: "var(--vscode-text-dim)", fontSize: 11 }}>Windows Pseudo Console v2 Active</span>
-              </div>
-
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 12px", backgroundColor: "rgba(255, 255, 255, 0.02)", border: "1px solid var(--vscode-border)" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ color: "#89d185", fontWeight: 800 }}>✓</span>
-                  <span style={{ color: "var(--vscode-text-primary)", fontWeight: 600 }}>NTFS Capability Filesystem</span>
-                </div>
-                <span style={{ color: "var(--vscode-text-dim)", fontSize: 11 }}>Read/Write Contained Paths Verified</span>
-              </div>
-
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 12px", backgroundColor: "rgba(255, 255, 255, 0.02)", border: "1px solid var(--vscode-border)" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ color: "#89d185", fontWeight: 800 }}>✓</span>
-                  <span style={{ color: "var(--vscode-text-primary)", fontWeight: 600 }}>OneDrive Workspace Sync</span>
-                </div>
-                <span style={{ color: "var(--vscode-text-dim)", fontSize: 11 }}>Synchronized, Zero Lock Conflicts</span>
-              </div>
-            </div>
+          <div style={{ padding: 16, color: "var(--vscode-text-dim)", fontSize: 12 }}>
+            System diagnostics are not currently connected. No health checks have been run.
           </div>
         )}
 

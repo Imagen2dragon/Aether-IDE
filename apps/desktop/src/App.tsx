@@ -70,6 +70,7 @@ export const App: React.FC = () => {
 
   // 3. Workspace & File Tabs State
   const [workspaceName, setWorkspaceName] = useState("");
+  const [workspaceRoot, setWorkspaceRoot] = useState("");
   const [workspaceTree, setWorkspaceTree] = useState<WorkspaceNode[]>([]);
   const [openTabs, setOpenTabs] = useState<OpenFileTab[]>([]);
   const [activeTabPath, setActiveTabPath] = useState<string | null>(null);
@@ -102,15 +103,20 @@ export const App: React.FC = () => {
     try {
       const summary = await TauriService.getWorkspaceSummary();
       if (summary && summary.name && summary.roots && summary.roots.length > 0) {
+        const root = summary.roots[0];
+        const rootPath = typeof root === "string" ? root : root?.path || root?.id || summary.primary_path || "";
         setWorkspaceName(summary.name);
-        const tree = await TauriService.getTree(summary.roots[0]);
+        setWorkspaceRoot(rootPath);
+        const tree = await TauriService.getTree(rootPath);
         setWorkspaceTree(tree);
       } else {
         setWorkspaceName("");
+        setWorkspaceRoot("");
         setWorkspaceTree([]);
       }
     } catch {
       setWorkspaceName("");
+      setWorkspaceRoot("");
       setWorkspaceTree([]);
     }
 
@@ -200,7 +206,10 @@ export const App: React.FC = () => {
       if (summary.name) {
         setWorkspaceName(summary.name);
       }
-      const tree = await TauriService.getTree(summary.roots?.[0]);
+      const root = summary.roots?.[0];
+      const rootPath = typeof root === "string" ? root : root?.path || root?.id || summary.primary_path || "";
+      setWorkspaceRoot(rootPath);
+      const tree = await TauriService.getTree(rootPath);
       setWorkspaceTree(tree);
       setOpenTabs([]);
       setActiveTabPath(null);
@@ -611,6 +620,7 @@ export const App: React.FC = () => {
           {/* Resizable / Maximizable Bottom Panel */}
           <Panel
             activeTab={panelTab}
+            workspaceRoot={workspaceRoot}
             onSelectTab={(t) => setPanelTab(t)}
             onClose={() => setIsPanelOpen(false)}
             isOpen={isPanelOpen}
