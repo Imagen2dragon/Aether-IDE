@@ -282,11 +282,19 @@ impl WorkspaceSession {
         user_path: &str,
     ) -> Result<(Arc<WorkspaceCapability>, PathBuf, String), String> {
         let roots = self.roots.lock().unwrap();
+        let p = Path::new(user_path);
+
         if roots.is_empty() {
+            if p.is_absolute() && p.is_file() {
+                drop(roots);
+                let canon = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+                if let Some(parent) = canon.parent() {
+                    let _ = self.set_single_root(parent.to_path_buf());
+                    return self.resolve_in_workspace(user_path);
+                }
+            }
             return Err("No active workspace is open".into());
         }
-
-        let p = Path::new(user_path);
 
         // Case 1: Absolute path
         if p.is_absolute() {
@@ -304,6 +312,14 @@ impl WorkspaceSession {
                             rel_str,
                         ));
                     }
+                }
+            }
+            // Safely authorize parent folder of explicitly accessed file
+            if canon.is_file() {
+                if let Some(parent) = canon.parent() {
+                    drop(roots);
+                    let _ = self.add_root(parent.to_path_buf());
+                    return self.resolve_in_workspace(user_path);
                 }
             }
             return Err(format!(
@@ -355,6 +371,7 @@ impl WorkspaceSession {
             });
         }
 
+        let primary_name = roots.first().map(|r| r.name.clone());
         let primary = roots
             .first()
             .map(|r| r.canonical_path.to_string_lossy().to_string());
@@ -362,6 +379,7 @@ impl WorkspaceSession {
         drop(roots);
 
         Ok(serde_json::json!({
+            "name": primary_name,
             "workspace_id": self.workspace_id(),
             "roots": root_infos,
             "root_count": count,
