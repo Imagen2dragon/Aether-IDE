@@ -173,18 +173,32 @@ pub async fn ide_dispatch(
         "TerminalSpawn" => {
             let cols = p.get("cols").and_then(|v| v.as_u64()).map(|v| v as u16);
             let rows = p.get("rows").and_then(|v| v.as_u64()).map(|v| v as u16);
-            terminal_spawn(app, None, cols, rows).await
+            terminal_spawn(app, None, cols, rows, None).await
         }
         "TerminalWrite" => {
             let data = p.get("data").and_then(|v| v.as_str()).unwrap_or("");
-            terminal_write(app, data.to_string()).await
+            let session_id = p
+                .get("sessionId")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            terminal_write(app, data.to_string(), session_id).await
         }
         "TerminalResize" => {
             let cols = p.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
             let rows = p.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
-            terminal_resize(app, cols, rows).await
+            let session_id = p
+                .get("sessionId")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            terminal_resize(app, cols, rows, session_id).await
         }
-        "TerminalClose" => terminal_kill(app).await,
+        "TerminalClose" => {
+            let session_id = p
+                .get("sessionId")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            terminal_kill(app, session_id).await
+        }
         _ => Err(format!("Unknown ide_dispatch action: {}", action)),
     }
 }

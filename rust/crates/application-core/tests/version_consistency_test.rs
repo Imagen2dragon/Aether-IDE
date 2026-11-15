@@ -2,8 +2,8 @@ use application_core::{AETHER_RELEASE_CHANNEL, AETHER_VERSION};
 
 #[test]
 fn test_version_consistency() {
-    assert_eq!(AETHER_VERSION, "0.1.0-beta.2");
-    assert_eq!(AETHER_RELEASE_CHANNEL, "beta.2");
+    assert_eq!(AETHER_VERSION, "0.1.0-beta.3");
+    assert_eq!(AETHER_RELEASE_CHANNEL, "beta.3");
 }
 
 #[test]
@@ -15,5 +15,5 @@ fn test_version_semantic_validity() {
     assert_eq!(semver_nums[0], "0");
     assert_eq!(semver_nums[1], "1");
     assert_eq!(semver_nums[2], "0");
-    assert_eq!(parts[1], "beta.2");
+    assert_eq!(parts[1], "beta.3");
 }

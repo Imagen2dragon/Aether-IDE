@@ -8,8 +8,8 @@ fn main() {
             "FileDescription",
             "AetherIDE AI-Native Development Environment",
         );
-        res.set("ProductVersion", "0.1.0-beta.2");
-        res.set("FileVersion", "0.1.0.2");
+        res.set("ProductVersion", "0.1.0-beta.3");
+        res.set("FileVersion", "0.1.0.3");
         res.set("OriginalFilename", "AetherIDE.exe");
         res.set("InternalName", "AetherIDE");
         res.set(

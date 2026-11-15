@@ -153,6 +153,7 @@ pub mod win32 {
         output_tx: broadcast::Sender<Vec<u8>>,
         recent_output: Arc<parking_lot::Mutex<Vec<u8>>>,
         closed: Arc<AtomicBool>,
+        dimensions: Arc<parking_lot::Mutex<(u16, u16)>>,
     }
 
     unsafe impl Send for ConPtySession {}
@@ -334,6 +335,7 @@ pub mod win32 {
             let (output_tx, _) = broadcast::channel(1024);
             let closed = Arc::new(AtomicBool::new(false));
             let recent_output = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let dimensions = Arc::new(parking_lot::Mutex::new((cols, rows)));
 
             // 6. Spawn Background Reader Thread
             let tx_clone = output_tx.clone();
@@ -392,6 +394,7 @@ pub mod win32 {
                 output_tx,
                 recent_output,
                 closed,
+                dimensions,
             })
         }
 
@@ -433,6 +436,7 @@ pub mod win32 {
 
             let hr = unsafe { ResizePseudoConsole(self.hpc, size) };
             if hr == S_OK {
+                *self.dimensions.lock() = (cols, rows);
                 debug!("Resized ConPTY session {} to {}x{}", self.id, cols, rows);
                 Ok(())
             } else {
@@ -441,6 +445,10 @@ pub mod win32 {
                     hr
                 )))
             }
+        }
+
+        pub fn get_dimensions(&self) -> (u16, u16) {
+            *self.dimensions.lock()
         }
 
         pub fn subscribe_output(&self) -> broadcast::Receiver<Vec<u8>> {

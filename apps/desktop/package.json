@@ -1,7 +1,7 @@
 {
   "name": "@aether/desktop",
   "productName": "AetherIDE",
-  "version": "0.1.0",
+  "version": "0.1.0-beta.3",
   "private": true,
   "type": "module",
   "scripts": {

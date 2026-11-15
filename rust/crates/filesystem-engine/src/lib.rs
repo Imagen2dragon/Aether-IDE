@@ -32,6 +32,14 @@ pub fn is_cross_device_error(err: &std::io::Error) -> bool {
     false
 }
 
+#[derive(Debug)]
+pub enum AtomicPublishError {
+    DestinationExists,
+    CrossDevice,
+    Unsupported,
+    Io(std::io::Error),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileObjectIdentity {
     pub volume_serial_number: u64,
@@ -49,6 +57,10 @@ thread_local! {
     static FAULT_INJECT_WINDOWS_IDENTITY_MISMATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAULT_INJECT_WINDOWS_DEST_IDENTITY_MISMATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAULT_INJECT_WINDOWS_DEST_IDENTITY_QUERY_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAULT_INJECT_WINDOWS_SECURITY_DESCRIPTOR_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAULT_INJECT_WINDOWS_DIFFERENT_OWNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAULT_INJECT_WINDOWS_SIMULATED_OWNER_SID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    static FAULT_INJECT_WINDOWS_SIMULATED_ADMIN_TOKEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static HOOK_WINDOWS_PRE_EXCLUSIVE_OPEN: std::cell::RefCell<Option<WindowsPreExclusiveOpenHook>> = const { std::cell::RefCell::new(None) };
     static HOOK_WINDOWS_POST_EXCLUSIVE_OPEN: std::cell::RefCell<Option<WindowsPostExclusiveOpenHook>> = const { std::cell::RefCell::new(None) };
 }
@@ -117,6 +129,42 @@ pub fn is_fault_inject_windows_dest_identity_mismatch() -> bool {
     FAULT_INJECT_WINDOWS_DEST_IDENTITY_MISMATCH.with(|cell| cell.get())
 }
 
+#[cfg(windows)]
+pub fn set_fault_inject_windows_security_descriptor_failure(inject: bool) {
+    FAULT_INJECT_WINDOWS_SECURITY_DESCRIPTOR_FAILURE.with(|cell| cell.set(inject));
+}
+
+#[cfg(windows)]
+pub fn is_fault_inject_windows_security_descriptor_failure() -> bool {
+    FAULT_INJECT_WINDOWS_SECURITY_DESCRIPTOR_FAILURE.with(|cell| cell.get())
+}
+
+#[cfg(windows)]
+pub fn set_fault_inject_windows_different_owner(inject: bool) {
+    FAULT_INJECT_WINDOWS_DIFFERENT_OWNER.with(|cell| cell.set(inject));
+}
+
+#[cfg(windows)]
+pub fn is_fault_inject_windows_different_owner() -> bool {
+    FAULT_INJECT_WINDOWS_DIFFERENT_OWNER.with(|cell| cell.get())
+}
+
+#[cfg(windows)]
+pub fn set_fault_inject_windows_simulated_owner_sid(sid_type: Option<u32>) {
+    FAULT_INJECT_WINDOWS_SIMULATED_OWNER_SID.with(|cell| cell.set(sid_type));
+}
+
+#[cfg(windows)]
+pub fn set_fault_inject_windows_simulated_admin_token(is_admin: bool) {
+    FAULT_INJECT_WINDOWS_SIMULATED_ADMIN_TOKEN.with(|cell| cell.set(is_admin));
+}
+
+#[cfg(not(windows))]
+pub fn set_fault_inject_windows_simulated_owner_sid(_sid_type: Option<u32>) {}
+
+#[cfg(not(windows))]
+pub fn set_fault_inject_windows_simulated_admin_token(_is_admin: bool) {}
+
 #[cfg(not(windows))]
 pub fn set_hook_windows_pre_exclusive_open(_hook: Option<WindowsPreExclusiveOpenHook>) {}
 
@@ -162,6 +210,22 @@ pub fn set_fault_inject_windows_dest_identity_mismatch(_inject: bool) {}
 
 #[cfg(not(windows))]
 pub fn is_fault_inject_windows_dest_identity_mismatch() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn set_fault_inject_windows_security_descriptor_failure(_inject: bool) {}
+
+#[cfg(not(windows))]
+pub fn is_fault_inject_windows_security_descriptor_failure() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn set_fault_inject_windows_different_owner(_inject: bool) {}
+
+#[cfg(not(windows))]
+pub fn is_fault_inject_windows_different_owner() -> bool {
     false
 }
 
@@ -267,6 +331,3074 @@ pub fn query_file_object_identity(_path: &Path) -> Result<FileObjectIdentity> {
         file_index_high: 0,
         file_index_low: 0,
     })
+}
+
+#[cfg(windows)]
+pub fn query_directory_identity(path: &Path) -> Result<FileObjectIdentity> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+    const FILE_SHARE_READ: u32 = 0x00000001;
+    const FILE_SHARE_WRITE: u32 = 0x00000002;
+    const FILE_SHARE_DELETE: u32 = 0x00000004;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
+    const FILE_TYPE_DISK: u32 = 0x0001;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(AetherError::Io)?;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct BY_HANDLE_FILE_INFORMATION {
+        dwFileAttributes: u32,
+        ftCreationTime: [u32; 2],
+        ftLastAccessTime: [u32; 2],
+        ftLastWriteTime: [u32; 2],
+        dwVolumeSerialNumber: u32,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+        nNumberOfLinks: u32,
+        nFileIndexHigh: u32,
+        nFileIndexLow: u32,
+    }
+    extern "system" {
+        fn GetFileType(hFile: *mut std::ffi::c_void) -> u32;
+        fn GetFileInformationByHandle(
+            hFile: *mut std::ffi::c_void,
+            lpFileInformation: *mut BY_HANDLE_FILE_INFORMATION,
+        ) -> i32;
+    }
+
+    let file_type = unsafe { GetFileType(file.as_raw_handle()) };
+    if file_type != FILE_TYPE_DISK {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is not a standard disk directory (file type: 0x{:x})",
+            path.display(),
+            file_type
+        )));
+    }
+
+    let mut by_handle_info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    let info_res =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), by_handle_info.as_mut_ptr()) };
+    if info_res == 0 {
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+    let file_info = unsafe { by_handle_info.assume_init() };
+
+    let is_reparse = (file_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    let is_dir = (file_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    if is_reparse {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is a reparse point (attributes: 0x{:x}); refusing directory identity query",
+            path.display(),
+            file_info.dwFileAttributes
+        )));
+    }
+    if !is_dir {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is not a directory (attributes: 0x{:x}); refusing directory identity query",
+            path.display(),
+            file_info.dwFileAttributes
+        )));
+    }
+
+    Ok(FileObjectIdentity {
+        volume_serial_number: file_info.dwVolumeSerialNumber as u64,
+        file_index_high: file_info.nFileIndexHigh as u64,
+        file_index_low: file_info.nFileIndexLow as u64,
+    })
+}
+
+#[cfg(unix)]
+pub fn query_directory_identity(path: &Path) -> Result<FileObjectIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).map_err(AetherError::Io)?;
+    if meta.file_type().is_symlink() {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is a symlink; refusing directory identity query",
+            path.display()
+        )));
+    }
+    if !meta.is_dir() {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is not a directory; refusing directory identity query",
+            path.display()
+        )));
+    }
+    let ino = meta.ino();
+    Ok(FileObjectIdentity {
+        volume_serial_number: meta.dev(),
+        file_index_high: (ino >> 32) as u64,
+        file_index_low: (ino & 0xFFFFFFFF) as u64,
+    })
+}
+
+#[cfg(not(any(windows, unix)))]
+pub fn query_directory_identity(_path: &Path) -> Result<FileObjectIdentity> {
+    Ok(FileObjectIdentity {
+        volume_serial_number: 0,
+        file_index_high: 0,
+        file_index_low: 0,
+    })
+}
+
+#[cfg(windows)]
+pub fn query_any_object_identity(path: &Path) -> Result<FileObjectIdentity> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+    const FILE_SHARE_READ: u32 = 0x00000001;
+    const FILE_SHARE_WRITE: u32 = 0x00000002;
+    const FILE_SHARE_DELETE: u32 = 0x00000004;
+    const FILE_TYPE_DISK: u32 = 0x0001;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(AetherError::Io)?;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct BY_HANDLE_FILE_INFORMATION {
+        dwFileAttributes: u32,
+        ftCreationTime: [u32; 2],
+        ftLastAccessTime: [u32; 2],
+        ftLastWriteTime: [u32; 2],
+        dwVolumeSerialNumber: u32,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+        nNumberOfLinks: u32,
+        nFileIndexHigh: u32,
+        nFileIndexLow: u32,
+    }
+    extern "system" {
+        fn GetFileType(hFile: *mut std::ffi::c_void) -> u32;
+        fn GetFileInformationByHandle(
+            hFile: *mut std::ffi::c_void,
+            lpFileInformation: *mut BY_HANDLE_FILE_INFORMATION,
+        ) -> i32;
+    }
+
+    let file_type = unsafe { GetFileType(file.as_raw_handle()) };
+    if file_type != FILE_TYPE_DISK {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is not a standard disk object (file type: 0x{:x})",
+            path.display(),
+            file_type
+        )));
+    }
+
+    let mut by_handle_info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    let info_res =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), by_handle_info.as_mut_ptr()) };
+    if info_res == 0 {
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+    let file_info = unsafe { by_handle_info.assume_init() };
+
+    Ok(FileObjectIdentity {
+        volume_serial_number: file_info.dwVolumeSerialNumber as u64,
+        file_index_high: file_info.nFileIndexHigh as u64,
+        file_index_low: file_info.nFileIndexLow as u64,
+    })
+}
+
+#[cfg(unix)]
+pub fn query_any_object_identity(path: &Path) -> Result<FileObjectIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).map_err(AetherError::Io)?;
+    let ino = meta.ino();
+    Ok(FileObjectIdentity {
+        volume_serial_number: meta.dev(),
+        file_index_high: (ino >> 32) as u64,
+        file_index_low: (ino & 0xFFFFFFFF) as u64,
+    })
+}
+
+#[cfg(not(any(windows, unix)))]
+pub fn query_any_object_identity(_path: &Path) -> Result<FileObjectIdentity> {
+    Ok(FileObjectIdentity {
+        volume_serial_number: 0,
+        file_index_high: 0,
+        file_index_low: 0,
+    })
+}
+
+pub type PathHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+
+static OWNERSHIP_PRE_CAPTURE_HOOK: std::sync::Mutex<Option<PathHook>> = std::sync::Mutex::new(None);
+static STAGING_PRE_PIN_HOOK: std::sync::Mutex<Option<PathHook>> = std::sync::Mutex::new(None);
+static PRE_PUBLICATION_HOOK: std::sync::Mutex<Option<PathHook>> = std::sync::Mutex::new(None);
+static CHILD_OPEN_PRE_HOOK: std::sync::Mutex<Option<PathHook>> = std::sync::Mutex::new(None);
+static ROOT_PRE_ENUMERATION_HOOK: std::sync::Mutex<Option<PathHook>> = std::sync::Mutex::new(None);
+static NESTED_DIR_PRE_ENUMERATION_HOOK: std::sync::Mutex<Option<PathHook>> =
+    std::sync::Mutex::new(None);
+static NESTED_DIR_PRE_TRAVERSAL_HOOK: std::sync::Mutex<Option<PathHook>> =
+    std::sync::Mutex::new(None);
+static CHILD_FILE_PRE_DELETE_HOOK: std::sync::Mutex<Option<PathHook>> = std::sync::Mutex::new(None);
+static CHILD_ENTRY_FINAL_PRE_DESTRUCTIVE_HOOK: std::sync::Mutex<Option<PathHook>> =
+    std::sync::Mutex::new(None);
+static SYMLINK_PRE_DELETE_HOOK: std::sync::Mutex<Option<PathHook>> = std::sync::Mutex::new(None);
+static NESTED_DIR_PRE_REMOVE_HOOK: std::sync::Mutex<Option<PathHook>> = std::sync::Mutex::new(None);
+static ROOT_PRE_REMOVE_HOOK: std::sync::Mutex<Option<PathHook>> = std::sync::Mutex::new(None);
+static TEMP_ENTRY_PRE_UNLINK_HOOK: std::sync::Mutex<Option<PathHook>> = std::sync::Mutex::new(None);
+
+static PARTIAL_TRAVERSAL_FAULT_INJECT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static FAULT_INJECT_TEMP_RENAME_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static FAULT_INJECT_PIN_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_ownership_pre_capture_hook(hook: Option<PathHook>) {
+    if let Ok(mut g) = OWNERSHIP_PRE_CAPTURE_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+pub fn set_staging_pre_pin_hook(hook: Option<PathHook>) {
+    if let Ok(mut g) = STAGING_PRE_PIN_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+pub fn set_pre_publication_hook(hook: Option<PathHook>) {
+    if let Ok(mut g) = PRE_PUBLICATION_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+pub fn set_child_open_pre_hook(hook: Option<PathHook>) {
+    if let Ok(mut g) = CHILD_OPEN_PRE_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+pub fn set_root_pre_enumeration_hook(hook: Option<PathHook>) {
+    if let Ok(mut g) = ROOT_PRE_ENUMERATION_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+pub fn set_nested_dir_pre_enumeration_hook(hook: Option<PathHook>) {
+    if let Ok(mut g) = NESTED_DIR_PRE_ENUMERATION_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+pub fn set_nested_dir_pre_traversal_hook(hook: Option<PathHook>) {
+    if let Ok(mut g) = NESTED_DIR_PRE_TRAVERSAL_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+pub fn set_child_file_pre_delete_hook(hook: Option<PathHook>) {
+    if let Ok(mut g) = CHILD_FILE_PRE_DELETE_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+pub fn set_child_entry_final_pre_destructive_hook(hook: Option<PathHook>) {
+    if let Ok(mut g) = CHILD_ENTRY_FINAL_PRE_DESTRUCTIVE_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+pub fn set_symlink_pre_delete_hook(hook: Option<PathHook>) {
+    if let Ok(mut g) = SYMLINK_PRE_DELETE_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+pub fn set_nested_dir_pre_remove_hook(hook: Option<PathHook>) {
+    if let Ok(mut g) = NESTED_DIR_PRE_REMOVE_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+pub fn set_root_pre_remove_hook(hook: Option<PathHook>) {
+    if let Ok(mut g) = ROOT_PRE_REMOVE_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+pub fn set_temp_entry_pre_unlink_hook(hook: Option<PathHook>) {
+    if let Ok(mut g) = TEMP_ENTRY_PRE_UNLINK_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+pub fn set_partial_traversal_fault_inject(val: bool) {
+    PARTIAL_TRAVERSAL_FAULT_INJECT.store(val, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn set_fault_inject_temp_rename_failure(val: bool) {
+    FAULT_INJECT_TEMP_RENAME_FAILURE.store(val, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn set_fault_inject_pin_failure(val: bool) {
+    FAULT_INJECT_PIN_FAILURE.store(val, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Threat-Model & Security Boundary:
+/// - Cross-user local isolation is enforced on Unix by verifying parent directory ownership against the
+///   running process UID and restricting POSIX mode to 0700.
+/// - On Windows, cross-user isolation is enforced by verifying parent directory ownership against the
+///   current process token (checking TokenUser, TokenOwner, and token membership for elevated/admin contexts)
+///   and inspecting explicit and inherited ACEs in the DACL to verify or establish restricted private permissions,
+///   rejecting any dangerous access (creation, modification, deletion, inheritance) granted to unauthorized principals
+///   (such as Everyone, BUILTIN\Users, Authenticated Users, or third-party accounts).
+/// - Threat-Model Boundary Limitation: Local filesystem permissions do not isolate against malicious concurrent
+///   processes or threads running under the IDENTICAL UID / user security token. Protection against same-user
+///   concurrent namespace substitution during snapshot creation is established by Isolated Staging Creation
+///   & Atomic Adoption (using an unguessable 128-bit random nonce in a private parent) and OS-level atomic
+///   no-replace publication (RENAME_NOREPLACE on Linux, renameatx_np(RENAME_EXCL) on macOS, MoveFileExW without replace on Windows).
+pub fn verify_and_secure_storage_parent(parent: &Path) -> Result<()> {
+    if !parent.is_dir() {
+        return Err(AetherError::PermissionDenied(format!(
+            "Parent storage path '{:?}' is not a directory",
+            parent
+        )));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::symlink_metadata(parent).map_err(AetherError::Io)?;
+        if meta.file_type().is_symlink() {
+            return Err(AetherError::PermissionDenied(format!(
+                "Parent storage path '{:?}' is a symlink; refusing operation",
+                parent
+            )));
+        }
+        let current_uid = unsafe { libc::getuid() };
+        if meta.uid() != current_uid {
+            return Err(AetherError::PermissionDenied(format!(
+                "Parent storage directory '{:?}' is owned by UID {}, but current process is UID {}; refusing operation",
+                parent,
+                meta.uid(),
+                current_uid
+            )));
+        }
+        let mode = meta.permissions().mode();
+        if (mode & 0o077) != 0 {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                |e| {
+                    AetherError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "Failed to enforce 0700 permissions on storage parent '{:?}': {}",
+                            parent, e
+                        ),
+                    ))
+                },
+            )?;
+            let meta_after = std::fs::symlink_metadata(parent).map_err(AetherError::Io)?;
+            if (meta_after.permissions().mode() & 0o077) != 0 {
+                return Err(AetherError::PermissionDenied(format!(
+                    "Failed to verify restricted 0700 permissions on storage parent '{:?}'",
+                    parent
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        match verify_storage_parent_acl(parent) {
+            Ok(()) => Ok(()),
+            Err(AetherError::PermissionDenied(ref msg))
+                if msg.contains("unsafe permissions") || msg.contains("NULL DACL") =>
+            {
+                secure_storage_parent_private_acl(parent)?;
+                verify_storage_parent_acl(parent)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+pub fn verify_storage_parent_acl(parent: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
+
+    let meta = std::fs::symlink_metadata(parent).map_err(AetherError::Io)?;
+    let attrs = meta.file_attributes();
+    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return Err(AetherError::PermissionDenied(format!(
+            "Parent storage path '{:?}' is a reparse point or junction; refusing operation",
+            parent
+        )));
+    }
+    if (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 {
+        return Err(AetherError::PermissionDenied(format!(
+            "Parent storage path '{:?}' is not a directory (attrs 0x{:x})",
+            parent, attrs
+        )));
+    }
+
+    if FAULT_INJECT_WINDOWS_SECURITY_DESCRIPTOR_FAILURE.with(|c| c.get()) {
+        return Err(AetherError::PermissionDenied(format!(
+            "Injected fault: failed to inspect security descriptor on storage parent '{:?}'",
+            parent
+        )));
+    }
+
+    let wide_parent: Vec<u16> = parent.as_os_str().encode_wide().chain(Some(0)).collect();
+
+    unsafe {
+        const SE_FILE_OBJECT: u32 = 1;
+        const OWNER_SECURITY_INFORMATION: u32 = 0x00000001;
+        const DACL_SECURITY_INFORMATION: u32 = 0x00000004;
+        const TOKEN_QUERY: u32 = 0x0008;
+
+        extern "system" {
+            fn GetNamedSecurityInfoW(
+                pObjectName: *const u16,
+                ObjectType: u32,
+                SecurityInfo: u32,
+                ppsidOwner: *mut *mut std::ffi::c_void,
+                ppsidGroup: *mut *mut std::ffi::c_void,
+                ppDacl: *mut *mut std::ffi::c_void,
+                ppSacl: *mut *mut std::ffi::c_void,
+                ppSecurityDescriptor: *mut *mut std::ffi::c_void,
+            ) -> u32;
+            fn OpenProcessToken(
+                ProcessHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn GetTokenInformation(
+                TokenHandle: *mut std::ffi::c_void,
+                TokenInformationClass: u32,
+                TokenInformation: *mut std::ffi::c_void,
+                TokenInformationLength: u32,
+                ReturnLength: *mut u32,
+            ) -> i32;
+            fn CheckTokenMembership(
+                TokenHandle: *mut std::ffi::c_void,
+                SidToCheck: *mut std::ffi::c_void,
+                IsMember: *mut i32,
+            ) -> i32;
+            fn CreateWellKnownSid(
+                WellKnownSidType: u32,
+                DomainSid: *mut std::ffi::c_void,
+                pSid: *mut std::ffi::c_void,
+                cbSid: *mut u32,
+            ) -> i32;
+            fn EqualSid(pSid1: *mut std::ffi::c_void, pSid2: *mut std::ffi::c_void) -> i32;
+            fn GetAclInformation(
+                pAcl: *mut std::ffi::c_void,
+                pAclInformation: *mut std::ffi::c_void,
+                nAclInformationLength: u32,
+                dwAclInformationClass: u32,
+            ) -> i32;
+            fn GetAce(
+                pAcl: *mut std::ffi::c_void,
+                dwAceIndex: u32,
+                pAce: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn ConvertSidToStringSidW(Sid: *mut std::ffi::c_void, StringSid: *mut *mut u16) -> i32;
+            fn LocalFree(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        }
+
+        let mut p_owner_sid: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut p_dacl: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut p_sec_desc: *mut std::ffi::c_void = std::ptr::null_mut();
+
+        let sec_res = GetNamedSecurityInfoW(
+            wide_parent.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut p_owner_sid,
+            std::ptr::null_mut(),
+            &mut p_dacl,
+            std::ptr::null_mut(),
+            &mut p_sec_desc,
+        );
+
+        if sec_res != 0 {
+            return Err(AetherError::PermissionDenied(format!(
+                "Failed to query security descriptor on storage parent '{:?}': Win32 error {}",
+                parent, sec_res
+            )));
+        }
+
+        struct SecDescGuard(*mut std::ffi::c_void);
+        impl Drop for SecDescGuard {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        LocalFree(self.0);
+                    }
+                }
+            }
+        }
+        let _desc_guard = SecDescGuard(p_sec_desc);
+
+        let mut token: *mut std::ffi::c_void = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+        struct TokenGuard(*mut std::ffi::c_void);
+        impl Drop for TokenGuard {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        CloseHandle(self.0);
+                    }
+                }
+            }
+        }
+        let _tok_guard = TokenGuard(token);
+
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct SID_AND_ATTRIBUTES {
+            Sid: *mut std::ffi::c_void,
+            Attributes: u32,
+        }
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct TOKEN_USER {
+            User: SID_AND_ATTRIBUTES,
+        }
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct TOKEN_OWNER {
+            Owner: *mut std::ffi::c_void,
+        }
+
+        #[repr(align(8))]
+        struct AlignedBuffer([u8; 512]);
+        let mut user_buf = AlignedBuffer([0u8; 512]);
+        let mut ret_len = 0u32;
+        #[allow(non_upper_case_globals)]
+        const TokenUser: u32 = 1;
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            user_buf.0.as_mut_ptr() as *mut _,
+            user_buf.0.len() as u32,
+            &mut ret_len,
+        ) == 0
+        {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+        let token_user = &*(user_buf.0.as_ptr() as *const TOKEN_USER);
+
+        let mut owner_buf = AlignedBuffer([0u8; 512]);
+        #[allow(non_upper_case_globals)]
+        const TokenOwner: u32 = 4;
+        let mut tok_owner_sid: *mut std::ffi::c_void = std::ptr::null_mut();
+        if GetTokenInformation(
+            token,
+            TokenOwner,
+            owner_buf.0.as_mut_ptr() as *mut _,
+            owner_buf.0.len() as u32,
+            &mut ret_len,
+        ) != 0
+        {
+            let token_owner = &*(owner_buf.0.as_ptr() as *const TOKEN_OWNER);
+            tok_owner_sid = token_owner.Owner;
+        }
+
+        // Test seam for simulating different owner
+        if FAULT_INJECT_WINDOWS_DIFFERENT_OWNER.with(|c| c.get()) {
+            return Err(AetherError::PermissionDenied(format!(
+                "Parent storage directory '{:?}' is not owned by an authorized private owner (simulated different user)",
+                parent
+            )));
+        }
+
+        // Allow simulated owner SID (e.g. BUILTIN\Users or BUILTIN\Administrators) for testing
+        const WIN_LOCAL_SYSTEM_SID: u32 = 22;
+        const WIN_BUILTIN_ADMINISTRATORS_SID: u32 = 26;
+        let mut sim_owner_sid = vec![0u8; 68];
+        let mut effective_owner_sid = p_owner_sid;
+        if let Some(well_known_type) = FAULT_INJECT_WINDOWS_SIMULATED_OWNER_SID.with(|c| c.get()) {
+            let mut cb_sim = sim_owner_sid.len() as u32;
+            if CreateWellKnownSid(
+                well_known_type,
+                std::ptr::null_mut(),
+                sim_owner_sid.as_mut_ptr() as *mut _,
+                &mut cb_sim,
+            ) != 0
+            {
+                effective_owner_sid = sim_owner_sid.as_mut_ptr() as *mut _;
+            }
+        }
+
+        // Narrow accepted-owner policy:
+        // 1. Current individual user (TokenUser):
+        let is_current_user = EqualSid(token_user.User.Sid, effective_owner_sid) != 0;
+
+        // 2. Elevated administrative storage (BUILTIN\Administrators S-1-5-32-544):
+        let mut is_authorized_admin_owner = false;
+        let mut admin_sid = vec![0u8; 68];
+        let mut cb_admin = admin_sid.len() as u32;
+        if CreateWellKnownSid(
+            WIN_BUILTIN_ADMINISTRATORS_SID,
+            std::ptr::null_mut(),
+            admin_sid.as_mut_ptr() as *mut _,
+            &mut cb_admin,
+        ) != 0
+            && EqualSid(admin_sid.as_mut_ptr() as *mut _, effective_owner_sid) != 0
+        {
+            let mut is_member = 0i32;
+            let token_is_admin_member = (CheckTokenMembership(
+                std::ptr::null_mut(),
+                admin_sid.as_mut_ptr() as *mut _,
+                &mut is_member,
+            ) != 0
+                && is_member != 0)
+                || FAULT_INJECT_WINDOWS_SIMULATED_ADMIN_TOKEN.with(|c| c.get());
+
+            if token_is_admin_member {
+                let matches_tok_owner = (!tok_owner_sid.is_null()
+                    && EqualSid(tok_owner_sid, admin_sid.as_mut_ptr() as *mut _) != 0)
+                    || FAULT_INJECT_WINDOWS_SIMULATED_ADMIN_TOKEN.with(|c| c.get());
+
+                #[repr(C)]
+                #[allow(non_snake_case)]
+                struct TOKEN_ELEVATION {
+                    TokenIsElevated: u32,
+                }
+                const TOKEN_ELEVATION_CLASS: u32 = 20;
+                let mut elev = TOKEN_ELEVATION { TokenIsElevated: 0 };
+                let mut elev_ret_len = 0u32;
+                let is_elevated = (GetTokenInformation(
+                    token,
+                    TOKEN_ELEVATION_CLASS,
+                    &mut elev as *mut _ as *mut _,
+                    std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                    &mut elev_ret_len,
+                ) != 0
+                    && elev.TokenIsElevated != 0)
+                    || FAULT_INJECT_WINDOWS_SIMULATED_ADMIN_TOKEN.with(|c| c.get());
+
+                if matches_tok_owner || is_elevated {
+                    is_authorized_admin_owner = true;
+                }
+            }
+        }
+
+        // 3. SYSTEM (S-1-5-18):
+        let mut is_authorized_system_owner = false;
+        let mut sys_sid = vec![0u8; 68];
+        let mut cb_sys = sys_sid.len() as u32;
+        if CreateWellKnownSid(
+            WIN_LOCAL_SYSTEM_SID,
+            std::ptr::null_mut(),
+            sys_sid.as_mut_ptr() as *mut _,
+            &mut cb_sys,
+        ) != 0
+            && EqualSid(sys_sid.as_mut_ptr() as *mut _, effective_owner_sid) != 0
+            && EqualSid(token_user.User.Sid, sys_sid.as_mut_ptr() as *mut _) != 0
+        {
+            is_authorized_system_owner = true;
+        }
+
+        let is_valid_owner =
+            is_current_user || is_authorized_admin_owner || is_authorized_system_owner;
+        if !is_valid_owner {
+            return Err(AetherError::PermissionDenied(format!(
+                "Parent storage directory '{:?}' is not owned by an authorized private owner (individual TokenUser or authorized elevated Administrators); refusing operation",
+                parent
+            )));
+        }
+
+        // Inspect DACL
+        if p_dacl.is_null() {
+            return Err(AetherError::PermissionDenied(format!(
+                "Parent storage directory '{:?}' has a NULL DACL (unprotected); refusing operation",
+                parent
+            )));
+        }
+
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct ACL_SIZE_INFORMATION {
+            AceCount: u32,
+            AclBytesInUse: u32,
+            AclBytesFree: u32,
+        }
+        const ACL_SIZE_INFO_CLASS: u32 = 2;
+        let mut acl_size = ACL_SIZE_INFORMATION {
+            AceCount: 0,
+            AclBytesInUse: 0,
+            AclBytesFree: 0,
+        };
+        if GetAclInformation(
+            p_dacl,
+            &mut acl_size as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            ACL_SIZE_INFO_CLASS,
+        ) == 0
+        {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct ACE_HEADER {
+            AceType: u8,
+            AceFlags: u8,
+            AceSize: u16,
+        }
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct ACCESS_ALLOWED_ACE {
+            Header: ACE_HEADER,
+            Mask: u32,
+            SidStart: u32,
+        }
+
+        const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+        const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 9;
+
+        const FILE_ADD_FILE: u32 = 0x0002;
+        const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
+        const FILE_WRITE_DATA: u32 = 0x0002;
+        const FILE_APPEND_DATA: u32 = 0x0004;
+        const FILE_WRITE_EA: u32 = 0x0010;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        const FILE_DELETE_CHILD: u32 = 0x0040;
+        const DELETE: u32 = 0x00010000;
+        const WRITE_DAC: u32 = 0x00040000;
+        const WRITE_OWNER: u32 = 0x00080000;
+        const GENERIC_WRITE: u32 = 0x40000000;
+        const GENERIC_ALL: u32 = 0x10000000;
+
+        const DANGEROUS_PERMISSIONS: u32 = FILE_ADD_FILE
+            | FILE_ADD_SUBDIRECTORY
+            | FILE_WRITE_DATA
+            | FILE_APPEND_DATA
+            | FILE_WRITE_EA
+            | FILE_WRITE_ATTRIBUTES
+            | FILE_DELETE_CHILD
+            | DELETE
+            | WRITE_DAC
+            | WRITE_OWNER
+            | GENERIC_WRITE
+            | GENERIC_ALL;
+
+        for i in 0..acl_size.AceCount {
+            let mut p_ace: *mut std::ffi::c_void = std::ptr::null_mut();
+            if GetAce(p_dacl, i, &mut p_ace) == 0 {
+                return Err(AetherError::Io(std::io::Error::last_os_error()));
+            }
+            let ace_hdr = &*(p_ace as *const ACE_HEADER);
+            if ace_hdr.AceType == ACCESS_ALLOWED_ACE_TYPE
+                || ace_hdr.AceType == ACCESS_ALLOWED_CALLBACK_ACE_TYPE
+            {
+                let allowed_ace = &*(p_ace as *const ACCESS_ALLOWED_ACE);
+                let mask = allowed_ace.Mask;
+                if (mask & DANGEROUS_PERMISSIONS) != 0 {
+                    let ace_sid = &allowed_ace.SidStart as *const u32 as *mut std::ffi::c_void;
+                    let is_current_user_ace = EqualSid(token_user.User.Sid, ace_sid) != 0;
+
+                    if is_current_user_ace {
+                        continue;
+                    }
+
+                    let mut p_str: *mut u16 = std::ptr::null_mut();
+                    if ConvertSidToStringSidW(ace_sid, &mut p_str) != 0 && !p_str.is_null() {
+                        let mut len = 0;
+                        while *p_str.add(len) != 0 {
+                            len += 1;
+                        }
+                        let s = String::from_utf16_lossy(std::slice::from_raw_parts(p_str, len));
+                        LocalFree(p_str as *mut _);
+
+                        // S-1-5-18 = NT AUTHORITY\SYSTEM
+                        // S-1-5-32-544 = BUILTIN\Administrators
+                        if s == "S-1-5-18" || s == "S-1-5-32-544" {
+                            continue;
+                        }
+
+                        return Err(AetherError::PermissionDenied(format!(
+                            "Parent storage directory '{:?}' has unsafe permissions: ACE {} grants dangerous permissions (0x{:08X}) to unauthorized principal {}; refusing operation",
+                            parent, i, mask, s
+                        )));
+                    } else {
+                        return Err(AetherError::PermissionDenied(format!(
+                            "Parent storage directory '{:?}' has unsafe permissions: ACE {} grants dangerous permissions (0x{:08X}) to unknown principal; refusing operation",
+                            parent, i, mask
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn secure_storage_parent_private_acl(parent: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide_parent: Vec<u16> = parent.as_os_str().encode_wide().chain(Some(0)).collect();
+
+    unsafe {
+        const SE_FILE_OBJECT: u32 = 1;
+        const DACL_SECURITY_INFORMATION: u32 = 0x00000004;
+        const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x80000000;
+        const TOKEN_QUERY: u32 = 0x0008;
+        const ACL_REVISION: u32 = 2;
+        const CONTAINER_INHERIT_ACE: u32 = 0x02;
+        const OBJECT_INHERIT_ACE: u32 = 0x01;
+        const GENERIC_ALL: u32 = 0x10000000;
+        const WIN_LOCAL_SYSTEM_SID: u32 = 22;
+        const WIN_BUILTIN_ADMINISTRATORS_SID: u32 = 26;
+
+        extern "system" {
+            fn OpenProcessToken(
+                ProcessHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn GetTokenInformation(
+                TokenHandle: *mut std::ffi::c_void,
+                TokenInformationClass: u32,
+                TokenInformation: *mut std::ffi::c_void,
+                TokenInformationLength: u32,
+                ReturnLength: *mut u32,
+            ) -> i32;
+            fn CreateWellKnownSid(
+                WellKnownSidType: u32,
+                DomainSid: *mut std::ffi::c_void,
+                pSid: *mut std::ffi::c_void,
+                cbSid: *mut u32,
+            ) -> i32;
+            fn InitializeAcl(
+                pAcl: *mut std::ffi::c_void,
+                nAclLength: u32,
+                dwAclRevision: u32,
+            ) -> i32;
+            fn AddAccessAllowedAceEx(
+                pAcl: *mut std::ffi::c_void,
+                dwAceRevision: u32,
+                AceFlags: u32,
+                AccessMask: u32,
+                pSid: *mut std::ffi::c_void,
+            ) -> i32;
+            fn SetNamedSecurityInfoW(
+                pObjectName: *const u16,
+                ObjectType: u32,
+                SecurityInfo: u32,
+                ppsidOwner: *mut std::ffi::c_void,
+                ppsidGroup: *mut std::ffi::c_void,
+                ppDacl: *mut std::ffi::c_void,
+                ppSacl: *mut std::ffi::c_void,
+            ) -> u32;
+            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        }
+
+        let mut token: *mut std::ffi::c_void = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct SID_AND_ATTRIBUTES {
+            Sid: *mut std::ffi::c_void,
+            Attributes: u32,
+        }
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct TOKEN_USER {
+            User: SID_AND_ATTRIBUTES,
+        }
+
+        #[repr(align(8))]
+        struct AlignedBuffer([u8; 512]);
+        let mut user_buf = AlignedBuffer([0u8; 512]);
+        let mut ret_len = 0u32;
+        #[allow(non_upper_case_globals)]
+        const TokenUser: u32 = 1;
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            user_buf.0.as_mut_ptr() as *mut _,
+            user_buf.0.len() as u32,
+            &mut ret_len,
+        ) == 0
+        {
+            CloseHandle(token);
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+        CloseHandle(token);
+        let token_user = &*(user_buf.0.as_ptr() as *const TOKEN_USER);
+
+        let mut system_sid = vec![0u8; 68];
+        let mut cb_system = system_sid.len() as u32;
+        if CreateWellKnownSid(
+            WIN_LOCAL_SYSTEM_SID,
+            std::ptr::null_mut(),
+            system_sid.as_mut_ptr() as *mut _,
+            &mut cb_system,
+        ) == 0
+        {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+
+        let mut admin_sid = vec![0u8; 68];
+        let mut cb_admin = admin_sid.len() as u32;
+        if CreateWellKnownSid(
+            WIN_BUILTIN_ADMINISTRATORS_SID,
+            std::ptr::null_mut(),
+            admin_sid.as_mut_ptr() as *mut _,
+            &mut cb_admin,
+        ) == 0
+        {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+
+        let mut acl_buf = vec![0u8; 1024];
+        if InitializeAcl(
+            acl_buf.as_mut_ptr() as *mut _,
+            acl_buf.len() as u32,
+            ACL_REVISION,
+        ) == 0
+        {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+
+        let ace_flags = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
+        if AddAccessAllowedAceEx(
+            acl_buf.as_mut_ptr() as *mut _,
+            ACL_REVISION,
+            ace_flags,
+            GENERIC_ALL,
+            token_user.User.Sid,
+        ) == 0
+        {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+
+        if AddAccessAllowedAceEx(
+            acl_buf.as_mut_ptr() as *mut _,
+            ACL_REVISION,
+            ace_flags,
+            GENERIC_ALL,
+            system_sid.as_mut_ptr() as *mut _,
+        ) == 0
+        {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+
+        if AddAccessAllowedAceEx(
+            acl_buf.as_mut_ptr() as *mut _,
+            ACL_REVISION,
+            ace_flags,
+            GENERIC_ALL,
+            admin_sid.as_mut_ptr() as *mut _,
+        ) == 0
+        {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+
+        let set_res = SetNamedSecurityInfoW(
+            wide_parent.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            acl_buf.as_mut_ptr() as *mut _,
+            std::ptr::null_mut(),
+        );
+
+        if set_res != 0 {
+            return Err(AetherError::PermissionDenied(format!(
+                "Failed to set private ACL on storage parent '{:?}': Win32 error {}",
+                parent, set_res
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn verify_storage_parent_acl(_parent: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn secure_storage_parent_private_acl(_parent: &Path) -> Result<()> {
+    Ok(())
+}
+
+pub fn create_and_pin_directory(path: &Path) -> Result<PinnedDirectoryHandle> {
+    create_and_pin_directory_with_hook(path, None)
+}
+
+pub fn create_and_pin_directory_with_hook(
+    path: &Path,
+    hook: Option<PathHook>,
+) -> Result<PinnedDirectoryHandle> {
+    let parent = path.parent().ok_or_else(|| {
+        AetherError::PermissionDenied(format!("Directory '{:?}' has no parent", path))
+    })?;
+    verify_and_secure_storage_parent(parent)?;
+
+    // Check if destination path already exists prior to operation (standard collision check)
+    let initial_dest_exists = match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(AetherError::Io(e)),
+    };
+    if initial_dest_exists {
+        return Err(AetherError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "Failed to create snapshot directory '{:?}': directory already exists",
+                path
+            ),
+        )));
+    }
+
+    // Isolated Staging Creation:
+    // Create an unpredictable, cryptographically random staging directory inside the verified parent.
+    // Because the name is a 128-bit random nonce inside a private parent,
+    // no concurrent process can predict or pre-substitute it.
+    let staging_nonce = format!(
+        ".stage_{}_{}",
+        uuid::Uuid::new_v4().simple(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let staging_path = parent.join(&staging_nonce);
+
+    std::fs::create_dir(&staging_path).map_err(AetherError::Io)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&staging_path, std::fs::Permissions::from_mode(0o700));
+    }
+
+    let initial_staging_id = query_directory_identity(&staging_path)?;
+
+    // Seam: Test 1 & 2 pre-pin hook (replace staging directory before pin attempt)
+    if let Ok(guard) = STAGING_PRE_PIN_HOOK.lock() {
+        if let Some(ref h) = *guard {
+            h(&staging_path);
+        }
+    }
+
+    if FAULT_INJECT_PIN_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(AetherError::PermissionDenied(format!(
+            "Injected fault: pinning failed for staging directory '{:?}'",
+            staging_path
+        )));
+    }
+
+    // Immediately open and pin the staging directory handle.
+    // This is our verified, immutable first ownership witness.
+    let mut pinned = match pin_created_directory_internal(&staging_path, initial_staging_id) {
+        Ok(p) => p,
+        Err(e) => {
+            // NEVER perform best-effort removal of an unpinned pathname when ownership has not been established!
+            // Preserve the potentially replaced object, record the failure, and fail closed.
+            return Err(AetherError::PermissionDenied(format!(
+                "Failed to pin created staging directory '{:?}': {}; preserving object without deletion",
+                staging_path, e
+            )));
+        }
+    };
+
+    // Adversarial Hook Seam (Test 1):
+    // Simulates an adversary attempting to substitute `path` before ownership capture.
+    if let Some(ref h) = hook {
+        h(path);
+    } else if let Ok(guard) = OWNERSHIP_PRE_CAPTURE_HOOK.lock() {
+        if let Some(ref h) = *guard {
+            h(path);
+        }
+    }
+
+    // If destination `path` already exists (e.g. pre-created by adversary or test hook),
+    // NEVER adopt it! Refuse adoption, preserve the replacement object, clean staging, and fail closed.
+    let dest_exists = match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            let clean_res = pinned.clean_contents();
+            let rm_res = pinned.verify_and_remove_entry();
+            if let Err(cr) = clean_res {
+                return Err(AetherError::Internal(format!(
+                    "Destination metadata check failed ({}) and staging cleanup failed: {}",
+                    e, cr
+                )));
+            }
+            if let Err(rr) = rm_res {
+                return Err(AetherError::Internal(format!(
+                    "Destination metadata check failed ({}) and staging removal failed: {}",
+                    e, rr
+                )));
+            }
+            return Err(AetherError::Io(e));
+        }
+    };
+
+    if dest_exists {
+        // Clean staging dir through its pinned handle
+        let clean_res = pinned.clean_contents();
+        let rm_res = pinned.verify_and_remove_entry();
+        if let Err(cr) = clean_res {
+            return Err(AetherError::Internal(format!(
+                "Refusing adoption of '{:?}': destination already exists, and staging cleanup failed: {}",
+                path, cr
+            )));
+        }
+        if let Err(rr) = rm_res {
+            return Err(AetherError::Internal(format!(
+                "Refusing adoption of '{:?}': destination already exists, and staging removal failed: {}",
+                path, rr
+            )));
+        }
+        return Err(AetherError::PermissionDenied(format!(
+            "Refusing to adopt directory '{:?}': destination was substituted before ownership capture",
+            path
+        )));
+    }
+
+    // Seam: Test 3 & 4 pre-publication hook
+    // Invoked after final absence check and immediately before atomic no-replace publication
+    if let Ok(guard) = PRE_PUBLICATION_HOOK.lock() {
+        if let Some(ref h) = *guard {
+            h(path);
+        }
+    }
+
+    // Publish the pinned staging directory to `path` with no-replace semantics
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide_stage: Vec<u16> = staging_path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let wide_dest: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        extern "system" {
+            fn MoveFileExW(
+                lpExistingFileName: *const u16,
+                lpNewFileName: *const u16,
+                dwFlags: u32,
+            ) -> i32;
+        }
+        // dwFlags = 0 (no MOVEFILE_REPLACE_EXISTING: atomic no-replace publication)
+        let res = unsafe { MoveFileExW(wide_stage.as_ptr(), wide_dest.as_ptr(), 0) };
+        if res == 0 {
+            let err = std::io::Error::last_os_error();
+            let clean_res = pinned.clean_contents();
+            let rm_res = pinned.verify_and_remove_entry();
+            if let Err(cr) = clean_res {
+                return Err(AetherError::Internal(format!(
+                    "Publication failed ({}) and staging cleanup failed: {}",
+                    err, cr
+                )));
+            }
+            if let Err(rr) = rm_res {
+                return Err(AetherError::Internal(format!(
+                    "Publication failed ({}) and staging removal failed: {}",
+                    err, rr
+                )));
+            }
+            if err.raw_os_error() == Some(183) || err.raw_os_error() == Some(80) {
+                return Err(AetherError::PermissionDenied(format!(
+                    "Refusing to adopt directory '{:?}': destination already exists or was substituted",
+                    path
+                )));
+            }
+            return Err(AetherError::Io(err));
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::{FromRawFd, OwnedFd};
+
+        let file_name = path.file_name().ok_or_else(|| {
+            AetherError::PermissionDenied(format!("Directory '{:?}' has no file name", path))
+        })?;
+        let c_parent = CString::new(parent.as_os_str().as_bytes())
+            .map_err(|e| AetherError::Internal(format!("Invalid parent CString: {}", e)))?;
+        let c_stage = CString::new(staging_nonce.as_bytes())
+            .map_err(|e| AetherError::Internal(format!("Invalid stage CString: {}", e)))?;
+        let c_dest = CString::new(file_name.as_bytes())
+            .map_err(|e| AetherError::Internal(format!("Invalid dest CString: {}", e)))?;
+
+        let parent_fd_raw = unsafe {
+            libc::open(
+                c_parent.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if parent_fd_raw < 0 {
+            let clean_res = pinned.clean_contents();
+            let rm_res = pinned.verify_and_remove_entry();
+            if let Err(cr) = clean_res {
+                return Err(AetherError::Internal(format!(
+                    "Failed to open parent directory and staging cleanup failed: {}",
+                    cr
+                )));
+            }
+            if let Err(rr) = rm_res {
+                return Err(AetherError::Internal(format!(
+                    "Failed to open parent directory and staging removal failed: {}",
+                    rr
+                )));
+            }
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+        let _parent_fd = unsafe { OwnedFd::from_raw_fd(parent_fd_raw) };
+
+        // Double check target absence in parent descriptor
+        let mut target_stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                parent_fd_raw,
+                c_dest.as_ptr(),
+                &mut target_stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0
+        {
+            let clean_res = pinned.clean_contents();
+            let rm_res = pinned.verify_and_remove_entry();
+            if let Err(cr) = clean_res {
+                return Err(AetherError::Internal(format!(
+                    "Destination already exists and staging cleanup failed: {}",
+                    cr
+                )));
+            }
+            if let Err(rr) = rm_res {
+                return Err(AetherError::Internal(format!(
+                    "Destination already exists and staging removal failed: {}",
+                    rr
+                )));
+            }
+            return Err(AetherError::PermissionDenied(format!(
+                "Refusing to adopt directory '{:?}': destination already exists in parent descriptor",
+                path
+            )));
+        }
+
+        // Seam: Test 3 & 4 pre-publication hook on Unix
+        if let Ok(guard) = PRE_PUBLICATION_HOOK.lock() {
+            if let Some(ref h) = *guard {
+                h(path);
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let res = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    parent_fd_raw,
+                    c_stage.as_ptr(),
+                    parent_fd_raw,
+                    c_dest.as_ptr(),
+                    1u32, // RENAME_NOREPLACE
+                )
+            };
+            if res != 0 {
+                let err = std::io::Error::last_os_error();
+                let clean_res = pinned.clean_contents();
+                let rm_res = pinned.verify_and_remove_entry();
+                if let Err(cr) = clean_res {
+                    return Err(AetherError::Internal(format!(
+                        "Publication failed and staging cleanup failed: {}",
+                        cr
+                    )));
+                }
+                if let Err(rr) = rm_res {
+                    return Err(AetherError::Internal(format!(
+                        "Publication failed and staging removal failed: {}",
+                        rr
+                    )));
+                }
+                if err.raw_os_error() == Some(libc::EEXIST) {
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Refusing to adopt directory '{:?}': destination already exists (renameat2 RENAME_NOREPLACE rejected replacement)",
+                        path
+                    )));
+                }
+                return Err(AetherError::Io(err));
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            extern "C" {
+                fn renameatx_np(
+                    fromfd: libc::c_int,
+                    from: *const libc::c_char,
+                    tofd: libc::c_int,
+                    to: *const libc::c_char,
+                    flags: libc::c_uint,
+                ) -> libc::c_int;
+            }
+            const RENAME_EXCL: libc::c_uint = 0x00000004;
+            let res = unsafe {
+                renameatx_np(
+                    parent_fd_raw,
+                    c_stage.as_ptr(),
+                    parent_fd_raw,
+                    c_dest.as_ptr(),
+                    RENAME_EXCL,
+                )
+            };
+            if res != 0 {
+                let err = std::io::Error::last_os_error();
+                let clean_res = pinned.clean_contents();
+                let rm_res = pinned.verify_and_remove_entry();
+                if let Err(cr) = clean_res {
+                    return Err(AetherError::Internal(format!(
+                        "Publication failed and staging cleanup failed: {}",
+                        cr
+                    )));
+                }
+                if let Err(rr) = rm_res {
+                    return Err(AetherError::Internal(format!(
+                        "Publication failed and staging removal failed: {}",
+                        rr
+                    )));
+                }
+                if err.raw_os_error() == Some(libc::EEXIST) {
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Refusing to adopt directory '{:?}': destination already exists (renameatx_np RENAME_EXCL rejected replacement)",
+                        path
+                    )));
+                }
+                return Err(AetherError::Io(err));
+            }
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            // Fail closed: Never fall back to replacement-capable rename semantics!
+            let clean_res = pinned.clean_contents();
+            let rm_res = pinned.verify_and_remove_entry();
+            return Err(AetherError::PermissionDenied(format!(
+                "Exclusive atomic no-replace publication is unsupported on this platform; failing closed to prevent replacement races on '{:?}'",
+                path
+            )));
+        }
+    }
+
+    // Publication succeeded: update path in PinnedDirectoryHandle
+    pinned.path = path.to_path_buf();
+    Ok(pinned)
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct PinnedDirectoryHandle {
+    file: std::fs::File,
+    path: PathBuf,
+    identity: FileObjectIdentity,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct PinnedDirectoryHandle {
+    fd: std::os::unix::io::OwnedFd,
+    path: PathBuf,
+    identity: FileObjectIdentity,
+}
+
+#[cfg(not(any(windows, unix)))]
+#[derive(Debug)]
+pub struct PinnedDirectoryHandle {
+    path: PathBuf,
+    identity: FileObjectIdentity,
+}
+
+#[cfg(windows)]
+impl PinnedDirectoryHandle {
+    pub fn identity(&self) -> FileObjectIdentity {
+        self.identity
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn clean_contents(&self) -> Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        clean_directory_handle_windows_inner(
+            self.file.as_raw_handle(),
+            &self.path,
+            self.identity,
+            true,
+        )
+    }
+
+    pub fn verify_and_remove_entry(self) -> Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        #[allow(non_upper_case_globals)]
+        const FileDispositionInfo: u32 = 4;
+
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct FILE_DISPOSITION_INFO {
+            DeleteFile: u8,
+        }
+        extern "system" {
+            fn SetFileInformationByHandle(
+                hFile: *mut std::ffi::c_void,
+                FileInformationClass: u32,
+                lpFileInformation: *mut std::ffi::c_void,
+                dwBufferSize: u32,
+            ) -> i32;
+        }
+
+        let current_id = match query_directory_identity(&self.path) {
+            Ok(id) => id,
+            Err(AetherError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(())
+            }
+            Err(e) => return Err(e),
+        };
+
+        if current_id != self.identity {
+            return Err(AetherError::PermissionDenied(format!(
+                "Directory entry '{:?}' identity conflict: directory was replaced (expected {:?}, found {:?}); refusing removal to preserve replaced object",
+                self.path, self.identity, current_id
+            )));
+        }
+
+        // Test hook check (Test 7: root directory replacement between identity verification and removal)
+        if let Ok(guard) = ROOT_PRE_REMOVE_HOOK.lock() {
+            if let Some(ref hook) = *guard {
+                hook(&self.path);
+                let post_hook_id = query_directory_identity(&self.path).ok();
+                if post_hook_id != Some(self.identity) {
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Directory entry '{:?}' identity conflict: directory was replaced during removal; refusing removal to preserve replaced object",
+                        self.path
+                    )));
+                }
+            }
+        }
+
+        // Set delete disposition on the open directory handle
+        let disp = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+        let set_res = unsafe {
+            SetFileInformationByHandle(
+                self.file.as_raw_handle(),
+                FileDispositionInfo,
+                &disp as *const _ as *mut std::ffi::c_void,
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        if set_res == 0 {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+
+        // Drop the open handle so Windows commits deletion of the handle-bound object
+        drop(self.file);
+
+        // Absence verification (NO pathname fallback remove_dir)
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(_) => {
+                let id_now = query_directory_identity(&self.path).ok();
+                if id_now == Some(self.identity) {
+                    Err(AetherError::Internal(format!(
+                        "Directory '{:?}' still exists after handle deletion disposition commit",
+                        self.path
+                    )))
+                } else {
+                    Err(AetherError::PermissionDenied(format!(
+                        "Directory '{:?}' was replaced during removal; refusing further action to preserve replaced object",
+                        self.path
+                    )))
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(AetherError::Io(e)),
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn clean_directory_handle_windows(
+    dir_path: &Path,
+    expected_dir_id: FileObjectIdentity,
+) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+    const GENERIC_READ: u32 = 0x80000000;
+    const DELETE: u32 = 0x00010000;
+    const SYNCHRONIZE: u32 = 0x00100000;
+    const FILE_SHARE_READ: u32 = 0x00000001;
+    const FILE_SHARE_WRITE: u32 = 0x00000002;
+    const FILE_SHARE_DELETE: u32 = 0x00000004;
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(GENERIC_READ | DELETE | SYNCHRONIZE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(dir_path)
+        .map_err(AetherError::Io)?;
+
+    clean_directory_handle_windows_inner(file.as_raw_handle(), dir_path, expected_dir_id, true)
+}
+
+#[cfg(windows)]
+fn clean_directory_handle_windows_inner(
+    dir_handle: *mut std::ffi::c_void,
+    dir_path: &Path,
+    expected_dir_id: FileObjectIdentity,
+    is_root: bool,
+) -> Result<()> {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
+    const FILE_OPEN_REPARSE_POINT: u32 = 0x00200000;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x00000020;
+    const GENERIC_READ: u32 = 0x80000000;
+    const DELETE: u32 = 0x00010000;
+    const SYNCHRONIZE: u32 = 0x00100000;
+    const FILE_SHARE_READ: u32 = 0x00000001;
+    const FILE_SHARE_WRITE: u32 = 0x00000002;
+    const FILE_SHARE_DELETE: u32 = 0x00000004;
+    const OBJ_CASE_INSENSITIVE: u32 = 0x00000040;
+    const STATUS_OBJECT_NAME_NOT_FOUND: i32 = -1073741772; // 0xC0000034
+    const STATUS_OBJECT_PATH_NOT_FOUND: i32 = -1073741766; // 0xC000003A
+
+    #[allow(non_upper_case_globals)]
+    const FileDispositionInfo: u32 = 4;
+    #[allow(non_upper_case_globals)]
+    const FileIdBothDirectoryInfo: u32 = 10;
+    #[allow(non_upper_case_globals)]
+    const FileIdBothDirectoryRestartInfo: u32 = 11;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct FILE_DISPOSITION_INFO {
+        DeleteFile: u8,
+    }
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct BY_HANDLE_FILE_INFORMATION {
+        dwFileAttributes: u32,
+        ftCreationTime: [u32; 2],
+        ftLastAccessTime: [u32; 2],
+        ftLastWriteTime: [u32; 2],
+        dwVolumeSerialNumber: u32,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+        nNumberOfLinks: u32,
+        nFileIndexHigh: u32,
+        nFileIndexLow: u32,
+    }
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct FILE_ID_BOTH_DIR_INFO {
+        NextEntryOffset: u32,
+        FileIndex: u32,
+        CreationTime: i64,
+        LastAccessTime: i64,
+        LastWriteTime: i64,
+        ChangeTime: i64,
+        EndOfFile: i64,
+        AllocationSize: i64,
+        FileAttributes: u32,
+        FileNameLength: u32,
+        EaSize: u32,
+        ShortNameLength: u8,
+        ShortName: [u16; 12],
+        FileId: i64,
+        FileName: [u16; 1],
+    }
+
+    #[repr(C)]
+    struct UNICODE_STRING {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+
+    #[repr(C)]
+    struct OBJECT_ATTRIBUTES {
+        length: u32,
+        root_directory: *mut std::ffi::c_void,
+        object_name: *mut UNICODE_STRING,
+        attributes: u32,
+        security_descriptor: *mut std::ffi::c_void,
+        security_quality_of_service: *mut std::ffi::c_void,
+    }
+
+    #[repr(C)]
+    struct IO_STATUS_BLOCK {
+        status: i32,
+        information: usize,
+    }
+
+    type NtOpenFileFn = unsafe extern "system" fn(
+        file_handle: *mut *mut std::ffi::c_void,
+        desired_access: u32,
+        object_attributes: *mut OBJECT_ATTRIBUTES,
+        io_status_block: *mut IO_STATUS_BLOCK,
+        share_access: u32,
+        open_options: u32,
+    ) -> i32;
+
+    extern "system" {
+        fn GetModuleHandleW(lpModuleName: *const u16) -> *mut std::ffi::c_void;
+        fn GetProcAddress(
+            hModule: *mut std::ffi::c_void,
+            lpProcName: *const u8,
+        ) -> *mut std::ffi::c_void;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+        fn GetFileInformationByHandle(
+            hFile: *mut std::ffi::c_void,
+            lpFileInformation: *mut BY_HANDLE_FILE_INFORMATION,
+        ) -> i32;
+        fn GetFileInformationByHandleEx(
+            hFile: *mut std::ffi::c_void,
+            FileInformationClass: u32,
+            lpFileInformation: *mut std::ffi::c_void,
+            dwBufferSize: u32,
+        ) -> i32;
+        fn SetFileInformationByHandle(
+            hFile: *mut std::ffi::c_void,
+            FileInformationClass: u32,
+            lpFileInformation: *mut std::ffi::c_void,
+            dwBufferSize: u32,
+        ) -> i32;
+    }
+
+    struct HandleGuard(*mut std::ffi::c_void);
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    // Hook 1: Pre-enumeration hook (root or nested)
+    if is_root {
+        if let Ok(guard) = ROOT_PRE_ENUMERATION_HOOK.lock() {
+            if let Some(ref hook) = *guard {
+                hook(dir_path);
+            }
+        }
+    } else if let Ok(guard) = NESTED_DIR_PRE_ENUMERATION_HOOK.lock() {
+        if let Some(ref hook) = *guard {
+            hook(dir_path);
+        }
+    }
+
+    // Verify handle identity
+    let mut by_handle_info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    let info_res = unsafe { GetFileInformationByHandle(dir_handle, by_handle_info.as_mut_ptr()) };
+    if info_res == 0 {
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+    let file_info = unsafe { by_handle_info.assume_init() };
+    let current_id = FileObjectIdentity {
+        volume_serial_number: file_info.dwVolumeSerialNumber as u64,
+        file_index_high: file_info.nFileIndexHigh as u64,
+        file_index_low: file_info.nFileIndexLow as u64,
+    };
+    if current_id != expected_dir_id {
+        return Err(AetherError::PermissionDenied(format!(
+            "Refusing cleanup: directory '{:?}' was replaced (expected {:?}, found {:?})",
+            dir_path, expected_dir_id, current_id
+        )));
+    }
+
+    // Dynamically resolve NtOpenFile from ntdll.dll
+    let ntdll = unsafe {
+        let mut ntdll_name: Vec<u16> = "ntdll.dll".encode_utf16().collect();
+        ntdll_name.push(0);
+        GetModuleHandleW(ntdll_name.as_ptr())
+    };
+    if ntdll.is_null() {
+        return Err(AetherError::Internal(
+            "Failed to get ntdll.dll module handle".into(),
+        ));
+    }
+    let nt_open_file_ptr = unsafe { GetProcAddress(ntdll, c"NtOpenFile".as_ptr() as *const u8) };
+    if nt_open_file_ptr.is_null() {
+        return Err(AetherError::Internal(
+            "Failed to find NtOpenFile in ntdll.dll".into(),
+        ));
+    }
+    let nt_open_file: NtOpenFileFn = unsafe { std::mem::transmute(nt_open_file_ptr) };
+
+    let mut buf = vec![0u64; 8192];
+    let mut first_call = true;
+
+    loop {
+        if PARTIAL_TRAVERSAL_FAULT_INJECT.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(AetherError::Io(std::io::Error::other(
+                "Injected I/O error during directory cleanup traversal",
+            )));
+        }
+
+        let info_class = if first_call {
+            FileIdBothDirectoryRestartInfo
+        } else {
+            FileIdBothDirectoryInfo
+        };
+        first_call = false;
+
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                dir_handle,
+                info_class,
+                buf.as_mut_ptr() as *mut std::ffi::c_void,
+                (buf.len() * 8) as u32,
+            )
+        };
+
+        if ok == 0 {
+            let err = std::io::Error::last_os_error();
+            // ERROR_NO_MORE_FILES = 38
+            if err.raw_os_error() == Some(38) || err.raw_os_error() == Some(18) {
+                break;
+            }
+            return Err(AetherError::Io(err));
+        }
+
+        let mut curr_ptr = buf.as_ptr() as *const u8;
+        loop {
+            if PARTIAL_TRAVERSAL_FAULT_INJECT.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(AetherError::Io(std::io::Error::other(
+                    "Injected I/O error during directory cleanup traversal",
+                )));
+            }
+
+            let entry_info = unsafe { &*(curr_ptr as *const FILE_ID_BOTH_DIR_INFO) };
+            let name_len_chars = (entry_info.FileNameLength as usize) / 2;
+            let name_slice =
+                unsafe { std::slice::from_raw_parts(entry_info.FileName.as_ptr(), name_len_chars) };
+
+            let next_offset = entry_info.NextEntryOffset as usize;
+
+            if name_slice == [0x002e] || name_slice == [0x002e, 0x002e] {
+                // Skip "." and ".."
+                if next_offset == 0 {
+                    break;
+                }
+                curr_ptr = unsafe { curr_ptr.add(next_offset) };
+                continue;
+            }
+
+            let child_name = String::from_utf16_lossy(name_slice);
+            let child_path = dir_path.join(&child_name);
+
+            // Seam: Test 2 CHILD_OPEN_PRE_HOOK
+            if let Ok(guard) = CHILD_OPEN_PRE_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&child_path);
+                }
+            }
+
+            // Open child strictly relative to dir_handle via NtOpenFile
+            let mut name_wide: Vec<u16> = name_slice.to_vec();
+            let mut uni_str = UNICODE_STRING {
+                length: (name_wide.len() * 2) as u16,
+                maximum_length: (name_wide.len() * 2) as u16,
+                buffer: name_wide.as_mut_ptr(),
+            };
+            let mut obj_attr = OBJECT_ATTRIBUTES {
+                length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+                root_directory: dir_handle,
+                object_name: &mut uni_str,
+                attributes: OBJ_CASE_INSENSITIVE,
+                security_descriptor: std::ptr::null_mut(),
+                security_quality_of_service: std::ptr::null_mut(),
+            };
+            let mut io_status = IO_STATUS_BLOCK {
+                status: 0,
+                information: 0,
+            };
+            let mut child_raw_handle: *mut std::ffi::c_void = std::ptr::null_mut();
+
+            let status = unsafe {
+                nt_open_file(
+                    &mut child_raw_handle,
+                    GENERIC_READ | DELETE | SYNCHRONIZE,
+                    &mut obj_attr,
+                    &mut io_status,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                )
+            };
+
+            if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND {
+                // Child was deleted concurrently
+                if next_offset == 0 {
+                    break;
+                }
+                curr_ptr = unsafe { curr_ptr.add(next_offset) };
+                continue;
+            }
+            if status < 0 {
+                return Err(AetherError::PermissionDenied(format!(
+                    "NtOpenFile failed with NTSTATUS 0x{:08X} for relative child '{:?}' in directory '{:?}'",
+                    status as u32, child_name, dir_path
+                )));
+            }
+
+            let guard = HandleGuard(child_raw_handle);
+
+            // Query child object information on child_raw_handle
+            let mut child_info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+            let ginfo_res =
+                unsafe { GetFileInformationByHandle(child_raw_handle, child_info.as_mut_ptr()) };
+            if ginfo_res == 0 {
+                return Err(AetherError::Io(std::io::Error::last_os_error()));
+            }
+            let child_file_info = unsafe { child_info.assume_init() };
+
+            let is_reparse = (child_file_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+            let is_dir = (child_file_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            let child_id = FileObjectIdentity {
+                volume_serial_number: child_file_info.dwVolumeSerialNumber as u64,
+                file_index_high: child_file_info.nFileIndexHigh as u64,
+                file_index_low: child_file_info.nFileIndexLow as u64,
+            };
+
+            // Verify identity against enumeration FileId if non-zero
+            if entry_info.FileId != 0 {
+                let initial_64 = (child_id.file_index_high << 32) | child_id.file_index_low;
+                if (entry_info.FileId as u64) != initial_64 {
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Refusing deletion: child '{:?}' FileId conflict (expected 0x{:X}, handle has 0x{:X})",
+                        child_path, entry_info.FileId, initial_64
+                    )));
+                }
+            }
+
+            let disp = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+
+            if is_reparse {
+                // Symlink or NTFS Junction: do NOT follow into target!
+                if let Ok(g) = SYMLINK_PRE_DELETE_HOOK.lock() {
+                    if let Some(ref hook) = *g {
+                        hook(&child_path);
+                    }
+                }
+                if let Ok(g) = CHILD_ENTRY_FINAL_PRE_DESTRUCTIVE_HOOK.lock() {
+                    if let Some(ref hook) = *g {
+                        hook(&child_path);
+                    }
+                }
+
+                // Verify opened handle is still a reparse point
+                let mut re_info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+                if unsafe { GetFileInformationByHandle(child_raw_handle, re_info.as_mut_ptr()) }
+                    == 0
+                {
+                    return Err(AetherError::Io(std::io::Error::last_os_error()));
+                }
+                let re_file_info = unsafe { re_info.assume_init() };
+                if (re_file_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 {
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Refusing deletion: reparse point '{:?}' changed attributes",
+                        child_path
+                    )));
+                }
+
+                let set_res = unsafe {
+                    SetFileInformationByHandle(
+                        child_raw_handle,
+                        FileDispositionInfo,
+                        &disp as *const _ as *mut std::ffi::c_void,
+                        std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                    )
+                };
+                if set_res == 0 {
+                    return Err(AetherError::Io(std::io::Error::last_os_error()));
+                }
+                drop(guard);
+            } else if is_dir {
+                // Test 3 Seam: Nested directory substitution before recursive traversal begins
+                if let Ok(g) = NESTED_DIR_PRE_TRAVERSAL_HOOK.lock() {
+                    if let Some(ref hook) = *g {
+                        hook(&child_path);
+                    }
+                }
+
+                // Recurse into nested directory using the retained child directory handle!
+                clean_directory_handle_windows_inner(
+                    child_raw_handle,
+                    &child_path,
+                    child_id,
+                    false, // is_root = false
+                )?;
+
+                // Test 6 & 7 Seam: Nested directory replacement before removal
+                if let Ok(g) = NESTED_DIR_PRE_REMOVE_HOOK.lock() {
+                    if let Some(ref hook) = *g {
+                        hook(&child_path);
+                    }
+                }
+                if let Ok(g) = CHILD_ENTRY_FINAL_PRE_DESTRUCTIVE_HOOK.lock() {
+                    if let Some(ref hook) = *g {
+                        hook(&child_path);
+                    }
+                }
+
+                // Re-verify child_raw_handle identity
+                let mut re_info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+                if unsafe { GetFileInformationByHandle(child_raw_handle, re_info.as_mut_ptr()) }
+                    == 0
+                {
+                    return Err(AetherError::Io(std::io::Error::last_os_error()));
+                }
+                let re_file_info = unsafe { re_info.assume_init() };
+                let current_child_id = FileObjectIdentity {
+                    volume_serial_number: re_file_info.dwVolumeSerialNumber as u64,
+                    file_index_high: re_file_info.nFileIndexHigh as u64,
+                    file_index_low: re_file_info.nFileIndexLow as u64,
+                };
+                if current_child_id != child_id {
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Refusing removal: nested directory '{:?}' handle identity changed before unlinking",
+                        child_path
+                    )));
+                }
+
+                let set_res = unsafe {
+                    SetFileInformationByHandle(
+                        child_raw_handle,
+                        FileDispositionInfo,
+                        &disp as *const _ as *mut std::ffi::c_void,
+                        std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                    )
+                };
+                if set_res == 0 {
+                    return Err(AetherError::Io(std::io::Error::last_os_error()));
+                }
+                drop(guard);
+            } else {
+                // Regular file
+                if let Ok(g) = CHILD_FILE_PRE_DELETE_HOOK.lock() {
+                    if let Some(ref hook) = *g {
+                        hook(&child_path);
+                    }
+                }
+                if let Ok(g) = CHILD_ENTRY_FINAL_PRE_DESTRUCTIVE_HOOK.lock() {
+                    if let Some(ref hook) = *g {
+                        hook(&child_path);
+                    }
+                }
+
+                // Re-verify child_raw_handle identity
+                let mut re_info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+                if unsafe { GetFileInformationByHandle(child_raw_handle, re_info.as_mut_ptr()) }
+                    == 0
+                {
+                    return Err(AetherError::Io(std::io::Error::last_os_error()));
+                }
+                let re_file_info = unsafe { re_info.assume_init() };
+                let current_file_id = FileObjectIdentity {
+                    volume_serial_number: re_file_info.dwVolumeSerialNumber as u64,
+                    file_index_high: re_file_info.nFileIndexHigh as u64,
+                    file_index_low: re_file_info.nFileIndexLow as u64,
+                };
+                if current_file_id != child_id {
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Refusing deletion: child file '{:?}' handle identity changed before unlinking",
+                        child_path
+                    )));
+                }
+
+                let set_res = unsafe {
+                    SetFileInformationByHandle(
+                        child_raw_handle,
+                        FileDispositionInfo,
+                        &disp as *const _ as *mut std::ffi::c_void,
+                        std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                    )
+                };
+                if set_res == 0 {
+                    return Err(AetherError::Io(std::io::Error::last_os_error()));
+                }
+                drop(guard);
+            }
+
+            if next_offset == 0 {
+                break;
+            }
+            curr_ptr = unsafe { curr_ptr.add(next_offset) };
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn pin_created_directory(path: &Path) -> Result<PinnedDirectoryHandle> {
+    let identity = query_directory_identity(path)?;
+    pin_created_directory_internal(path, identity)
+}
+
+#[cfg(windows)]
+fn pin_created_directory_internal(
+    path: &Path,
+    expected_identity: FileObjectIdentity,
+) -> Result<PinnedDirectoryHandle> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+    const FILE_SHARE_READ: u32 = 0x00000001;
+    const FILE_SHARE_WRITE: u32 = 0x00000002;
+    const FILE_SHARE_DELETE: u32 = 0x00000004;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
+    const FILE_TYPE_DISK: u32 = 0x0001;
+    const GENERIC_READ: u32 = 0x80000000;
+    const DELETE: u32 = 0x00010000;
+    const SYNCHRONIZE: u32 = 0x00100000;
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(GENERIC_READ | DELETE | SYNCHRONIZE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(AetherError::Io)?;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct BY_HANDLE_FILE_INFORMATION {
+        dwFileAttributes: u32,
+        ftCreationTime: [u32; 2],
+        ftLastAccessTime: [u32; 2],
+        ftLastWriteTime: [u32; 2],
+        dwVolumeSerialNumber: u32,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+        nNumberOfLinks: u32,
+        nFileIndexHigh: u32,
+        nFileIndexLow: u32,
+    }
+    extern "system" {
+        fn GetFileType(hFile: *mut std::ffi::c_void) -> u32;
+        fn GetFileInformationByHandle(
+            hFile: *mut std::ffi::c_void,
+            lpFileInformation: *mut BY_HANDLE_FILE_INFORMATION,
+        ) -> i32;
+        fn GetFinalPathNameByHandleW(
+            hFile: *mut std::ffi::c_void,
+            lpszFilePath: *mut u16,
+            cchFilePath: u32,
+            dwFlags: u32,
+        ) -> u32;
+    }
+
+    let file_type = unsafe { GetFileType(file.as_raw_handle()) };
+    if file_type != FILE_TYPE_DISK {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is not a standard disk directory (file type: 0x{:x})",
+            path.display(),
+            file_type
+        )));
+    }
+
+    let mut by_handle_info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    let info_res =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), by_handle_info.as_mut_ptr()) };
+    if info_res == 0 {
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+    let file_info = unsafe { by_handle_info.assume_init() };
+
+    let is_reparse = (file_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    let is_dir = (file_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    if is_reparse {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is a reparse point (attributes: 0x{:x}); refusing directory handle pinning",
+            path.display(),
+            file_info.dwFileAttributes
+        )));
+    }
+    if !is_dir {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is not a directory (attributes: 0x{:x}); refusing directory handle pinning",
+            path.display(),
+            file_info.dwFileAttributes
+        )));
+    }
+
+    // Path verification: GetFinalPathNameByHandleW
+    let mut buf = vec![0u16; 1024];
+    let len = unsafe {
+        GetFinalPathNameByHandleW(file.as_raw_handle(), buf.as_mut_ptr(), buf.len() as u32, 0)
+    };
+    if len > 0 && (len as usize) < buf.len() {
+        let final_path_str = String::from_utf16_lossy(&buf[..len as usize]);
+        let normalized = final_path_str.trim_start_matches(r"\\?\");
+        if let Ok(canon) = std::fs::canonicalize(path) {
+            let canon_str = canon.to_string_lossy();
+            let canon_norm = canon_str.trim_start_matches(r"\\?\");
+            if !normalized.eq_ignore_ascii_case(canon_norm) {
+                return Err(AetherError::PermissionDenied(format!(
+                    "Path verification failed for directory '{}': normalized target '{}' does not match '{}'",
+                    path.display(),
+                    normalized,
+                    canon_norm
+                )));
+            }
+        }
+    }
+
+    // A newly created snapshot directory must be empty. If it contains entries,
+    // an adversary placed a replacement directory with files before ownership capture.
+    let mut entries = std::fs::read_dir(path).map_err(AetherError::Io)?;
+    if entries.next().is_some() {
+        return Err(AetherError::PermissionDenied(format!(
+            "Directory '{}' is not empty; refusing to pin non-empty directory as newly created snapshot directory",
+            path.display()
+        )));
+    }
+
+    let handle_identity = FileObjectIdentity {
+        volume_serial_number: file_info.dwVolumeSerialNumber as u64,
+        file_index_high: file_info.nFileIndexHigh as u64,
+        file_index_low: file_info.nFileIndexLow as u64,
+    };
+    if handle_identity != expected_identity {
+        return Err(AetherError::PermissionDenied(format!(
+            "Identity mismatch for directory handle '{}': handle has {:?}, expected {:?}",
+            path.display(),
+            handle_identity,
+            expected_identity
+        )));
+    }
+
+    Ok(PinnedDirectoryHandle {
+        file,
+        path: path.to_path_buf(),
+        identity: handle_identity,
+    })
+}
+
+#[cfg(unix)]
+impl PinnedDirectoryHandle {
+    pub fn identity(&self) -> FileObjectIdentity {
+        self.identity
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn clean_contents(&self) -> Result<()> {
+        use std::os::unix::io::AsRawFd;
+        clean_dir_descriptor(self.fd.as_raw_fd(), &self.path)
+    }
+
+    pub fn verify_and_remove_entry(self) -> Result<()> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::{FromRawFd, OwnedFd};
+
+        let parent_path = self.path.parent().ok_or_else(|| {
+            AetherError::PermissionDenied(format!("Directory '{:?}' has no parent", self.path))
+        })?;
+        let file_name = self.path.file_name().ok_or_else(|| {
+            AetherError::PermissionDenied(format!("Directory '{:?}' has no file name", self.path))
+        })?;
+
+        let c_parent = CString::new(parent_path.as_os_str().as_bytes())
+            .map_err(|e| AetherError::Internal(format!("Invalid parent CString: {}", e)))?;
+        let c_name = CString::new(file_name.as_bytes())
+            .map_err(|e| AetherError::Internal(format!("Invalid file name CString: {}", e)))?;
+
+        let parent_fd_raw = unsafe {
+            libc::open(
+                c_parent.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if parent_fd_raw < 0 {
+            return Err(AetherError::Io(std::io::Error::last_os_error()));
+        }
+        let _parent_fd = unsafe { OwnedFd::from_raw_fd(parent_fd_raw) };
+
+        let mut entry_stat: libc::stat = unsafe { std::mem::zeroed() };
+        let res = unsafe {
+            libc::fstatat(
+                parent_fd_raw,
+                c_name.as_ptr(),
+                &mut entry_stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if res != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            return Err(AetherError::Io(err));
+        }
+
+        let entry_ino = entry_stat.st_ino as u64;
+        let entry_dev = entry_stat.st_dev as u64;
+        let expected_ino = (self.identity.file_index_high << 32) | self.identity.file_index_low;
+        let expected_dev = self.identity.volume_serial_number;
+
+        if entry_dev != expected_dev || entry_ino != expected_ino {
+            return Err(AetherError::PermissionDenied(format!(
+                "Directory entry '{:?}' identity conflict: directory was replaced (expected dev {} ino {}, found dev {} ino {}); refusing unlinking to preserve replaced object",
+                self.path, expected_dev, expected_ino, entry_dev, entry_ino
+            )));
+        }
+
+        // Test 7 Seam: Root directory replacement before final unlinking
+        if let Ok(guard) = ROOT_PRE_REMOVE_HOOK.lock() {
+            if let Some(ref hook) = *guard {
+                hook(&self.path);
+            }
+        }
+
+        let mut entry_stat2: libc::stat = unsafe { std::mem::zeroed() };
+        let res2 = unsafe {
+            libc::fstatat(
+                parent_fd_raw,
+                c_name.as_ptr(),
+                &mut entry_stat2,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if res2 != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            return Err(AetherError::Io(err));
+        }
+
+        let entry_ino2 = entry_stat2.st_ino as u64;
+        let entry_dev2 = entry_stat2.st_dev as u64;
+        if entry_dev2 != expected_dev || entry_ino2 != expected_ino {
+            return Err(AetherError::PermissionDenied(format!(
+                "Directory entry '{:?}' identity conflict: directory was replaced during final removal; refusing unlinking to preserve replaced object",
+                self.path
+            )));
+        }
+
+        let temp_unlink_name = CString::new(format!(
+            ".to_del_{}_{}",
+            uuid::Uuid::new_v4().simple(),
+            file_name.to_string_lossy()
+        ))
+        .map_err(|e| AetherError::Internal(format!("Invalid temp CString: {}", e)))?;
+
+        if FAULT_INJECT_TEMP_RENAME_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(AetherError::PermissionDenied(format!(
+                "Injected failure during root directory temporary rename on '{:?}'",
+                self.path
+            )));
+        }
+
+        if unsafe {
+            libc::renameat(
+                parent_fd_raw,
+                c_name.as_ptr(),
+                parent_fd_raw,
+                temp_unlink_name.as_ptr(),
+            )
+        } == 0
+        {
+            let temp_child_path = self
+                .path
+                .parent()
+                .map(|p| p.join(temp_unlink_name.to_string_lossy().as_ref()))
+                .unwrap_or_else(|| PathBuf::from(temp_unlink_name.to_string_lossy().as_ref()));
+            if let Ok(guard) = TEMP_ENTRY_PRE_UNLINK_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&temp_child_path);
+                }
+            }
+
+            let mut temp_stat: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe {
+                libc::fstatat(
+                    parent_fd_raw,
+                    temp_unlink_name.as_ptr(),
+                    &mut temp_stat,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } == 0
+                && (temp_stat.st_ino as u64) == expected_ino
+                && (temp_stat.st_dev as u64) == expected_dev
+            {
+                if unsafe {
+                    libc::unlinkat(parent_fd_raw, temp_unlink_name.as_ptr(), libc::AT_REMOVEDIR)
+                } != 0
+                {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() != std::io::ErrorKind::NotFound {
+                        return Err(AetherError::Io(err));
+                    }
+                }
+            } else {
+                unsafe {
+                    libc::renameat(
+                        parent_fd_raw,
+                        temp_unlink_name.as_ptr(),
+                        parent_fd_raw,
+                        c_name.as_ptr(),
+                    )
+                };
+                return Err(AetherError::PermissionDenied(format!(
+                    "Directory entry '{:?}' identity conflict during rename",
+                    self.path
+                )));
+            }
+        } else {
+            return Err(AetherError::PermissionDenied(format!(
+                "Failed to isolate root directory '{:?}' via temporary rename before unlinking; refusing deletion to avoid unverified pathname unlinking",
+                self.path
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+pub fn pin_created_directory(path: &Path) -> Result<PinnedDirectoryHandle> {
+    let identity = query_directory_identity(path)?;
+    pin_created_directory_internal(path, identity)
+}
+
+#[cfg(unix)]
+fn pin_created_directory_internal(
+    path: &Path,
+    expected_identity: FileObjectIdentity,
+) -> Result<PinnedDirectoryHandle> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{FromRawFd, OwnedFd};
+
+    let parent_path = path.parent().ok_or_else(|| {
+        AetherError::PermissionDenied(format!("Snapshot directory '{:?}' has no parent", path))
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        AetherError::PermissionDenied(format!("Snapshot directory '{:?}' has no file name", path))
+    })?;
+
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| AetherError::Internal(format!("Invalid path CString: {}", e)))?;
+    let c_parent = CString::new(parent_path.as_os_str().as_bytes())
+        .map_err(|e| AetherError::Internal(format!("Invalid parent path CString: {}", e)))?;
+    let c_name = CString::new(file_name.as_bytes())
+        .map_err(|e| AetherError::Internal(format!("Invalid file name CString: {}", e)))?;
+
+    let dir_fd_raw = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if dir_fd_raw < 0 {
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(dir_fd_raw) };
+
+    let mut dir_stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(dir_fd_raw, &mut dir_stat) } != 0 {
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+
+    if (dir_stat.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        return Err(AetherError::PermissionDenied(format!(
+            "Object '{}' is not a directory; refusing directory descriptor pinning",
+            path.display()
+        )));
+    }
+
+    let parent_fd_raw = unsafe {
+        libc::open(
+            c_parent.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if parent_fd_raw < 0 {
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+    let _parent_fd = unsafe { OwnedFd::from_raw_fd(parent_fd_raw) };
+
+    let mut parent_entry_stat: libc::stat = unsafe { std::mem::zeroed() };
+    let statat_res = unsafe {
+        libc::fstatat(
+            parent_fd_raw,
+            c_name.as_ptr(),
+            &mut parent_entry_stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if statat_res != 0 {
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+
+    if (parent_entry_stat.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+        return Err(AetherError::PermissionDenied(format!(
+            "Directory entry '{}' in parent is a symlink; refusing directory descriptor pinning",
+            path.display()
+        )));
+    }
+
+    if dir_stat.st_dev != parent_entry_stat.st_dev || dir_stat.st_ino != parent_entry_stat.st_ino {
+        return Err(AetherError::PermissionDenied(format!(
+            "Relationship mismatch for directory '{}': parent entry points to dev {} ino {}, but open descriptor is dev {} ino {}",
+            path.display(),
+            parent_entry_stat.st_dev,
+            parent_entry_stat.st_ino,
+            dir_stat.st_dev,
+            dir_stat.st_ino
+        )));
+    }
+
+    // A newly created snapshot directory must be empty
+    let mut entries = std::fs::read_dir(path).map_err(AetherError::Io)?;
+    if entries.next().is_some() {
+        return Err(AetherError::PermissionDenied(format!(
+            "Directory '{}' is not empty; refusing to pin non-empty directory as newly created snapshot directory",
+            path.display()
+        )));
+    }
+
+    let ino = dir_stat.st_ino as u64;
+    let handle_identity = FileObjectIdentity {
+        volume_serial_number: dir_stat.st_dev as u64,
+        file_index_high: ino >> 32,
+        file_index_low: ino & 0xFFFFFFFF,
+    };
+    if handle_identity != expected_identity {
+        return Err(AetherError::PermissionDenied(format!(
+            "Identity mismatch for directory descriptor '{}': descriptor has {:?}, expected {:?}",
+            path.display(),
+            handle_identity,
+            expected_identity
+        )));
+    }
+
+    Ok(PinnedDirectoryHandle {
+        fd,
+        path: path.to_path_buf(),
+        identity: handle_identity,
+    })
+}
+
+#[cfg(unix)]
+fn clean_dir_descriptor(dir_fd: libc::c_int, dir_path: &Path) -> Result<()> {
+    use std::ffi::{CStr, CString};
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+
+    let dup_fd = unsafe { libc::dup(dir_fd) };
+    if dup_fd < 0 {
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+
+    let dir_ptr = unsafe { libc::fdopendir(dup_fd) };
+    if dir_ptr.is_null() {
+        unsafe {
+            libc::close(dup_fd);
+        }
+        return Err(AetherError::Io(std::io::Error::last_os_error()));
+    }
+
+    loop {
+        if PARTIAL_TRAVERSAL_FAULT_INJECT.load(std::sync::atomic::Ordering::SeqCst) {
+            unsafe {
+                libc::closedir(dir_ptr);
+            }
+            return Err(AetherError::Io(std::io::Error::other(
+                "Injected I/O error during directory cleanup traversal",
+            )));
+        }
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        #[cfg(target_os = "macos")]
+        unsafe {
+            *libc::__error() = 0;
+        }
+
+        let entry_ptr = unsafe { libc::readdir(dir_ptr) };
+        if entry_ptr.is_null() {
+            let err = std::io::Error::last_os_error();
+            if let Some(code) = err.raw_os_error() {
+                if code != 0 {
+                    unsafe {
+                        libc::closedir(dir_ptr);
+                    }
+                    return Err(AetherError::Io(err));
+                }
+            }
+            break;
+        }
+
+        let entry = unsafe { &*entry_ptr };
+        let name_bytes = unsafe { CStr::from_ptr(entry.d_name.as_ptr()) }.to_bytes();
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+
+        let c_name = entry.d_name.as_ptr();
+        let name_str = String::from_utf8_lossy(name_bytes);
+        let child_path = dir_path.join(name_str.as_ref());
+
+        let mut child_stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatat(dir_fd, c_name, &mut child_stat, libc::AT_SYMLINK_NOFOLLOW) } != 0
+        {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::NotFound {
+                continue;
+            }
+            unsafe {
+                libc::closedir(dir_ptr);
+            }
+            return Err(AetherError::Io(err));
+        }
+
+        let is_symlink = (child_stat.st_mode & libc::S_IFMT) == libc::S_IFLNK;
+        let is_dir = (child_stat.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+
+        if is_symlink {
+            if let Ok(guard) = SYMLINK_PRE_DELETE_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&child_path);
+                }
+            }
+
+            let mut stat_verify: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstatat(dir_fd, c_name, &mut stat_verify, libc::AT_SYMLINK_NOFOLLOW) }
+                != 0
+            {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::Io(err));
+            }
+
+            if (stat_verify.st_mode & libc::S_IFMT) != libc::S_IFLNK
+                || stat_verify.st_ino != child_stat.st_ino
+            {
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::PermissionDenied(format!(
+                    "Refusing deletion: symlink '{:?}' was replaced before unlinking",
+                    child_path
+                )));
+            }
+
+            if let Ok(guard) = CHILD_ENTRY_FINAL_PRE_DESTRUCTIVE_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&child_path);
+                }
+            }
+
+            if FAULT_INJECT_TEMP_RENAME_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::PermissionDenied(format!(
+                    "Injected failure during symlink temporary rename on '{:?}'",
+                    child_path
+                )));
+            }
+
+            let temp_unlink_name = CString::new(format!(
+                ".to_del_{}_{}",
+                uuid::Uuid::new_v4().simple(),
+                name_str
+            ))
+            .map_err(|e| AetherError::Internal(format!("Invalid temp CString: {}", e)))?;
+
+            if unsafe { libc::renameat(dir_fd, c_name, dir_fd, temp_unlink_name.as_ptr()) } == 0 {
+                let temp_child_path = dir_path.join(temp_unlink_name.to_string_lossy().as_ref());
+                if let Ok(guard) = TEMP_ENTRY_PRE_UNLINK_HOOK.lock() {
+                    if let Some(ref hook) = *guard {
+                        hook(&temp_child_path);
+                    }
+                }
+
+                let mut temp_stat: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe {
+                    libc::fstatat(
+                        dir_fd,
+                        temp_unlink_name.as_ptr(),
+                        &mut temp_stat,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } == 0
+                    && (temp_stat.st_mode & libc::S_IFMT) == libc::S_IFLNK
+                    && temp_stat.st_ino == child_stat.st_ino
+                {
+                    if unsafe { libc::unlinkat(dir_fd, temp_unlink_name.as_ptr(), 0) } != 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.kind() != std::io::ErrorKind::NotFound {
+                            unsafe {
+                                libc::closedir(dir_ptr);
+                            }
+                            return Err(AetherError::Io(err));
+                        }
+                    }
+                } else {
+                    unsafe { libc::renameat(dir_fd, temp_unlink_name.as_ptr(), dir_fd, c_name) };
+                    unsafe {
+                        libc::closedir(dir_ptr);
+                    }
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Refusing deletion: symlink '{:?}' identity conflict during rename",
+                        child_path
+                    )));
+                }
+            } else {
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::PermissionDenied(format!(
+                    "Failed to isolate symlink '{:?}' via temporary rename before unlinking; refusing deletion to avoid unverified pathname unlinking",
+                    child_path
+                )));
+            }
+        } else if is_dir {
+            // Test 2 Seam: Replacement between initial child inspection and openat
+            if let Ok(guard) = CHILD_OPEN_PRE_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&child_path);
+                }
+            }
+
+            let child_fd_raw = unsafe {
+                libc::openat(
+                    dir_fd,
+                    c_name,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if child_fd_raw < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::Io(err));
+            }
+            let child_fd = unsafe { OwnedFd::from_raw_fd(child_fd_raw) };
+
+            // Step 3: fstat() the opened descriptor
+            let mut opened_stat: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(child_fd.as_raw_fd(), &mut opened_stat) } != 0 {
+                let err = std::io::Error::last_os_error();
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::Io(err));
+            }
+
+            // Step 4: Verify opened descriptor matches the intended object
+            if opened_stat.st_ino != child_stat.st_ino || opened_stat.st_dev != child_stat.st_dev {
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::PermissionDenied(format!(
+                    "Refusing recursive traversal: child directory '{:?}' was replaced before openat()",
+                    child_path
+                )));
+            }
+
+            // Test 3 Seam: Nested directory substitution before recursive traversal begins
+            if let Ok(guard) = NESTED_DIR_PRE_TRAVERSAL_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&child_path);
+                }
+            }
+
+            let mut pre_traverse_stat: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe {
+                libc::fstatat(
+                    dir_fd,
+                    c_name,
+                    &mut pre_traverse_stat,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+                || pre_traverse_stat.st_ino != child_stat.st_ino
+                || pre_traverse_stat.st_dev != child_stat.st_dev
+            {
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::PermissionDenied(format!(
+                    "Refusing recursive traversal: child directory '{:?}' was replaced before traversal started",
+                    child_path
+                )));
+            }
+
+            // Step 5: Recurse into that descriptor
+            clean_dir_descriptor(child_fd.as_raw_fd(), &child_path)?;
+
+            // Test 6 & 7 Seam: Nested directory replacement before removal
+            if let Ok(guard) = NESTED_DIR_PRE_REMOVE_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&child_path);
+                }
+            }
+
+            let mut stat_verify: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstatat(dir_fd, c_name, &mut stat_verify, libc::AT_SYMLINK_NOFOLLOW) }
+                != 0
+            {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::Io(err));
+            }
+
+            if stat_verify.st_ino != child_stat.st_ino || stat_verify.st_dev != child_stat.st_dev {
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::PermissionDenied(format!(
+                    "Refusing removal: nested directory '{:?}' was replaced before unlinking",
+                    child_path
+                )));
+            }
+
+            if let Ok(guard) = CHILD_ENTRY_FINAL_PRE_DESTRUCTIVE_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&child_path);
+                }
+            }
+
+            drop(child_fd);
+
+            if FAULT_INJECT_TEMP_RENAME_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::PermissionDenied(format!(
+                    "Injected failure during nested directory temporary rename on '{:?}'",
+                    child_path
+                )));
+            }
+
+            let temp_unlink_name = CString::new(format!(
+                ".to_del_{}_{}",
+                uuid::Uuid::new_v4().simple(),
+                name_str
+            ))
+            .map_err(|e| AetherError::Internal(format!("Invalid temp CString: {}", e)))?;
+
+            if unsafe { libc::renameat(dir_fd, c_name, dir_fd, temp_unlink_name.as_ptr()) } == 0 {
+                let temp_child_path = dir_path.join(temp_unlink_name.to_string_lossy().as_ref());
+                if let Ok(guard) = TEMP_ENTRY_PRE_UNLINK_HOOK.lock() {
+                    if let Some(ref hook) = *guard {
+                        hook(&temp_child_path);
+                    }
+                }
+
+                let mut temp_stat: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe {
+                    libc::fstatat(
+                        dir_fd,
+                        temp_unlink_name.as_ptr(),
+                        &mut temp_stat,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } == 0
+                    && temp_stat.st_ino == child_stat.st_ino
+                    && temp_stat.st_dev == child_stat.st_dev
+                {
+                    if unsafe {
+                        libc::unlinkat(dir_fd, temp_unlink_name.as_ptr(), libc::AT_REMOVEDIR)
+                    } != 0
+                    {
+                        let err = std::io::Error::last_os_error();
+                        if err.kind() != std::io::ErrorKind::NotFound {
+                            unsafe {
+                                libc::closedir(dir_ptr);
+                            }
+                            return Err(AetherError::Io(err));
+                        }
+                    }
+                } else {
+                    unsafe { libc::renameat(dir_fd, temp_unlink_name.as_ptr(), dir_fd, c_name) };
+                    unsafe {
+                        libc::closedir(dir_ptr);
+                    }
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Refusing removal: nested directory '{:?}' identity conflict during rename",
+                        child_path
+                    )));
+                }
+            } else {
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::PermissionDenied(format!(
+                    "Failed to isolate nested directory '{:?}' via temporary rename before unlinking; refusing removal to avoid unverified pathname unlinking",
+                    child_path
+                )));
+            }
+        } else {
+            // Test 2 Seam: Replacement between initial child inspection and openat
+            if let Ok(guard) = CHILD_OPEN_PRE_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&child_path);
+                }
+            }
+
+            let child_file_raw = unsafe {
+                libc::openat(
+                    dir_fd,
+                    c_name,
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if child_file_raw < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::Io(err));
+            }
+            let child_file_fd = unsafe { OwnedFd::from_raw_fd(child_file_raw) };
+
+            // Step 3: fstat() the opened file descriptor
+            let mut opened_stat: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(child_file_fd.as_raw_fd(), &mut opened_stat) } != 0 {
+                let err = std::io::Error::last_os_error();
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::Io(err));
+            }
+
+            // Step 4: Verify opened descriptor matches initial metadata
+            if opened_stat.st_ino != child_stat.st_ino || opened_stat.st_dev != child_stat.st_dev {
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::PermissionDenied(format!(
+                    "Refusing deletion: child file '{:?}' was replaced before openat()",
+                    child_path
+                )));
+            }
+
+            if let Ok(guard) = CHILD_FILE_PRE_DELETE_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&child_path);
+                }
+            }
+
+            let mut stat_verify: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstatat(dir_fd, c_name, &mut stat_verify, libc::AT_SYMLINK_NOFOLLOW) }
+                != 0
+            {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::Io(err));
+            }
+
+            if stat_verify.st_ino != child_stat.st_ino || stat_verify.st_dev != child_stat.st_dev {
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::PermissionDenied(format!(
+                    "Refusing deletion: child file '{:?}' was replaced before unlinking",
+                    child_path
+                )));
+            }
+
+            if let Ok(guard) = CHILD_ENTRY_FINAL_PRE_DESTRUCTIVE_HOOK.lock() {
+                if let Some(ref hook) = *guard {
+                    hook(&child_path);
+                }
+            }
+
+            drop(child_file_fd);
+
+            if FAULT_INJECT_TEMP_RENAME_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::PermissionDenied(format!(
+                    "Injected failure during child file temporary rename on '{:?}'",
+                    child_path
+                )));
+            }
+
+            let temp_unlink_name = CString::new(format!(
+                ".to_del_{}_{}",
+                uuid::Uuid::new_v4().simple(),
+                name_str
+            ))
+            .map_err(|e| AetherError::Internal(format!("Invalid temp CString: {}", e)))?;
+
+            if unsafe { libc::renameat(dir_fd, c_name, dir_fd, temp_unlink_name.as_ptr()) } == 0 {
+                let temp_child_path = dir_path.join(temp_unlink_name.to_string_lossy().as_ref());
+                if let Ok(guard) = TEMP_ENTRY_PRE_UNLINK_HOOK.lock() {
+                    if let Some(ref hook) = *guard {
+                        hook(&temp_child_path);
+                    }
+                }
+
+                let mut temp_stat: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe {
+                    libc::fstatat(
+                        dir_fd,
+                        temp_unlink_name.as_ptr(),
+                        &mut temp_stat,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } == 0
+                    && temp_stat.st_ino == child_stat.st_ino
+                    && temp_stat.st_dev == child_stat.st_dev
+                {
+                    if unsafe { libc::unlinkat(dir_fd, temp_unlink_name.as_ptr(), 0) } != 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.kind() != std::io::ErrorKind::NotFound {
+                            unsafe {
+                                libc::closedir(dir_ptr);
+                            }
+                            return Err(AetherError::Io(err));
+                        }
+                    }
+                } else {
+                    unsafe { libc::renameat(dir_fd, temp_unlink_name.as_ptr(), dir_fd, c_name) };
+                    unsafe {
+                        libc::closedir(dir_ptr);
+                    }
+                    return Err(AetherError::PermissionDenied(format!(
+                        "Refusing deletion: child file '{:?}' identity conflict during rename",
+                        child_path
+                    )));
+                }
+            } else {
+                unsafe {
+                    libc::closedir(dir_ptr);
+                }
+                return Err(AetherError::PermissionDenied(format!(
+                    "Failed to isolate child file '{:?}' via temporary rename before unlinking; refusing deletion to avoid unverified pathname unlinking",
+                    child_path
+                )));
+            }
+        }
+    }
+
+    unsafe {
+        libc::closedir(dir_ptr);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(windows, unix)))]
+impl PinnedDirectoryHandle {
+    pub fn identity(&self) -> FileObjectIdentity {
+        self.identity
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn clean_contents(&self) -> Result<()> {
+        Err(AetherError::PermissionDenied(
+            "Directory cleanup not supported on this platform".into(),
+        ))
+    }
+
+    pub fn verify_and_remove_entry(self) -> Result<()> {
+        Err(AetherError::PermissionDenied(
+            "Directory removal not supported on this platform".into(),
+        ))
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+pub fn pin_created_directory(path: &Path) -> Result<PinnedDirectoryHandle> {
+    Err(AetherError::PermissionDenied(format!(
+        "Directory pinning and race-free cleanup are not supported on this platform: refusing '{:?}'",
+        path
+    )))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn pin_created_directory_internal(
+    path: &Path,
+    _expected_identity: FileObjectIdentity,
+) -> Result<PinnedDirectoryHandle> {
+    Err(AetherError::PermissionDenied(format!(
+        "Directory pinning and race-free cleanup are not supported on this platform: refusing '{:?}'",
+        path
+    )))
 }
 
 #[cfg(windows)]
@@ -720,6 +3852,15 @@ pub struct ConditionalReplaceOutcome {
     /// If a backup file had to be preserved due to trailing modifications, read failure,
     /// rename failure, or removal failure, this contains the absolute path of the surviving file.
     pub preserved_backup: Option<PathBuf>,
+    /// If a temporary staging file could not be unlinked after publication, this contains the absolute path of the residual artifact.
+    pub residual_staging: Option<PathBuf>,
+}
+
+impl ConditionalReplaceOutcome {
+    /// Returns true if no backup was preserved and no residual staging artifact remains.
+    pub fn is_fully_clean(&self) -> bool {
+        self.preserved_backup.is_none() && self.residual_staging.is_none()
+    }
 }
 
 /// Optional hooks and fault-injection flags for conditional file replacement.
@@ -743,6 +3884,14 @@ pub struct ConditionalReplaceHooks<'a> {
     pub fault_inject_conflict_rename: bool,
     /// Injected fault: simulate failure during backup removal.
     pub fault_inject_backup_removal: bool,
+    /// Injected fault: simulate failure during staging file removal after publication or during rollback.
+    pub fault_inject_staging_removal: bool,
+    /// Injected immediately before primary atomic publication (pre-hard-link / pre-publish).
+    pub pre_publish_hook: Option<&'a (dyn Fn(&Path) + 'a)>,
+    /// Injected immediately before platform-specific fallback publication primitive.
+    pub pre_fallback_publish_hook: Option<&'a (dyn Fn(&Path) + 'a)>,
+    /// Injected fault: simulate non-AlreadyExists hard-link failure (forcing the fallback publication path).
+    pub fault_inject_hard_link_failure: bool,
 }
 
 /// Final disposition of a conditional file deletion attempt.
@@ -917,7 +4066,12 @@ impl WorkspaceCapability {
 
         // Step 2: Atomic rename anchored to directory capability
         if let Err(e) = self.dir.rename(&temp_rel, &self.dir, &rel) {
-            let _ = self.dir.remove_file(&temp_rel);
+            if let Err(rm_err) = self.dir.remove_file(&temp_rel) {
+                return Err(AetherError::Internal(format!(
+                    "Rename of temporary file failed ({}) and cleanup of temporary file '{:?}' failed: {}",
+                    e, temp_rel, rm_err
+                )));
+            }
             return Err(AetherError::Io(e));
         }
 
@@ -927,6 +4081,7 @@ impl WorkspaceCapability {
     /// Internal rollback helper that strictly verifies rollback rename results.
     /// If rollback fails, the backup file is preserved on disk without deletion,
     /// and an explicit `AetherError::Internal` containing the backup location is returned.
+    #[allow(clippy::too_many_arguments)]
     fn perform_rollback(
         &self,
         backup_rel: &Path,
@@ -935,10 +4090,60 @@ impl WorkspaceCapability {
         user_path: &str,
         cause_msg: &str,
         fault_inject_rollback_failure: bool,
+        fault_inject_staging_removal: bool,
     ) -> AetherError {
         // Clean up temporary incoming stage file if present
+        let mut staging_residual_note = None;
         if let Some(stage) = stage_rel {
-            let _ = self.dir.remove_file(stage);
+            let stage_abs = self.root_path.join(stage);
+            let rm_res = if fault_inject_staging_removal {
+                Err(std::io::Error::other(
+                    "Injected staging removal failure during rollback",
+                ))
+            } else {
+                self.dir.remove_file(stage)
+            };
+            if let Err(e) = rm_res {
+                warn!(
+                    "perform_rollback: failed to remove staging file '{:?}': {}",
+                    stage, e
+                );
+                staging_residual_note = Some(format!(
+                    "; additionally failed to remove residual staging artifact '{}': {}",
+                    stage_abs.display(),
+                    e
+                ));
+            }
+        }
+        let staging_note = staging_residual_note.as_deref().unwrap_or("");
+
+        // Commit-boundary safety check:
+        // If a competing object already exists at `rel`, attempting to rename `backup_rel` to `rel`
+        // would either silently overwrite the competing object (on POSIX) or fail (on Windows).
+        // Neither the competing object nor the original backup must be lost or overwritten!
+        if self.dir.symlink_metadata(rel).is_ok() {
+            let conflict_name = format!(".aether-conflict-{}", uuid::Uuid::new_v4().simple());
+            let conflict_rel = if let Some(parent) = rel.parent() {
+                parent.join(&conflict_name)
+            } else {
+                PathBuf::from(&conflict_name)
+            };
+            let backup_abs = self.root_path.join(backup_rel);
+            match self.dir.rename(backup_rel, &self.dir, &conflict_rel) {
+                Ok(()) => {
+                    let conflict_abs = self.root_path.join(&conflict_rel);
+                    return AetherError::PermissionDenied(format!(
+                        "Commit boundary conflict on '{}': {}. Destination was concurrently recreated; competing destination preserved; original data preserved at '{}'{}.",
+                        user_path, cause_msg, conflict_abs.display(), staging_note
+                    ));
+                }
+                Err(e) => {
+                    return AetherError::Internal(format!(
+                        "Commit boundary conflict on '{}': {}. Destination was concurrently recreated; preservation rename to conflict path failed ({}); original data retained at '{}'{}.",
+                        user_path, cause_msg, e, backup_abs.display(), staging_note
+                    ));
+                }
+            }
         }
 
         let rollback_res = if fault_inject_rollback_failure {
@@ -952,17 +4157,210 @@ impl WorkspaceCapability {
 
         match rollback_res {
             Ok(()) => AetherError::PermissionDenied(format!(
-                "Restore race detected: {}. Restore aborted, target rolled back successfully.",
-                cause_msg
+                "Restore race detected: {}. Restore aborted, target rolled back successfully{}.",
+                cause_msg, staging_note
             )),
             Err(rb_err) => {
                 let backup_abs = self.root_path.join(backup_rel);
                 AetherError::Internal(format!(
-                    "RESTORE ROLLBACK FAILURE on '{}': {}. Attempted rollback to destination failed ({}). User data PRESERVED at '{}'. Do not delete this file; manual recovery required.",
-                    user_path, cause_msg, rb_err, backup_abs.display()
+                    "RESTORE ROLLBACK FAILURE on '{}': {}. Attempted rollback to destination failed ({}). User data PRESERVED at '{}'. Do not delete this file; manual recovery required{}.",
+                    user_path, cause_msg, rb_err, backup_abs.display(), staging_note
                 ))
             }
         }
+    }
+
+    fn atomic_publish_fallback(
+        stage_abs: &Path,
+        dest_abs: &Path,
+    ) -> std::result::Result<(), AtomicPublishError> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            let wide_stage: Vec<u16> = stage_abs
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let wide_dest: Vec<u16> = dest_abs
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+
+            extern "system" {
+                fn MoveFileExW(
+                    lpExistingFileName: *const u16,
+                    lpNewFileName: *const u16,
+                    dwFlags: u32,
+                ) -> i32;
+                fn GetLastError() -> u32;
+            }
+
+            const MOVEFILE_WRITE_THROUGH: u32 = 0x00000008;
+            // CRITICAL: MOVEFILE_REPLACE_EXISTING (0x1) is deliberately omitted to enforce no-overwrite semantics!
+            let ret = unsafe {
+                MoveFileExW(
+                    wide_stage.as_ptr(),
+                    wide_dest.as_ptr(),
+                    MOVEFILE_WRITE_THROUGH,
+                )
+            };
+
+            if ret != 0 {
+                return Ok(());
+            }
+
+            let err = unsafe { GetLastError() };
+            if err == 183 || err == 80 {
+                // ERROR_ALREADY_EXISTS (183) or ERROR_FILE_EXISTS (80)
+                return Err(AtomicPublishError::DestinationExists);
+            }
+
+            Err(AtomicPublishError::Io(std::io::Error::from_raw_os_error(
+                err as i32,
+            )))
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let c_stage = std::ffi::CString::new(stage_abs.as_os_str().as_bytes())
+                .map_err(|_| AtomicPublishError::Unsupported)?;
+            let c_dest = std::ffi::CString::new(dest_abs.as_os_str().as_bytes())
+                .map_err(|_| AtomicPublishError::Unsupported)?;
+
+            const RENAME_NOREPLACE: libc::c_uint = 1;
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    libc::AT_FDCWD,
+                    c_stage.as_ptr(),
+                    libc::AT_FDCWD,
+                    c_dest.as_ptr(),
+                    RENAME_NOREPLACE,
+                )
+            };
+
+            if ret == 0 {
+                return Ok(());
+            }
+
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if errno == libc::EEXIST {
+                return Err(AtomicPublishError::DestinationExists);
+            }
+            if errno == libc::EINVAL || errno == libc::ENOSYS {
+                return Err(AtomicPublishError::Unsupported);
+            }
+
+            Err(AtomicPublishError::Io(std::io::Error::from_raw_os_error(
+                errno,
+            )))
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let c_stage = std::ffi::CString::new(stage_abs.as_os_str().as_bytes())
+                .map_err(|_| AtomicPublishError::Unsupported)?;
+            let c_dest = std::ffi::CString::new(dest_abs.as_os_str().as_bytes())
+                .map_err(|_| AtomicPublishError::Unsupported)?;
+
+            extern "C" {
+                fn renamex_np(
+                    oldpath: *const libc::c_char,
+                    newpath: *const libc::c_char,
+                    flags: libc::c_uint,
+                ) -> libc::c_int;
+            }
+            const RENAME_EXCL: libc::c_uint = 0x00000004;
+
+            let ret = unsafe { renamex_np(c_stage.as_ptr(), c_dest.as_ptr(), RENAME_EXCL) };
+
+            if ret == 0 {
+                return Ok(());
+            }
+
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if errno == libc::EEXIST {
+                return Err(AtomicPublishError::DestinationExists);
+            }
+            if errno == libc::ENOTSUP {
+                return Err(AtomicPublishError::Unsupported);
+            }
+
+            Err(AtomicPublishError::Io(std::io::Error::from_raw_os_error(
+                errno,
+            )))
+        }
+
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+        {
+            Err(AtomicPublishError::Unsupported)
+        }
+    }
+
+    fn atomic_publish_no_replace(
+        &self,
+        stage_rel: &Path,
+        rel: &Path,
+        stage_abs: &Path,
+        dest_abs: &Path,
+        hooks: &ConditionalReplaceHooks,
+    ) -> std::result::Result<Option<PathBuf>, AtomicPublishError> {
+        if let Some(hook) = hooks.pre_publish_hook {
+            hook(dest_abs);
+        }
+
+        // Try hard_link as primary atomic no-replace publication where supported
+        let link_res = if hooks.fault_inject_hard_link_failure {
+            Err(std::io::Error::other(
+                "Injected hard-link non-AlreadyExists failure",
+            ))
+        } else {
+            self.dir.hard_link(stage_rel, &self.dir, rel)
+        };
+
+        match link_res {
+            Ok(()) => {
+                let residual_staging = if hooks.fault_inject_staging_removal {
+                    Some(stage_abs.to_path_buf())
+                } else if let Err(e) = self.dir.remove_file(stage_rel) {
+                    warn!(
+                        "atomic_publish_no_replace: failed to remove staging link '{:?}': {}",
+                        stage_rel, e
+                    );
+                    Some(stage_abs.to_path_buf())
+                } else {
+                    None
+                };
+                return Ok(residual_staging);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(AtomicPublishError::DestinationExists);
+            }
+            #[cfg(windows)]
+            Err(e) if e.raw_os_error() == Some(183) || e.raw_os_error() == Some(80) => {
+                return Err(AtomicPublishError::DestinationExists);
+            }
+            #[cfg(unix)]
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                return Err(AtomicPublishError::DestinationExists);
+            }
+            Err(_) => {
+                // Hard-link failed for other reasons (e.g. cross-device, unsupported, or fault-injected).
+                // Proceed to platform-specific atomic no-replace fallback.
+            }
+        }
+
+        // Invoke fallback pre-publish hook if provided (deterministic adversarial race testing)
+        if let Some(fb_hook) = hooks.pre_fallback_publish_hook {
+            fb_hook(dest_abs);
+        }
+
+        Self::atomic_publish_fallback(stage_abs, dest_abs)?;
+        Ok(None)
     }
 
     /// Conditionally replaces or creates a file inside workspace capability with full hook support.
@@ -995,6 +4393,7 @@ impl WorkspaceCapability {
             } else {
                 PathBuf::from(&stage_name)
             };
+            let stage_abs = self.root_path.join(&stage_rel);
 
             let mut opts = OpenOptions::new();
             opts.write(true).create_new(true);
@@ -1004,32 +4403,52 @@ impl WorkspaceCapability {
                 .open_with(&stage_rel, &opts)
                 .map_err(AetherError::Io)?;
 
+            let cleanup_stage_or_error = |primary_msg: String| -> AetherError {
+                let rm_res = if hooks.fault_inject_staging_removal {
+                    Err(std::io::Error::other("Injected staging removal failure"))
+                } else {
+                    self.dir.remove_file(&stage_rel)
+                };
+                if let Err(rm_err) = rm_res {
+                    AetherError::Io(std::io::Error::other(format!(
+                        "{}; additionally failed to remove residual staging artifact '{}': {}",
+                        primary_msg,
+                        stage_abs.display(),
+                        rm_err
+                    )))
+                } else {
+                    AetherError::Io(std::io::Error::other(primary_msg))
+                }
+            };
+
             if hooks.fault_inject_stage_write {
                 drop(f);
-                let _ = self.dir.remove_file(&stage_rel);
-                return Err(AetherError::Io(std::io::Error::other(
-                    "Injected stage write failure",
-                )));
+                return Err(cleanup_stage_or_error(
+                    "Injected stage write failure".to_string(),
+                ));
             }
 
             if let Err(e) = f.write_all(bytes) {
                 drop(f);
-                let _ = self.dir.remove_file(&stage_rel);
-                return Err(AetherError::Io(e));
+                return Err(cleanup_stage_or_error(format!(
+                    "Failed to write stage file bytes: {}",
+                    e
+                )));
             }
 
             if hooks.fault_inject_stage_sync {
                 drop(f);
-                let _ = self.dir.remove_file(&stage_rel);
-                return Err(AetherError::Io(std::io::Error::other(
-                    "Injected stage sync failure",
-                )));
+                return Err(cleanup_stage_or_error(
+                    "Injected stage sync failure".to_string(),
+                ));
             }
 
             if let Err(e) = f.sync_all() {
                 drop(f);
-                let _ = self.dir.remove_file(&stage_rel);
-                return Err(AetherError::Io(e));
+                return Err(cleanup_stage_or_error(format!(
+                    "Failed to sync stage file: {}",
+                    e
+                )));
             }
             drop(f);
 
@@ -1037,30 +4456,69 @@ impl WorkspaceCapability {
             let link_res = self.dir.hard_link(&stage_rel, &self.dir, &rel);
             match link_res {
                 Ok(()) => {
-                    let _ = self.dir.remove_file(&stage_rel);
+                    let residual_staging = if hooks.fault_inject_staging_removal {
+                        Some(stage_abs.clone())
+                    } else if let Err(e) = self.dir.remove_file(&stage_rel) {
+                        warn!(
+                            "replace_file_bytes_conditional_with_hooks: failed to remove staging link '{:?}': {}",
+                            stage_rel, e
+                        );
+                        Some(stage_abs.clone())
+                    } else {
+                        None
+                    };
                     return Ok(ConditionalReplaceOutcome {
                         dest_path: dest_abs,
                         preserved_backup: None,
+                        residual_staging,
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let _ = self.dir.remove_file(&stage_rel);
+                    let rm_res = if hooks.fault_inject_staging_removal {
+                        Err(std::io::Error::other("Injected staging removal failure"))
+                    } else {
+                        self.dir.remove_file(&stage_rel)
+                    };
+                    let residual_msg = if let Err(rm_err) = rm_res {
+                        format!(
+                            "; additionally failed to remove residual staging artifact '{}': {}",
+                            stage_abs.display(),
+                            rm_err
+                        )
+                    } else {
+                        String::new()
+                    };
                     return Err(AetherError::PermissionDenied(format!(
-                        "Restore race detected: target file '{}' was newly created on disk before replacement. Restore aborted.",
-                        user_path
+                        "Restore race detected: target file '{}' was newly created on disk before replacement{}. Restore aborted.",
+                        user_path, residual_msg
                     )));
                 }
                 Err(e) => {
+                    let rm_res = if hooks.fault_inject_staging_removal {
+                        Err(std::io::Error::other("Injected staging removal failure"))
+                    } else {
+                        self.dir.remove_file(&stage_rel)
+                    };
+                    let residual_msg = if let Err(rm_err) = rm_res {
+                        format!(
+                            "; additionally failed to remove residual staging artifact '{}': {}",
+                            stage_abs.display(),
+                            rm_err
+                        )
+                    } else {
+                        String::new()
+                    };
                     // Check if file exists to detect race condition
                     if self.dir.symlink_metadata(&rel).is_ok() {
-                        let _ = self.dir.remove_file(&stage_rel);
                         return Err(AetherError::PermissionDenied(format!(
-                            "Restore race detected: target file '{}' was newly created on disk before replacement. Restore aborted.",
-                            user_path
+                            "Restore race detected: target file '{}' was newly created on disk before replacement{}. Restore aborted.",
+                            user_path, residual_msg
                         )));
                     }
-                    let _ = self.dir.remove_file(&stage_rel);
-                    return Err(AetherError::Io(e));
+                    return Err(AetherError::Io(std::io::Error::other(format!(
+                        "Failed to hard-link stage file ({}){}",
+                        e, residual_msg
+                    ))));
                 }
             }
         }
@@ -1074,6 +4532,7 @@ impl WorkspaceCapability {
         } else {
             PathBuf::from(&stage_name)
         };
+        let stage_abs = self.root_path.join(&stage_rel);
 
         let mut opts = OpenOptions::new();
         opts.write(true).create_new(true);
@@ -1082,8 +4541,54 @@ impl WorkspaceCapability {
             .dir
             .open_with(&stage_rel, &opts)
             .map_err(AetherError::Io)?;
-        f.write_all(bytes).map_err(AetherError::Io)?;
-        f.sync_all().map_err(AetherError::Io)?;
+
+        let cleanup_stage_or_error = |primary_msg: String| -> AetherError {
+            let rm_res = if hooks.fault_inject_staging_removal {
+                Err(std::io::Error::other("Injected staging removal failure"))
+            } else {
+                self.dir.remove_file(&stage_rel)
+            };
+            if let Err(rm_err) = rm_res {
+                AetherError::Io(std::io::Error::other(format!(
+                    "{}; additionally failed to remove residual staging artifact '{}': {}",
+                    primary_msg,
+                    stage_abs.display(),
+                    rm_err
+                )))
+            } else {
+                AetherError::Io(std::io::Error::other(primary_msg))
+            }
+        };
+
+        if hooks.fault_inject_stage_write {
+            drop(f);
+            return Err(cleanup_stage_or_error(
+                "Injected stage write failure".to_string(),
+            ));
+        }
+
+        if let Err(e) = f.write_all(bytes) {
+            drop(f);
+            return Err(cleanup_stage_or_error(format!(
+                "Failed to write stage file bytes: {}",
+                e
+            )));
+        }
+
+        if hooks.fault_inject_stage_sync {
+            drop(f);
+            return Err(cleanup_stage_or_error(
+                "Injected stage sync failure".to_string(),
+            ));
+        }
+
+        if let Err(e) = f.sync_all() {
+            drop(f);
+            return Err(cleanup_stage_or_error(format!(
+                "Failed to sync stage file: {}",
+                e
+            )));
+        }
         drop(f);
 
         // 2. Invoke pre_replace_hook if configured (deterministic test injection)
@@ -1100,10 +4605,23 @@ impl WorkspaceCapability {
         };
 
         if let Err(e) = self.dir.rename(&rel, &self.dir, &backup_rel) {
-            let _ = self.dir.remove_file(&stage_rel);
+            let rm_res = if hooks.fault_inject_staging_removal {
+                Err(std::io::Error::other("Injected staging removal failure"))
+            } else {
+                self.dir.remove_file(&stage_rel)
+            };
+            let residual_msg = if let Err(rm_err) = rm_res {
+                format!(
+                    "; additionally failed to remove residual staging artifact '{}': {}",
+                    stage_abs.display(),
+                    rm_err
+                )
+            } else {
+                String::new()
+            };
             return Err(AetherError::PermissionDenied(format!(
-                "Restore race detected: target file '{}' could not be staged for verification ({}). Restore aborted.",
-                user_path, e
+                "Restore race detected: target file '{}' could not be staged for verification ({}){}. Restore aborted.",
+                user_path, e, residual_msg
             )));
         }
 
@@ -1121,6 +4639,7 @@ impl WorkspaceCapability {
                         user_path, e
                     ),
                     hooks.fault_inject_rollback_failure,
+                    hooks.fault_inject_staging_removal,
                 ));
             }
         };
@@ -1136,6 +4655,7 @@ impl WorkspaceCapability {
                     user_path
                 ),
                 hooks.fault_inject_rollback_failure,
+                hooks.fault_inject_staging_removal,
             ));
         }
 
@@ -1152,6 +4672,7 @@ impl WorkspaceCapability {
                         user_path, e
                     ),
                     hooks.fault_inject_rollback_failure,
+                    hooks.fault_inject_staging_removal,
                 ));
             }
         };
@@ -1166,6 +4687,7 @@ impl WorkspaceCapability {
                 user_path,
                 &format!("target file '{}' could not be read ({})", user_path, e),
                 hooks.fault_inject_rollback_failure,
+                hooks.fault_inject_staging_removal,
             ));
         }
         drop(backup_file);
@@ -1189,6 +4711,7 @@ impl WorkspaceCapability {
                     user_path, expected, current_hash
                 ),
                 hooks.fault_inject_rollback_failure,
+                hooks.fault_inject_staging_removal,
             ));
         }
 
@@ -1215,6 +4738,7 @@ impl WorkspaceCapability {
                         user_path, e
                     ),
                     hooks.fault_inject_rollback_failure,
+                    hooks.fault_inject_staging_removal,
                 ));
             }
         };
@@ -1239,20 +4763,62 @@ impl WorkspaceCapability {
                     user_path, expected, recheck_hash
                 ),
                 hooks.fault_inject_rollback_failure,
+                hooks.fault_inject_staging_removal,
             ));
         }
 
         // 7. Hash verified! Commit replacement: move stage to target
-        if let Err(e) = self.dir.rename(&stage_rel, &self.dir, &rel) {
-            return Err(self.perform_rollback(
-                &backup_rel,
-                &rel,
-                Some(&stage_rel),
-                user_path,
-                &format!("failed to commit replacement file ({})", e),
-                hooks.fault_inject_rollback_failure,
-            ));
-        }
+        let stage_abs = self.root_path.join(&stage_rel);
+        let publish_res =
+            self.atomic_publish_no_replace(&stage_rel, &rel, &stage_abs, &dest_abs, &hooks);
+
+        let residual_staging = match publish_res {
+            Ok(res_staging) => res_staging,
+            Err(AtomicPublishError::DestinationExists) => {
+                return Err(self.perform_rollback(
+                    &backup_rel,
+                    &rel,
+                    Some(&stage_rel),
+                    user_path,
+                    "competing destination object was concurrently created at commit boundary",
+                    hooks.fault_inject_rollback_failure,
+                    hooks.fault_inject_staging_removal,
+                ));
+            }
+            Err(AtomicPublishError::Unsupported) => {
+                return Err(self.perform_rollback(
+                    &backup_rel,
+                    &rel,
+                    Some(&stage_rel),
+                    user_path,
+                    "filesystem does not support atomic no-replace publication; failed closed to prevent overwrite",
+                    hooks.fault_inject_rollback_failure,
+                    hooks.fault_inject_staging_removal,
+                ));
+            }
+            Err(AtomicPublishError::CrossDevice) => {
+                return Err(self.perform_rollback(
+                    &backup_rel,
+                    &rel,
+                    Some(&stage_rel),
+                    user_path,
+                    "cross-device link error during publication; failed closed to prevent overwrite",
+                    hooks.fault_inject_rollback_failure,
+                    hooks.fault_inject_staging_removal,
+                ));
+            }
+            Err(AtomicPublishError::Io(e)) => {
+                return Err(self.perform_rollback(
+                    &backup_rel,
+                    &rel,
+                    Some(&stage_rel),
+                    user_path,
+                    &format!("failed to commit replacement file atomically ({})", e),
+                    hooks.fault_inject_rollback_failure,
+                    hooks.fault_inject_staging_removal,
+                ));
+            }
+        };
 
         // 8. Final guard: verify backup file did not receive trailing modifications before removal
         let backup_check_result: std::io::Result<bool> = (|| {
@@ -1315,6 +4881,7 @@ impl WorkspaceCapability {
             return Ok(ConditionalReplaceOutcome {
                 dest_path: dest_abs,
                 preserved_backup: Some(surviving_path),
+                residual_staging,
             });
         }
 
@@ -1354,6 +4921,7 @@ impl WorkspaceCapability {
                 return Ok(ConditionalReplaceOutcome {
                     dest_path: dest_abs,
                     preserved_backup: Some(surviving),
+                    residual_staging,
                 });
             }
         }
@@ -1369,6 +4937,7 @@ impl WorkspaceCapability {
             Ok(()) => Ok(ConditionalReplaceOutcome {
                 dest_path: dest_abs,
                 preserved_backup: None,
+                residual_staging,
             }),
             Err(rm_err) => {
                 let surviving = self.root_path.join(&backup_rel);
@@ -1381,6 +4950,7 @@ impl WorkspaceCapability {
                 Ok(ConditionalReplaceOutcome {
                     dest_path: dest_abs,
                     preserved_backup: Some(surviving),
+                    residual_staging,
                 })
             }
         }
@@ -2252,6 +5822,98 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_query_directory_identity_valid_and_rejections() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_fs_dir_id_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let dir_a = temp_dir.join("dir_a");
+        let dir_b = temp_dir.join("dir_b");
+        let file_a = temp_dir.join("file_a.txt");
+        let non_existent = temp_dir.join("non_existent");
+
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+        fs::write(&file_a, b"regular file content").unwrap();
+
+        // 1. Valid directories return unique identities
+        let id_a = query_directory_identity(&dir_a).expect("query_directory_identity on dir_a");
+        let id_b = query_directory_identity(&dir_b).expect("query_directory_identity on dir_b");
+        assert_ne!(
+            id_a, id_b,
+            "Different directories must have distinct identities"
+        );
+
+        // Querying dir_a again returns the same identity
+        let id_a_second = query_directory_identity(&dir_a).expect("second query on dir_a");
+        assert_eq!(id_a, id_a_second);
+
+        // 2. Reject regular file
+        let file_err = query_directory_identity(&file_a);
+        assert!(
+            file_err.is_err(),
+            "query_directory_identity must reject regular files"
+        );
+
+        // 3. Non-existent path returns error
+        let missing_err = query_directory_identity(&non_existent);
+        assert!(
+            missing_err.is_err(),
+            "query_directory_identity must fail for non-existent path"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_pinned_directory_lifecycle_and_rejections() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_fs_pin_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let dir_target = temp_dir.join("pinned_dir");
+        let regular_file = temp_dir.join("file.txt");
+        let non_empty_dir = temp_dir.join("non_empty");
+
+        fs::create_dir_all(&temp_dir).unwrap();
+        fs::create_dir(&dir_target).unwrap();
+        fs::write(&regular_file, b"content").unwrap();
+        fs::create_dir(&non_empty_dir).unwrap();
+        fs::write(non_empty_dir.join("nested.txt"), b"data").unwrap();
+
+        // 1. Regular file rejected
+        assert!(pin_created_directory(&regular_file).is_err());
+
+        // 2. Non-empty directory rejected
+        assert!(pin_created_directory(&non_empty_dir).is_err());
+
+        // 3. Valid empty directory pinned successfully
+        let pinned = pin_created_directory(&dir_target).expect("pin empty directory");
+        assert_eq!(pinned.path(), dir_target.as_path());
+
+        // Add children inside pinned directory
+        let child_file = dir_target.join("child.txt");
+        let child_sub = dir_target.join("sub");
+        fs::write(&child_file, b"child data").unwrap();
+        fs::create_dir(&child_sub).unwrap();
+        fs::write(child_sub.join("subfile.txt"), b"sub content").unwrap();
+
+        // 4. Object-bound clean_contents empties directory without deleting dir_target
+        pinned.clean_contents().expect("clean_contents");
+        assert!(dir_target.exists());
+        assert!(!child_file.exists());
+        assert!(!child_sub.exists());
+
+        // 5. verify_and_remove_entry safely removes empty directory entry
+        pinned
+            .verify_and_remove_entry()
+            .expect("verify_and_remove_entry");
+        assert!(!dir_target.exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
     fn test_atomic_write_and_read() {
         let temp_dir =
             std::env::temp_dir().join(format!("aether_fs_test_{}", uuid::Uuid::new_v4().simple()));
@@ -2998,6 +6660,439 @@ mod tests {
     }
 
     #[test]
+    fn test_commit_boundary_competing_destination_never_overwritten() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_commit_race_file_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("critical.rs");
+        let original_data = b"const SYSTEM_STATE: &str = \"ORIGINAL\";\n";
+        fs::write(&file_path, original_data).unwrap();
+
+        let initial_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(original_data);
+            format!("{:x}", hasher.finalize())
+        };
+
+        let competing_data = b"const MALICIOUS_INJECTION: bool = true;\n";
+        let post_hash = |dest: &Path| {
+            // Adversary / concurrent worker recreates target at commit boundary
+            fs::write(dest, competing_data).unwrap();
+        };
+
+        let hooks = ConditionalReplaceHooks {
+            post_hash_hook: Some(&post_hash),
+            ..Default::default()
+        };
+
+        let res = cap.replace_file_bytes_conditional_with_hooks(
+            "critical.rs",
+            b"const SYSTEM_STATE: &str = \"PROPOSED_AI_UPDATE\";\n",
+            Some(&initial_hash),
+            hooks,
+        );
+
+        // Operation MUST fail closed with a clear commit-boundary conflict error
+        assert!(
+            res.is_err(),
+            "Replacement at commit boundary must fail closed"
+        );
+        let err = res.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Commit boundary conflict"),
+            "Error must indicate commit boundary conflict, got: {}",
+            err_msg
+        );
+
+        // CRITICAL: Competing destination must NEVER be silently overwritten
+        let dest_on_disk = fs::read(&file_path).unwrap();
+        assert_eq!(
+            dest_on_disk, competing_data,
+            "Competing destination file must be 100% preserved and never overwritten!"
+        );
+
+        // CRITICAL: Original user data must be safely preserved in conflict file
+        let mut conflict_found = false;
+        for entry in fs::read_dir(&temp_dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".aether-conflict-") {
+                conflict_found = true;
+                let conflict_data = fs::read(entry.path()).unwrap();
+                assert_eq!(
+                    conflict_data, original_data,
+                    "Preserved conflict file must contain exact original data"
+                );
+            }
+        }
+        assert!(
+            conflict_found,
+            "Conflict artifact must be created to preserve original data"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_commit_boundary_competing_directory_preserved() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_commit_race_dir_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("submodule");
+        let original_data = b"original submodule pointer\n";
+        fs::write(&file_path, original_data).unwrap();
+
+        let initial_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(original_data);
+            format!("{:x}", hasher.finalize())
+        };
+
+        let post_hash = |dest: &Path| {
+            // Adversary / concurrent worker introduces a directory at commit boundary
+            let _ = fs::create_dir_all(dest);
+        };
+
+        let hooks = ConditionalReplaceHooks {
+            post_hash_hook: Some(&post_hash),
+            ..Default::default()
+        };
+
+        let res = cap.replace_file_bytes_conditional_with_hooks(
+            "submodule",
+            b"replacement submodule pointer\n",
+            Some(&initial_hash),
+            hooks,
+        );
+
+        assert!(
+            res.is_err(),
+            "Replacement must fail closed when destination is occupied"
+        );
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("Commit boundary conflict"));
+
+        // Verify destination is still a directory and original data preserved
+        assert!(file_path.is_dir(), "Competing directory must be preserved");
+
+        let mut conflict_found = false;
+        for entry in fs::read_dir(&temp_dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".aether-conflict-") {
+                conflict_found = true;
+                assert_eq!(fs::read(entry.path()).unwrap(), original_data);
+            }
+        }
+        assert!(
+            conflict_found,
+            "Original data must be preserved in conflict artifact"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_commit_boundary_competing_symlink_preserved() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_commit_race_symlink_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("target_symlink");
+        let original_data = b"original data prior to symlink race\n";
+        fs::write(&file_path, original_data).unwrap();
+
+        let initial_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(original_data);
+            format!("{:x}", hasher.finalize())
+        };
+
+        let outside_dir = std::env::temp_dir().join(format!(
+            "aether_outside_sym_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&outside_dir);
+        let external_file = outside_dir.join("external.txt");
+        fs::write(&external_file, "external secret").unwrap();
+
+        let ext_clone = external_file.clone();
+        let post_hash = move |dest: &Path| {
+            #[cfg(windows)]
+            let _ = std::os::windows::fs::symlink_file(&ext_clone, dest);
+            #[cfg(not(windows))]
+            let _ = std::os::unix::fs::symlink(&ext_clone, dest);
+        };
+
+        let hooks = ConditionalReplaceHooks {
+            post_hash_hook: Some(&post_hash),
+            ..Default::default()
+        };
+
+        let res = cap.replace_file_bytes_conditional_with_hooks(
+            "target_symlink",
+            b"replacement data\n",
+            Some(&initial_hash),
+            hooks,
+        );
+
+        // If symlink creation was permitted by OS/privileges
+        if let Ok(meta) = file_path.symlink_metadata() {
+            if meta.is_symlink() {
+                assert!(
+                    res.is_err(),
+                    "Replacement must fail closed when destination is symlink"
+                );
+                assert!(res
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Commit boundary conflict"));
+                assert_eq!(
+                    fs::read_to_string(&external_file).unwrap(),
+                    "external secret"
+                );
+            }
+        }
+
+        let _ = fs::remove_dir_all(outside_dir);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_commit_boundary_primary_path_pre_publish_competing_file_never_overwritten() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_commit_pre_pub_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("service.rs");
+        let original_data = b"pub fn service() -> &'static str { \"PRIMARY_ORIGINAL\" }\n";
+        fs::write(&file_path, original_data).unwrap();
+
+        let initial_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(original_data);
+            format!("{:x}", hasher.finalize())
+        };
+
+        let competing_data = b"pub fn injected() -> &'static str { \"PRE_PUBLISH_INJECTION\" }\n";
+        let pre_pub_hook = |dest: &Path| {
+            // Adversary recreates destination immediately before atomic publication
+            fs::write(dest, competing_data).unwrap();
+        };
+
+        let hooks = ConditionalReplaceHooks {
+            pre_publish_hook: Some(&pre_pub_hook),
+            ..Default::default()
+        };
+
+        let res = cap.replace_file_bytes_conditional_with_hooks(
+            "service.rs",
+            b"pub fn service() -> &'static str { \"NEW_CONTENT\" }\n",
+            Some(&initial_hash),
+            hooks,
+        );
+
+        assert!(
+            res.is_err(),
+            "Primary atomic publication must fail closed when destination was recreated immediately before link"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Commit boundary conflict"),
+            "Error must report commit boundary conflict: {}",
+            err_msg
+        );
+
+        let dest_on_disk = fs::read(&file_path).unwrap();
+        assert_eq!(
+            dest_on_disk, competing_data,
+            "Competing destination file must remain byte-for-byte intact"
+        );
+
+        let mut conflict_found = false;
+        for entry in fs::read_dir(&temp_dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".aether-conflict-") {
+                conflict_found = true;
+                let conflict_data = fs::read(entry.path()).unwrap();
+                assert_eq!(
+                    conflict_data, original_data,
+                    "Conflict file must preserve original data"
+                );
+            }
+        }
+        assert!(
+            conflict_found,
+            "Original data must be preserved in conflict artifact"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_commit_boundary_fallback_path_competing_file_never_overwritten() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_commit_fallback_race_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("critical_service.rs");
+        let original_data = b"pub fn critical() -> &'static str { \"ORIGINAL_CORE\" }\n";
+        fs::write(&file_path, original_data).unwrap();
+
+        let initial_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(original_data);
+            format!("{:x}", hasher.finalize())
+        };
+
+        let competing_data =
+            b"pub fn injected() -> &'static str { \"FALLBACK_WINDOW_INJECTION\" }\n";
+        let pre_fallback_hook = |dest: &Path| {
+            // Adversary recreates destination file specifically at the fallback window
+            // immediately before the platform-specific atomic no-replace publication primitive runs!
+            fs::write(dest, competing_data).unwrap();
+        };
+
+        // Inject hard-link failure to force execution of the platform-specific atomic fallback path
+        let hooks = ConditionalReplaceHooks {
+            fault_inject_hard_link_failure: true,
+            pre_fallback_publish_hook: Some(&pre_fallback_hook),
+            ..Default::default()
+        };
+
+        let res = cap.replace_file_bytes_conditional_with_hooks(
+            "critical_service.rs",
+            b"pub fn critical() -> &'static str { \"PROPOSED_PAYLOAD\" }\n",
+            Some(&initial_hash),
+            hooks,
+        );
+
+        assert!(
+            res.is_err(),
+            "Fallback publication path must fail closed when competing file exists"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Commit boundary conflict"),
+            "Error must report commit boundary conflict on fallback path: {}",
+            err_msg
+        );
+
+        // Competing file must be completely untouched and byte-for-byte intact
+        let dest_on_disk = fs::read(&file_path).unwrap();
+        assert_eq!(
+            dest_on_disk, competing_data,
+            "Competing destination file must NEVER be overwritten on fallback path"
+        );
+
+        // Original data must be safely preserved in conflict file
+        let mut conflict_found = false;
+        for entry in fs::read_dir(&temp_dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".aether-conflict-") {
+                conflict_found = true;
+                let conflict_data = fs::read(entry.path()).unwrap();
+                assert_eq!(
+                    conflict_data, original_data,
+                    "Original data must be recovered in conflict file on fallback path"
+                );
+            }
+        }
+        assert!(
+            conflict_found,
+            "Conflict artifact must be created to preserve original data"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_commit_boundary_fallback_path_competing_directory_preserved() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_commit_fallback_dir_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cap = WorkspaceCapability::open(&temp_dir).unwrap();
+
+        let target_path = temp_dir.join("module_target");
+        let original_data = b"pub fn initial_module() {}\n";
+        fs::write(&target_path, original_data).unwrap();
+
+        let initial_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(original_data);
+            format!("{:x}", hasher.finalize())
+        };
+
+        let pre_fallback_hook = |dest: &Path| {
+            // Adversary recreates destination as a directory at the fallback publication boundary
+            fs::create_dir_all(dest).unwrap();
+            fs::write(dest.join("subfile.txt"), b"directory content").unwrap();
+        };
+
+        let hooks = ConditionalReplaceHooks {
+            fault_inject_hard_link_failure: true,
+            pre_fallback_publish_hook: Some(&pre_fallback_hook),
+            ..Default::default()
+        };
+
+        let res = cap.replace_file_bytes_conditional_with_hooks(
+            "module_target",
+            b"pub fn new_module() {}\n",
+            Some(&initial_hash),
+            hooks,
+        );
+
+        assert!(
+            res.is_err(),
+            "Fallback publication must fail closed when competing directory is created"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Commit boundary conflict"),
+            "Error must report commit boundary conflict: {}",
+            err_msg
+        );
+
+        // Competing directory must be preserved
+        assert!(
+            target_path.is_dir(),
+            "Competing directory must remain structurally intact"
+        );
+        assert_eq!(
+            fs::read(target_path.join("subfile.txt")).unwrap(),
+            b"directory content"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
     fn test_delete_file_conditional_unmodified_succeeds() {
         let temp_dir = std::env::temp_dir().join(format!(
             "aether_del_clean_{}",
@@ -3506,5 +7601,2366 @@ mod tests {
         assert!(surviving.exists(), "Surviving file must exist on disk!");
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[cfg(windows)]
+    thread_local! {
+        static FAULT_INJECT_WINDOWS_IMPERSONATION_EARLY_RETURN_ERR: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        static FAULT_INJECT_WINDOWS_IMPERSONATION_EARLY_PANIC: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        static FAULT_INJECT_WINDOWS_REVERT_TO_SELF_FAIL: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        static FAULT_INJECT_WINDOWS_POSTCONDITION_ACTIVE_TOKEN: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        static FAULT_INJECT_WINDOWS_POSTCONDITION_UNEXPECTED_ERR: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        static FAULT_INJECT_WINDOWS_EMERGENCY_CLEANUP_FAIL: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        static EMERGENCY_FAIL_STOP_HOOK: std::cell::Cell<Option<fn(&str)>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    #[cfg(windows)]
+    fn set_fault_inject_windows_impersonation_early_return_err(inject: bool) {
+        FAULT_INJECT_WINDOWS_IMPERSONATION_EARLY_RETURN_ERR.with(|c| c.set(inject));
+    }
+
+    #[cfg(windows)]
+    fn set_fault_inject_windows_impersonation_early_panic(inject: bool) {
+        FAULT_INJECT_WINDOWS_IMPERSONATION_EARLY_PANIC.with(|c| c.set(inject));
+    }
+
+    #[cfg(windows)]
+    fn set_fault_inject_windows_revert_to_self_fail(inject: bool) {
+        FAULT_INJECT_WINDOWS_REVERT_TO_SELF_FAIL.with(|c| c.set(inject));
+    }
+
+    #[cfg(windows)]
+    fn set_fault_inject_windows_postcondition_active_token(inject: bool) {
+        FAULT_INJECT_WINDOWS_POSTCONDITION_ACTIVE_TOKEN.with(|c| c.set(inject));
+    }
+
+    #[cfg(windows)]
+    fn set_fault_inject_windows_postcondition_unexpected_err(inject: bool) {
+        FAULT_INJECT_WINDOWS_POSTCONDITION_UNEXPECTED_ERR.with(|c| c.set(inject));
+    }
+
+    #[cfg(windows)]
+    fn set_fault_inject_windows_emergency_cleanup_fail(inject: bool) {
+        FAULT_INJECT_WINDOWS_EMERGENCY_CLEANUP_FAIL.with(|c| c.set(inject));
+    }
+
+    #[cfg(windows)]
+    fn set_emergency_fail_stop_hook(hook: Option<fn(&str)>) {
+        EMERGENCY_FAIL_STOP_HOOK.with(|c| c.set(hook));
+    }
+
+    #[cfg(windows)]
+    fn emergency_cleanup_fail_stop(msg: &str) -> ! {
+        if let Some(hook) = EMERGENCY_FAIL_STOP_HOOK.with(|c| c.get()) {
+            hook(msg);
+        }
+        eprintln!(
+            "FATAL: Thread impersonation emergency cleanup failed: {}",
+            msg
+        );
+        std::process::abort();
+    }
+
+    #[cfg(windows)]
+    struct HandleGuard(*mut std::ffi::c_void);
+    #[cfg(windows)]
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                extern "system" {
+                    fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+                }
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    struct ThreadImpersonationGuard {
+        active: bool,
+    }
+
+    #[cfg(windows)]
+    impl ThreadImpersonationGuard {
+        unsafe fn revert(&mut self) -> std::result::Result<(), String> {
+            if !self.active {
+                return Ok(());
+            }
+            extern "system" {
+                fn RevertToSelf() -> i32;
+                fn GetCurrentThread() -> *mut std::ffi::c_void;
+                fn OpenThreadToken(
+                    ThreadHandle: *mut std::ffi::c_void,
+                    DesiredAccess: u32,
+                    OpenAsSelf: i32,
+                    TokenHandle: *mut *mut std::ffi::c_void,
+                ) -> i32;
+                fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+                fn GetLastError() -> u32;
+                fn SetLastError(dwErrCode: u32);
+            }
+
+            // 1. Attempt RevertToSelf
+            let revert_res = if FAULT_INJECT_WINDOWS_REVERT_TO_SELF_FAIL.with(|c| c.get()) {
+                SetLastError(5); // ERROR_ACCESS_DENIED
+                0
+            } else {
+                RevertToSelf()
+            };
+
+            if revert_res == 0 {
+                let err = GetLastError();
+                // Requirement A.1 & A.4: Do NOT disarm guard; active remains true
+                return Err(format!("RevertToSelf failed with Win32 error {}", err));
+            }
+
+            // 2. Postcondition verification: OpenThreadToken must fail specifically with ERROR_NO_TOKEN
+            const TOKEN_QUERY: u32 = 0x0008;
+            const ERROR_NO_TOKEN: u32 = 1008;
+            let mut check_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+
+            if FAULT_INJECT_WINDOWS_POSTCONDITION_ACTIVE_TOKEN.with(|c| c.get()) {
+                // Requirement A.4: Active token detected; do NOT disarm guard
+                return Err("Postcondition verification failed: thread still has active impersonation token after RevertToSelf".to_string());
+            }
+
+            if FAULT_INJECT_WINDOWS_POSTCONDITION_UNEXPECTED_ERR.with(|c| c.get()) {
+                // Requirement A.4: Unexpected error code; do NOT disarm guard
+                return Err(
+                    "Postcondition verification failed: OpenThreadToken returned unexpected error 5; expected ERROR_NO_TOKEN (1008)"
+                        .to_string(),
+                );
+            }
+
+            SetLastError(0);
+            if OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut check_tok) != 0 {
+                CloseHandle(check_tok);
+                // Requirement A.4: Active token detected; do NOT disarm guard
+                return Err("Postcondition verification failed: thread still has active impersonation token after RevertToSelf".to_string());
+            }
+
+            let thread_err = GetLastError();
+            if thread_err != ERROR_NO_TOKEN {
+                // Requirement A.4: Unexpected error code; do NOT disarm guard
+                return Err(format!(
+                    "Postcondition verification failed: OpenThreadToken returned unexpected error {}; expected ERROR_NO_TOKEN (1008)",
+                    thread_err
+                ));
+            }
+
+            // Requirement A.3: ONLY disarm the guard after postcondition is confirmed
+            self.active = false;
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for ThreadImpersonationGuard {
+        fn drop(&mut self) {
+            if self.active {
+                extern "system" {
+                    fn RevertToSelf() -> i32;
+                    fn GetCurrentThread() -> *mut std::ffi::c_void;
+                    fn OpenThreadToken(
+                        ThreadHandle: *mut std::ffi::c_void,
+                        DesiredAccess: u32,
+                        OpenAsSelf: i32,
+                        TokenHandle: *mut *mut std::ffi::c_void,
+                    ) -> i32;
+                    fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+                    fn GetLastError() -> u32;
+                    fn SetLastError(dwErrCode: u32);
+                }
+                unsafe {
+                    let emergency_fail =
+                        FAULT_INJECT_WINDOWS_EMERGENCY_CLEANUP_FAIL.with(|c| c.get());
+                    let revert_res = if emergency_fail {
+                        SetLastError(5);
+                        0
+                    } else {
+                        RevertToSelf()
+                    };
+
+                    if revert_res == 0 {
+                        let err = GetLastError();
+                        // Requirement A.5 & A.6: Follow fail-stop policy; do not silently return control
+                        emergency_cleanup_fail_stop(&format!(
+                            "Emergency RevertToSelf failed in ThreadImpersonationGuard with Win32 error {}",
+                            err
+                        ));
+                    }
+
+                    const TOKEN_QUERY: u32 = 0x0008;
+                    const ERROR_NO_TOKEN: u32 = 1008;
+                    let mut check_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+
+                    if emergency_fail {
+                        emergency_cleanup_fail_stop(
+                            "Emergency cleanup verification failed: simulated failure in emergency drop",
+                        );
+                    }
+
+                    SetLastError(0);
+                    if OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut check_tok) != 0 {
+                        CloseHandle(check_tok);
+                        emergency_cleanup_fail_stop(
+                            "Emergency cleanup verification failed: thread still has active impersonation token after emergency RevertToSelf",
+                        );
+                    }
+
+                    let thread_err = GetLastError();
+                    if thread_err != ERROR_NO_TOKEN {
+                        emergency_cleanup_fail_stop(&format!(
+                            "Emergency cleanup verification failed: OpenThreadToken returned unexpected error {}; expected ERROR_NO_TOKEN (1008)",
+                            thread_err
+                        ));
+                    }
+
+                    // Only disarm after verification succeeds
+                    self.active = false;
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[repr(C)]
+    #[allow(clippy::upper_case_acronyms)]
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    struct LUID {
+        low_part: u32,
+        high_part: i32,
+    }
+
+    #[cfg(windows)]
+    #[repr(C)]
+    #[allow(clippy::upper_case_acronyms)]
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    struct LUID_AND_ATTRIBUTES {
+        luid: LUID,
+        attributes: u32,
+    }
+
+    #[cfg(windows)]
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+    #[cfg(windows)]
+    fn validate_token_privileges_sizing(
+        sizing_ret: i32,
+        last_error: u32,
+        req_len: u32,
+    ) -> std::result::Result<(usize, usize, u32), String> {
+        if sizing_ret != 0 {
+            return Err(
+                "GetTokenInformation sizing query unexpectedly succeeded with a NULL buffer"
+                    .to_string(),
+            );
+        }
+
+        if last_error != ERROR_INSUFFICIENT_BUFFER {
+            return Err(format!(
+                "GetTokenInformation sizing query failed with unexpected Win32 error {}; expected ERROR_INSUFFICIENT_BUFFER (122)",
+                last_error
+            ));
+        }
+
+        let min_required = std::mem::size_of::<u32>();
+        let req_len_usize = usize::try_from(req_len)
+            .map_err(|e| format!("Required buffer length conversion failed: {}", e))?;
+        if req_len_usize < min_required {
+            return Err(format!(
+                "Invalid required buffer length {} less than minimum header size {}",
+                req_len, min_required
+            ));
+        }
+
+        let u64_size = std::mem::size_of::<u64>();
+        let num_u64 = req_len_usize.checked_add(u64_size - 1).ok_or_else(|| {
+            "Required buffer length calculation overflowed during alignment rounding".to_string()
+        })? / u64_size;
+
+        let capacity_bytes = num_u64
+            .checked_mul(u64_size)
+            .ok_or_else(|| "Buffer capacity calculation overflowed".to_string())?;
+
+        if capacity_bytes < req_len_usize {
+            return Err("Calculated buffer capacity does not cover required size".to_string());
+        }
+
+        let capacity_u32 = u32::try_from(capacity_bytes).map_err(|e| {
+            format!(
+                "Buffer capacity {} exceeds u32 range: {}",
+                capacity_bytes, e
+            )
+        })?;
+
+        Ok((num_u64, capacity_bytes, capacity_u32))
+    }
+
+    #[cfg(windows)]
+    unsafe fn parse_token_privileges_buffer(
+        buf_ptr: *const u8,
+        capacity_bytes: usize,
+        actual_len: usize,
+    ) -> std::result::Result<Vec<LUID_AND_ATTRIBUTES>, String> {
+        if buf_ptr.is_null() {
+            return Err("Token privileges buffer pointer is NULL".to_string());
+        }
+
+        if actual_len > capacity_bytes {
+            return Err(format!(
+                "GetTokenInformation returned actual length {} exceeding allocated buffer capacity {}",
+                actual_len, capacity_bytes
+            ));
+        }
+
+        let min_required = std::mem::size_of::<u32>();
+        if actual_len < min_required {
+            return Err(format!(
+                "GetTokenInformation returned actual length {} less than minimum header size {}",
+                actual_len, min_required
+            ));
+        }
+
+        let base_addr = buf_ptr as usize;
+        if !base_addr.is_multiple_of(std::mem::align_of::<u32>()) {
+            return Err(format!(
+                "Buffer pointer {:#x} violates u32 header alignment requirement",
+                base_addr
+            ));
+        }
+
+        let priv_count = *(buf_ptr as *const u32) as usize;
+        let entry_size = std::mem::size_of::<LUID_AND_ATTRIBUTES>();
+        let entry_align = std::mem::align_of::<LUID_AND_ATTRIBUTES>();
+
+        let entries_bytes = priv_count
+            .checked_mul(entry_size)
+            .filter(|&b| b <= (u32::MAX as usize) - min_required)
+            .ok_or_else(|| "Privilege count calculation overflowed multiplication".to_string())?;
+
+        let required_bytes = min_required
+            .checked_add(entries_bytes)
+            .ok_or_else(|| "Privilege buffer length calculation overflowed".to_string())?;
+
+        if required_bytes > actual_len {
+            return Err(format!(
+                "Privilege count {} requires {} bytes, but returned buffer contains only {} bytes",
+                priv_count, required_bytes, actual_len
+            ));
+        }
+
+        let mut privileges = Vec::with_capacity(priv_count);
+        for i in 0..priv_count {
+            let offset = min_required
+                .checked_add(
+                    i.checked_mul(entry_size)
+                        .ok_or_else(|| format!("Offset calculation overflowed for entry {}", i))?,
+                )
+                .ok_or_else(|| format!("Offset calculation overflowed for entry {}", i))?;
+
+            let entry_end = offset
+                .checked_add(entry_size)
+                .ok_or_else(|| format!("Entry end calculation overflowed for entry {}", i))?;
+
+            if entry_end > actual_len || entry_end > capacity_bytes {
+                return Err(format!(
+                    "Privilege entry {} range [{}..{}] exceeds validated buffer bounds (actual_len={}, capacity={})",
+                    i, offset, entry_end, actual_len, capacity_bytes
+                ));
+            }
+
+            let entry_ptr = buf_ptr.add(offset) as *const LUID_AND_ATTRIBUTES;
+            let addr = entry_ptr as usize;
+            if !addr.is_multiple_of(entry_align) {
+                return Err(format!(
+                    "Privilege entry {} address {:#x} violates alignment requirement {}",
+                    i, addr, entry_align
+                ));
+            }
+
+            privileges.push(*entry_ptr);
+        }
+
+        Ok(privileges)
+    }
+
+    #[cfg(windows)]
+    unsafe fn query_token_privileges(
+        token: *mut std::ffi::c_void,
+    ) -> std::result::Result<Vec<LUID_AND_ATTRIBUTES>, String> {
+        #[allow(non_upper_case_globals)]
+        const TokenPrivileges: u32 = 3;
+
+        extern "system" {
+            fn GetTokenInformation(
+                TokenHandle: *mut std::ffi::c_void,
+                TokenInformationClass: u32,
+                TokenInformation: *mut std::ffi::c_void,
+                TokenInformationLength: u32,
+                ReturnLength: *mut u32,
+            ) -> i32;
+            fn GetLastError() -> u32;
+            fn SetLastError(dwErrCode: u32);
+        }
+
+        SetLastError(0);
+        let mut req_len = 0u32;
+        let sizing_ret = GetTokenInformation(
+            token,
+            TokenPrivileges,
+            std::ptr::null_mut(),
+            0,
+            &mut req_len,
+        );
+        let last_err = GetLastError();
+
+        let (num_u64, capacity_bytes, capacity_u32) =
+            validate_token_privileges_sizing(sizing_ret, last_err, req_len)?;
+
+        let mut priv_buf: Vec<u64> = vec![0u64; num_u64];
+
+        let mut actual_len = 0u32;
+        SetLastError(0);
+        let data_ret = GetTokenInformation(
+            token,
+            TokenPrivileges,
+            priv_buf.as_mut_ptr() as *mut std::ffi::c_void,
+            capacity_u32,
+            &mut actual_len,
+        );
+        if data_ret == 0 {
+            let err = GetLastError();
+            return Err(format!(
+                "GetTokenInformation(TokenPrivileges) query failed with Win32 error {}",
+                err
+            ));
+        }
+
+        let actual_len_usize = usize::try_from(actual_len)
+            .map_err(|e| format!("Actual returned length conversion failed: {}", e))?;
+
+        parse_token_privileges_buffer(
+            priv_buf.as_ptr() as *const u8,
+            capacity_bytes,
+            actual_len_usize,
+        )
+    }
+
+    #[cfg(windows)]
+    unsafe fn set_directory_owner_to_token_user(path: &Path) -> std::result::Result<(), String> {
+        use std::os::windows::ffi::OsStrExt;
+
+        const SE_FILE_OBJECT: u32 = 1;
+        const OWNER_SECURITY_INFORMATION: u32 = 0x00000001;
+        const TOKEN_DUPLICATE: u32 = 0x0002;
+        const TOKEN_IMPERSONATE: u32 = 0x0004;
+        const TOKEN_QUERY: u32 = 0x0008;
+        const TOKEN_ADJUST_PRIVILEGES: u32 = 0x0020;
+        const SECURITY_IMPERSONATION: u32 = 2;
+        const TOKEN_IMPERSONATION: u32 = 2;
+        #[allow(non_upper_case_globals)]
+        const TokenUser: u32 = 1;
+        const SE_PRIVILEGE_ENABLED: u32 = 0x00000002;
+        const ERROR_SUCCESS: u32 = 0;
+        const ERROR_NOT_ALL_ASSIGNED: u32 = 1300;
+        const ERROR_NO_TOKEN: u32 = 1008;
+
+        extern "system" {
+            fn OpenProcessToken(
+                ProcessHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn DuplicateTokenEx(
+                hExistingToken: *mut std::ffi::c_void,
+                dwDesiredAccess: u32,
+                lpTokenAttributes: *mut std::ffi::c_void,
+                ImpersonationLevel: u32,
+                TokenType: u32,
+                phNewToken: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn SetThreadToken(
+                Thread: *mut *mut std::ffi::c_void,
+                Token: *mut std::ffi::c_void,
+            ) -> i32;
+            fn GetCurrentThread() -> *mut std::ffi::c_void;
+            fn OpenThreadToken(
+                ThreadHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                OpenAsSelf: i32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn SetLastError(dwErrCode: u32);
+            fn GetTokenInformation(
+                TokenHandle: *mut std::ffi::c_void,
+                TokenInformationClass: u32,
+                TokenInformation: *mut std::ffi::c_void,
+                TokenInformationLength: u32,
+                ReturnLength: *mut u32,
+            ) -> i32;
+            fn LookupPrivilegeValueW(
+                lpSystemName: *const u16,
+                lpName: *const u16,
+                lpLuid: *mut std::ffi::c_void,
+            ) -> i32;
+            fn AdjustTokenPrivileges(
+                TokenHandle: *mut std::ffi::c_void,
+                DisableAllPrivileges: i32,
+                NewState: *mut std::ffi::c_void,
+                BufferLength: u32,
+                PreviousState: *mut std::ffi::c_void,
+                ReturnLength: *mut u32,
+            ) -> i32;
+            fn SetNamedSecurityInfoW(
+                pObjectName: *const u16,
+                ObjectType: u32,
+                SecurityInfo: u32,
+                ppsidOwner: *mut std::ffi::c_void,
+                ppsidGroup: *mut std::ffi::c_void,
+                ppDacl: *mut std::ffi::c_void,
+                ppSacl: *mut std::ffi::c_void,
+            ) -> u32;
+            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn GetLastError() -> u32;
+        }
+
+        // Requirement A: Query the current thread's impersonation token using OpenThreadToken.
+        // If the thread is already impersonating, reject before making any security-context changes.
+        let mut pre_existing_thread_token: *mut std::ffi::c_void = std::ptr::null_mut();
+        if OpenThreadToken(
+            GetCurrentThread(),
+            TOKEN_QUERY,
+            1,
+            &mut pre_existing_thread_token,
+        ) != 0
+        {
+            CloseHandle(pre_existing_thread_token);
+            return Err(
+                "Thread is already impersonating an existing security context; rejecting operation to protect existing context without overwriting or discarding it"
+                    .to_string(),
+            );
+        }
+        let initial_thread_err = GetLastError();
+        if initial_thread_err != ERROR_NO_TOKEN {
+            return Err(format!(
+                "Initial OpenThreadToken check failed with unexpected Win32 error {}; expected ERROR_NO_TOKEN (1008)",
+                initial_thread_err
+            ));
+        }
+
+        // 1. Open process token with minimum required access (TOKEN_QUERY | TOKEN_DUPLICATE)
+        let mut proc_token: *mut std::ffi::c_void = std::ptr::null_mut();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_DUPLICATE,
+            &mut proc_token,
+        ) == 0
+        {
+            let err = GetLastError();
+            return Err(format!("OpenProcessToken failed with Win32 error {}", err));
+        }
+        let _proc_guard = HandleGuard(proc_token);
+
+        // Query the process token's individual TokenUser SID
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct SID_AND_ATTRIBUTES {
+            Sid: *mut std::ffi::c_void,
+            Attributes: u32,
+        }
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct TOKEN_USER {
+            User: SID_AND_ATTRIBUTES,
+        }
+
+        #[repr(align(8))]
+        struct AlignedBuffer([u8; 512]);
+        let mut user_buf = AlignedBuffer([0u8; 512]);
+        let mut ret_len = 0u32;
+        if GetTokenInformation(
+            proc_token,
+            TokenUser,
+            user_buf.0.as_mut_ptr() as *mut _,
+            user_buf.0.len() as u32,
+            &mut ret_len,
+        ) == 0
+        {
+            let err = GetLastError();
+            return Err(format!(
+                "GetTokenInformation(TokenUser) failed with Win32 error {}",
+                err
+            ));
+        }
+        let token_user = &*(user_buf.0.as_ptr() as *const TOKEN_USER);
+        let p_token_user_sid = token_user.User.Sid;
+
+        // Requirement C: Query privileges present in the process token using aligned parsing
+        let present_privileges = query_token_privileges(proc_token)?;
+
+        // 2. Duplicate process token into thread impersonation token with TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES | TOKEN_IMPERSONATE
+        let mut imp_token: *mut std::ffi::c_void = std::ptr::null_mut();
+        if DuplicateTokenEx(
+            proc_token,
+            TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES | TOKEN_IMPERSONATE,
+            std::ptr::null_mut(),
+            SECURITY_IMPERSONATION,
+            TOKEN_IMPERSONATION,
+            &mut imp_token,
+        ) == 0
+        {
+            let err = GetLastError();
+            return Err(format!("DuplicateTokenEx failed with Win32 error {}", err));
+        }
+        let _imp_guard = HandleGuard(imp_token);
+
+        // 3. Enable only privileges required and actually present in the token on the duplicated token
+        #[repr(C)]
+        #[allow(clippy::upper_case_acronyms)]
+        struct TOKEN_PRIVILEGES {
+            privilege_count: u32,
+            privileges: [LUID_AND_ATTRIBUTES; 1],
+        }
+
+        for priv_name in &["SeRestorePrivilege", "SeTakeOwnershipPrivilege"] {
+            let wide_name: Vec<u16> = priv_name.encode_utf16().chain(Some(0)).collect();
+            let mut luid = LUID {
+                low_part: 0,
+                high_part: 0,
+            };
+            if LookupPrivilegeValueW(
+                std::ptr::null(),
+                wide_name.as_ptr(),
+                &mut luid as *mut _ as *mut _,
+            ) == 0
+            {
+                let err = GetLastError();
+                return Err(format!(
+                    "LookupPrivilegeValueW({}) failed with Win32 error {}",
+                    priv_name, err
+                ));
+            }
+
+            let mut is_present = false;
+            for entry in &present_privileges {
+                if entry.luid.low_part == luid.low_part && entry.luid.high_part == luid.high_part {
+                    is_present = true;
+                    break;
+                }
+            }
+
+            if is_present {
+                let mut tp = TOKEN_PRIVILEGES {
+                    privilege_count: 1,
+                    privileges: [LUID_AND_ATTRIBUTES {
+                        luid,
+                        attributes: SE_PRIVILEGE_ENABLED,
+                    }],
+                };
+                SetLastError(0);
+                let adj_res = AdjustTokenPrivileges(
+                    imp_token,
+                    0,
+                    &mut tp as *mut _ as *mut _,
+                    std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+                let adj_err = GetLastError();
+                if adj_res == 0 {
+                    return Err(format!(
+                        "AdjustTokenPrivileges({}) failed with Win32 error {}",
+                        priv_name, adj_err
+                    ));
+                }
+                if adj_err == ERROR_NOT_ALL_ASSIGNED {
+                    return Err(format!(
+                        "AdjustTokenPrivileges({}) failed: ERROR_NOT_ALL_ASSIGNED (1300)",
+                        priv_name
+                    ));
+                }
+                if adj_err != ERROR_SUCCESS {
+                    return Err(format!(
+                        "AdjustTokenPrivileges({}) returned unexpected error {}",
+                        priv_name, adj_err
+                    ));
+                }
+            }
+        }
+
+        // 4. Apply duplicated impersonation token to the current thread
+        if SetThreadToken(std::ptr::null_mut(), imp_token) == 0 {
+            let err = GetLastError();
+            return Err(format!("SetThreadToken failed with Win32 error {}", err));
+        }
+        let mut impersonation_guard = ThreadImpersonationGuard { active: true };
+
+        // Test fault injection hooks for verifying emergency cleanup in Drop
+        if FAULT_INJECT_WINDOWS_IMPERSONATION_EARLY_RETURN_ERR.with(|c| c.get()) {
+            return Err("Fault injection: simulated early error while impersonating".to_string());
+        }
+        if FAULT_INJECT_WINDOWS_IMPERSONATION_EARLY_PANIC.with(|c| c.get()) {
+            panic!("Fault injection: simulated panic while impersonating");
+        }
+
+        // 5. Call SetNamedSecurityInfoW under thread impersonation context
+        let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let set_res = SetNamedSecurityInfoW(
+            wide_path.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            p_token_user_sid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+
+        // 6. Explicitly revert thread impersonation and verify success
+        impersonation_guard.revert()?;
+
+        // 7. Verify SetNamedSecurityInfoW result
+        if set_res != 0 {
+            return Err(format!(
+                "SetNamedSecurityInfoW(OWNER_SECURITY_INFORMATION) failed with Win32 error {}",
+                set_res
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    unsafe fn query_directory_owner_and_token_user_sids(
+        path: &Path,
+    ) -> std::result::Result<(String, String, bool), String> {
+        use std::os::windows::ffi::OsStrExt;
+
+        const SE_FILE_OBJECT: u32 = 1;
+        const OWNER_SECURITY_INFORMATION: u32 = 0x00000001;
+        const TOKEN_QUERY: u32 = 0x0008;
+        #[allow(non_upper_case_globals)]
+        const TokenUser: u32 = 1;
+
+        extern "system" {
+            fn GetNamedSecurityInfoW(
+                pObjectName: *const u16,
+                ObjectType: u32,
+                SecurityInfo: u32,
+                ppsidOwner: *mut *mut std::ffi::c_void,
+                ppsidGroup: *mut *mut std::ffi::c_void,
+                ppDacl: *mut *mut std::ffi::c_void,
+                ppSacl: *mut *mut std::ffi::c_void,
+                ppSecurityDescriptor: *mut *mut std::ffi::c_void,
+            ) -> u32;
+            fn OpenProcessToken(
+                ProcessHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn GetTokenInformation(
+                TokenHandle: *mut std::ffi::c_void,
+                TokenInformationClass: u32,
+                TokenInformation: *mut std::ffi::c_void,
+                TokenInformationLength: u32,
+                ReturnLength: *mut u32,
+            ) -> i32;
+            fn EqualSid(pSid1: *mut std::ffi::c_void, pSid2: *mut std::ffi::c_void) -> i32;
+            fn ConvertSidToStringSidW(Sid: *mut std::ffi::c_void, StringSid: *mut *mut u16) -> i32;
+            fn LocalFree(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn GetLastError() -> u32;
+        }
+
+        unsafe fn sid_to_string(sid: *mut std::ffi::c_void) -> std::result::Result<String, String> {
+            let mut p_str: *mut u16 = std::ptr::null_mut();
+            if ConvertSidToStringSidW(sid, &mut p_str) == 0 || p_str.is_null() {
+                return Err(format!(
+                    "ConvertSidToStringSidW failed with Win32 error {}",
+                    GetLastError()
+                ));
+            }
+            let mut len = 0;
+            while *p_str.add(len) != 0 {
+                len += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(p_str, len));
+            LocalFree(p_str as *mut _);
+            Ok(s)
+        }
+
+        let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut p_owner_sid: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut p_sec_desc: *mut std::ffi::c_void = std::ptr::null_mut();
+
+        let sec_res = GetNamedSecurityInfoW(
+            wide_path.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut p_owner_sid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut p_sec_desc,
+        );
+        if sec_res != 0 {
+            return Err(format!(
+                "GetNamedSecurityInfoW(OWNER_SECURITY_INFORMATION) failed with Win32 error {}",
+                sec_res
+            ));
+        }
+        if p_owner_sid.is_null() {
+            if !p_sec_desc.is_null() {
+                LocalFree(p_sec_desc);
+            }
+            return Err("GetNamedSecurityInfoW returned a NULL owner SID".to_string());
+        }
+
+        let owner_sid_str = match sid_to_string(p_owner_sid) {
+            Ok(s) => s,
+            Err(e) => {
+                if !p_sec_desc.is_null() {
+                    LocalFree(p_sec_desc);
+                }
+                return Err(e);
+            }
+        };
+
+        let mut token: *mut std::ffi::c_void = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            if !p_sec_desc.is_null() {
+                LocalFree(p_sec_desc);
+            }
+            return Err(format!(
+                "OpenProcessToken failed with Win32 error {}",
+                GetLastError()
+            ));
+        }
+
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct SID_AND_ATTRIBUTES {
+            Sid: *mut std::ffi::c_void,
+            Attributes: u32,
+        }
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct TOKEN_USER {
+            User: SID_AND_ATTRIBUTES,
+        }
+
+        #[repr(align(8))]
+        struct AlignedBuffer([u8; 512]);
+        let mut user_buf = AlignedBuffer([0u8; 512]);
+        let mut ret_len = 0u32;
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            user_buf.0.as_mut_ptr() as *mut _,
+            user_buf.0.len() as u32,
+            &mut ret_len,
+        ) == 0
+        {
+            CloseHandle(token);
+            if !p_sec_desc.is_null() {
+                LocalFree(p_sec_desc);
+            }
+            return Err(format!(
+                "GetTokenInformation(TokenUser) failed with Win32 error {}",
+                GetLastError()
+            ));
+        }
+        let token_user = &*(user_buf.0.as_ptr() as *const TOKEN_USER);
+        let p_token_user_sid = token_user.User.Sid;
+
+        let token_user_sid_str = match sid_to_string(p_token_user_sid) {
+            Ok(s) => s,
+            Err(e) => {
+                CloseHandle(token);
+                if !p_sec_desc.is_null() {
+                    LocalFree(p_sec_desc);
+                }
+                return Err(e);
+            }
+        };
+
+        let is_equal = EqualSid(p_owner_sid, p_token_user_sid) != 0;
+
+        CloseHandle(token);
+        if !p_sec_desc.is_null() {
+            LocalFree(p_sec_desc);
+        }
+
+        Ok((owner_sid_str, token_user_sid_str, is_equal))
+    }
+
+    #[cfg(windows)]
+    unsafe fn assert_directory_owner_is_token_user(path: &Path) -> (String, String) {
+        let (owner_sid_str, token_user_sid_str, is_equal) =
+            query_directory_owner_and_token_user_sids(path)
+                .expect("Failed to query directory owner and TokenUser SIDs");
+
+        assert!(
+            is_equal,
+            "Directory actual owner SID ({}) does not match process TokenUser SID ({}); fixture requires exact individual TokenUser ownership",
+            owner_sid_str, token_user_sid_str
+        );
+        assert_eq!(
+            owner_sid_str, token_user_sid_str,
+            "Owner SID string representation must match TokenUser SID string"
+        );
+
+        (owner_sid_str, token_user_sid_str)
+    }
+
+    #[cfg(windows)]
+    unsafe fn set_permissive_dacl_for_sid(
+        path: &Path,
+        well_known_sid: u32,
+        inherit: bool,
+    ) -> std::result::Result<(), String> {
+        use std::os::windows::ffi::OsStrExt;
+        let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+
+        const SE_FILE_OBJECT: u32 = 1;
+        const DACL_SECURITY_INFORMATION: u32 = 0x00000004;
+        const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x80000000;
+        const ACL_REVISION: u32 = 2;
+        const GENERIC_ALL: u32 = 0x10000000;
+        const CONTAINER_INHERIT_ACE: u32 = 0x02;
+        const OBJECT_INHERIT_ACE: u32 = 0x01;
+
+        extern "system" {
+            fn CreateWellKnownSid(
+                WellKnownSidType: u32,
+                DomainSid: *mut std::ffi::c_void,
+                pSid: *mut std::ffi::c_void,
+                cbSid: *mut u32,
+            ) -> i32;
+            fn InitializeAcl(
+                pAcl: *mut std::ffi::c_void,
+                nAclLength: u32,
+                dwAclRevision: u32,
+            ) -> i32;
+            fn AddAccessAllowedAceEx(
+                pAcl: *mut std::ffi::c_void,
+                dwAceRevision: u32,
+                AceFlags: u32,
+                AccessMask: u32,
+                pSid: *mut std::ffi::c_void,
+            ) -> i32;
+            fn SetNamedSecurityInfoW(
+                pObjectName: *const u16,
+                ObjectType: u32,
+                SecurityInfo: u32,
+                ppsidOwner: *mut std::ffi::c_void,
+                ppsidGroup: *mut std::ffi::c_void,
+                ppDacl: *mut std::ffi::c_void,
+                ppSacl: *mut std::ffi::c_void,
+            ) -> u32;
+            fn GetLastError() -> u32;
+        }
+
+        let mut sid_buf = vec![0u8; 68];
+        let mut cb_sid = sid_buf.len() as u32;
+        if CreateWellKnownSid(
+            well_known_sid,
+            std::ptr::null_mut(),
+            sid_buf.as_mut_ptr() as *mut _,
+            &mut cb_sid,
+        ) == 0
+        {
+            return Err(format!(
+                "CreateWellKnownSid(type={}) failed with Win32 error {}",
+                well_known_sid,
+                GetLastError()
+            ));
+        }
+
+        let mut acl_buf = vec![0u8; 1024];
+        if InitializeAcl(
+            acl_buf.as_mut_ptr() as *mut _,
+            acl_buf.len() as u32,
+            ACL_REVISION,
+        ) == 0
+        {
+            return Err(format!(
+                "InitializeAcl failed with Win32 error {}",
+                GetLastError()
+            ));
+        }
+
+        let flags = if inherit {
+            CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
+        } else {
+            0
+        };
+        if AddAccessAllowedAceEx(
+            acl_buf.as_mut_ptr() as *mut _,
+            ACL_REVISION,
+            flags,
+            GENERIC_ALL,
+            sid_buf.as_mut_ptr() as *mut _,
+        ) == 0
+        {
+            return Err(format!(
+                "AddAccessAllowedAceEx failed with Win32 error {}",
+                GetLastError()
+            ));
+        }
+
+        let set_res = SetNamedSecurityInfoW(
+            wide_path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            acl_buf.as_mut_ptr() as *mut _,
+            std::ptr::null_mut(),
+        );
+        if set_res != 0 {
+            return Err(format!(
+                "SetNamedSecurityInfoW failed with Win32 error {}",
+                set_res
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    unsafe fn set_permissive_dacl_for_everyone(
+        path: &Path,
+        inherit: bool,
+    ) -> std::result::Result<(), String> {
+        const WIN_WORLD_SID: u32 = 1;
+        set_permissive_dacl_for_sid(path, WIN_WORLD_SID, inherit)
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_parent_safe_dacl() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_dacl_safe_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        secure_storage_parent_private_acl(&temp_dir).expect("secure private acl");
+        let res = verify_storage_parent_acl(&temp_dir);
+        assert!(
+            res.is_ok(),
+            "Parent with safe DACL must be accepted: {:?}",
+            res
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_parent_unsafe_permissive_dacl() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_dacl_unsafe_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        unsafe {
+            set_permissive_dacl_for_everyone(&temp_dir, false)
+                .expect("Failed to set unsafe permissive DACL for Everyone");
+        }
+
+        let res = verify_storage_parent_acl(&temp_dir);
+        assert!(
+            res.is_err(),
+            "Parent with unsafe permissive DACL must be rejected"
+        );
+        let err_msg = format!("{:?}", res);
+        assert!(
+            err_msg.contains("unsafe permissions"),
+            "Error must indicate unsafe permissions: {}",
+            err_msg
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_parent_different_user() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_dacl_diff_user_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        set_fault_inject_windows_different_owner(true);
+        let res = verify_storage_parent_acl(&temp_dir);
+        set_fault_inject_windows_different_owner(false);
+
+        assert!(
+            res.is_err(),
+            "Parent owned by a different user must be rejected"
+        );
+        let err_msg = format!("{:?}", res);
+        assert!(
+            err_msg.contains("not owned by an authorized private owner"),
+            "Error must indicate ownership mismatch: {}",
+            err_msg
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_parent_inherited_permissive_aces() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_dacl_inherited_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let parent_dir = temp_dir.join("parent_with_inherited");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+
+        unsafe {
+            set_permissive_dacl_for_everyone(&parent_dir, true)
+                .expect("Failed to set inherited permissive DACL for Everyone");
+        }
+
+        let child_storage = parent_dir.join("child_storage");
+        std::fs::create_dir_all(&child_storage).unwrap();
+
+        let res = verify_storage_parent_acl(&child_storage);
+        assert!(
+            res.is_err(),
+            "Parent with inherited permissive ACEs must be rejected"
+        );
+        let err_msg = format!("{:?}", res);
+        assert!(
+            err_msg.contains("unsafe permissions"),
+            "Error must indicate unsafe permissions from inherited ACEs: {}",
+            err_msg
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_parent_inspection_failure() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_dacl_inspect_fail_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        set_fault_inject_windows_security_descriptor_failure(true);
+        let res = verify_storage_parent_acl(&temp_dir);
+        set_fault_inject_windows_security_descriptor_failure(false);
+
+        assert!(
+            res.is_err(),
+            "Inspection failure on security descriptor must fail closed"
+        );
+        let err_msg = format!("{:?}", res);
+        assert!(
+            err_msg.contains("failed to inspect security descriptor"),
+            "Error must indicate inspection failure: {}",
+            err_msg
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_parent_broad_group_owner_cannot_bypass_private_acl() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_dacl_broad_group_owner_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Establish an otherwise secure, valid private DACL first so that DACL inspection
+        // cannot trigger rejection; the test strictly isolates the owner-validation check.
+        secure_storage_parent_private_acl(&temp_dir).expect("secure private acl");
+
+        // 2. Simulate owner as broad group BUILTIN\Users (Well-Known SID type 27: WinBuiltinUsersSid = S-1-5-32-545)
+        const WIN_BUILTIN_USERS_SID: u32 = 27;
+        set_fault_inject_windows_simulated_owner_sid(Some(WIN_BUILTIN_USERS_SID));
+        let res = verify_storage_parent_acl(&temp_dir);
+        set_fault_inject_windows_simulated_owner_sid(None);
+
+        // 3. Confirm that validation fails specifically because owner is not an accepted private owner,
+        // and does NOT fail due to DACL inspection.
+        assert!(
+            res.is_err(),
+            "Parent directory owned by BUILTIN\\Users must be rejected"
+        );
+        let err_msg = format!("{:?}", res);
+        assert!(
+            err_msg.contains("not owned by an authorized private owner"),
+            "Error must indicate rejection of broad group owner: {}",
+            err_msg
+        );
+        assert!(
+            !err_msg.contains("unsafe permissions"),
+            "Rejection must be strictly due to broad group owner, not DACL inspection: {}",
+            err_msg
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_parent_broad_group_dangerous_dacl_rejected() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_dacl_broad_group_dacl_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Establish individual TokenUser ownership explicitly rather than relying on
+        // test runner default ownership (which on elevated Windows runners defaults to BUILTIN\Administrators).
+        unsafe {
+            set_directory_owner_to_token_user(&temp_dir)
+                .expect("Failed to set directory owner to individual TokenUser");
+        }
+
+        // Explicitly verify and prove that the directory's actual owner SID is exactly
+        // the current process's individual TokenUser SID.
+        // Fails fixture setup if identities do not match (no fallback to Administrators/SYSTEM).
+        let (owner_sid, token_user_sid) =
+            unsafe { assert_directory_owner_is_token_user(&temp_dir) };
+        println!("test_windows_parent_broad_group_dangerous_dacl_rejected: directory actual owner SID: {}", owner_sid);
+        println!("test_windows_parent_broad_group_dangerous_dacl_rejected: process actual TokenUser SID: {}", token_user_sid);
+        assert_eq!(
+            owner_sid, token_user_sid,
+            "Directory actual owner SID must match current individual TokenUser SID"
+        );
+
+        // Ensure fault injection seams are cleared so owner verification passes cleanly
+        // and execution reaches DACL inspection.
+        set_fault_inject_windows_simulated_owner_sid(None);
+        set_fault_inject_windows_simulated_admin_token(false);
+
+        // 2. Grant dangerous permissions (GENERIC_ALL = 0x10000000, which includes write/modify/delete)
+        // to broad group BUILTIN\Users (Well-Known SID type 27: WinBuiltinUsersSid = S-1-5-32-545)
+        // using the verified ACL fixture constructor.
+        const WIN_BUILTIN_USERS_SID: u32 = 27;
+        let dacl_res =
+            unsafe { set_permissive_dacl_for_sid(&temp_dir, WIN_BUILTIN_USERS_SID, false) };
+        assert!(
+            dacl_res.is_ok(),
+            "Installing dangerous DACL fixture must succeed: {:?}",
+            dacl_res.err()
+        );
+
+        // 3. Invoke the production security verifier. Rejection must be triggered specifically by DACL inspection.
+        let res_dacl = verify_storage_parent_acl(&temp_dir);
+        assert!(
+            res_dacl.is_err(),
+            "Parent directory with dangerous broad-group DACL must be rejected"
+        );
+        let err_msg = format!("{:?}", res_dacl);
+        assert!(
+            err_msg.contains("unsafe permissions"),
+            "Error must indicate rejection due to unsafe DACL permissions: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("S-1-5-32-545"),
+            "Error must identify BUILTIN\\Users SID (S-1-5-32-545) as unauthorized principal: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("0x001F01FF") || err_msg.contains("0x10000000"),
+            "Error must identify dangerous permissions mask (GENERIC_ALL 0x10000000 or NTFS mapped FILE_ALL_ACCESS 0x001F01FF): {}",
+            err_msg
+        );
+        assert!(
+            !err_msg.contains("not owned by an authorized private owner"),
+            "Directory owner is verified TokenUser; must NOT fail owner validation: {}",
+            err_msg
+        );
+
+        // 4. Secure remediation: replace unsafe ACL with a valid private ACL
+        secure_storage_parent_private_acl(&temp_dir).expect("remediation must succeed");
+
+        // 5. Confirm that the valid configuration is accepted
+        let verify_safe = verify_storage_parent_acl(&temp_dir);
+        assert!(
+            verify_safe.is_ok(),
+            "Secured parent directory must pass verification: {:?}",
+            verify_safe
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_parent_token_user_identity_proof() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_dacl_token_user_proof_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Establish individual TokenUser ownership explicitly rather than relying on
+        // test runner default ownership (which on elevated Windows runners defaults to BUILTIN\Administrators).
+        unsafe {
+            set_directory_owner_to_token_user(&temp_dir)
+                .expect("Failed to set directory owner to individual TokenUser");
+        }
+
+        let (owner_sid, token_user_sid, is_equal) = unsafe {
+            query_directory_owner_and_token_user_sids(&temp_dir)
+                .expect("query_directory_owner_and_token_user_sids must succeed")
+        };
+        println!(
+            "test_windows_parent_token_user_identity_proof: directory actual owner SID: {}",
+            owner_sid
+        );
+        println!(
+            "test_windows_parent_token_user_identity_proof: process actual TokenUser SID: {}",
+            token_user_sid
+        );
+        println!(
+            "test_windows_parent_token_user_identity_proof: EqualSid result: {}",
+            is_equal
+        );
+
+        assert!(
+            is_equal,
+            "Created directory must be owned by current individual TokenUser"
+        );
+        assert_eq!(owner_sid, token_user_sid);
+        assert!(!owner_sid.is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_parent_authorized_administrators_owner() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_dacl_admin_owner_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        const WIN_BUILTIN_ADMINISTRATORS_SID: u32 = 26;
+        set_fault_inject_windows_simulated_owner_sid(Some(WIN_BUILTIN_ADMINISTRATORS_SID));
+        set_fault_inject_windows_simulated_admin_token(true);
+
+        secure_storage_parent_private_acl(&temp_dir).expect("secure private acl");
+        let res = verify_storage_parent_acl(&temp_dir);
+
+        set_fault_inject_windows_simulated_owner_sid(None);
+        set_fault_inject_windows_simulated_admin_token(false);
+
+        assert!(
+            res.is_ok(),
+            "Authorized elevated Administrators-owned parent must be accepted: {:?}",
+            res
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[cfg(windows)]
+    unsafe fn get_process_token_privileges() -> std::result::Result<Vec<(u32, i32, u32)>, String> {
+        const TOKEN_QUERY: u32 = 0x0008;
+
+        extern "system" {
+            fn OpenProcessToken(
+                ProcessHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn GetLastError() -> u32;
+        }
+
+        let mut token: *mut std::ffi::c_void = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(format!(
+                "OpenProcessToken failed with Win32 error {}",
+                GetLastError()
+            ));
+        }
+        let _guard = HandleGuard(token);
+
+        let privileges = query_token_privileges(token)?;
+        let mut privs: Vec<(u32, i32, u32)> = privileges
+            .into_iter()
+            .map(|p| (p.luid.low_part, p.luid.high_part, p.attributes))
+            .collect();
+        privs.sort_by_key(|p| (p.0, p.1));
+        Ok(privs)
+    }
+
+    #[cfg(windows)]
+    unsafe fn assert_thread_not_impersonating() {
+        const TOKEN_QUERY: u32 = 0x0008;
+        const ERROR_NO_TOKEN: u32 = 1008;
+        extern "system" {
+            fn GetCurrentThread() -> *mut std::ffi::c_void;
+            fn OpenThreadToken(
+                ThreadHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                OpenAsSelf: i32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+            fn GetLastError() -> u32;
+        }
+
+        let mut thread_token: *mut std::ffi::c_void = std::ptr::null_mut();
+        let res = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut thread_token);
+        if res != 0 {
+            CloseHandle(thread_token);
+            panic!("Expected thread NOT to be impersonating, but OpenThreadToken succeeded!");
+        }
+        let err = GetLastError();
+        assert_eq!(
+            err, ERROR_NO_TOKEN,
+            "Expected OpenThreadToken to fail with ERROR_NO_TOKEN (1008), got {}",
+            err
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_token_privilege_isolation_and_thread_impersonation_reversion() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_priv_isolation_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Verify thread is not impersonating before test begins
+        unsafe {
+            assert_thread_not_impersonating();
+        }
+
+        // 2. Query process primary token's privileges before calling set_directory_owner_to_token_user
+        let privs_before = unsafe {
+            get_process_token_privileges().expect("querying process token privileges before")
+        };
+        assert!(
+            !privs_before.is_empty(),
+            "Process token must have privileges"
+        );
+
+        // 3. Call set_directory_owner_to_token_user to set owner to individual TokenUser
+        let set_res = unsafe { set_directory_owner_to_token_user(&temp_dir) };
+        assert!(
+            set_res.is_ok(),
+            "set_directory_owner_to_token_user must succeed: {:?}",
+            set_res.err()
+        );
+
+        // 4. Query process primary token's privileges after calling set_directory_owner_to_token_user
+        let privs_after = unsafe {
+            get_process_token_privileges().expect("querying process token privileges after")
+        };
+
+        // Assert exact privilege equality: process primary token must be completely untouched
+        assert_eq!(
+            privs_before, privs_after,
+            "Process primary token privileges must remain completely untouched after set_directory_owner_to_token_user"
+        );
+
+        // 5. Verify the current thread is not impersonating after the call completes
+        unsafe {
+            assert_thread_not_impersonating();
+        }
+
+        // 6. Verify the directory owner was actually updated to the expected TokenUser SID
+        let (owner_sid, token_user_sid) =
+            unsafe { assert_directory_owner_is_token_user(&temp_dir) };
+        assert_eq!(
+            owner_sid, token_user_sid,
+            "Directory owner SID must match process TokenUser SID"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_set_directory_owner_rejects_existing_thread_impersonation() {
+        const TOKEN_QUERY: u32 = 0x0008;
+        const TOKEN_DUPLICATE: u32 = 0x0002;
+        const TOKEN_IMPERSONATE: u32 = 0x0004;
+        const SECURITY_IMPERSONATION: u32 = 2;
+        const TOKEN_IMPERSONATION: u32 = 2;
+
+        extern "system" {
+            fn OpenProcessToken(
+                ProcessHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn DuplicateTokenEx(
+                hExistingToken: *mut std::ffi::c_void,
+                dwDesiredAccess: u32,
+                lpTokenAttributes: *mut std::ffi::c_void,
+                ImpersonationLevel: u32,
+                TokenType: u32,
+                phNewToken: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn SetThreadToken(
+                Thread: *mut *mut std::ffi::c_void,
+                Token: *mut std::ffi::c_void,
+            ) -> i32;
+            fn RevertToSelf() -> i32;
+            fn GetCurrentThread() -> *mut std::ffi::c_void;
+            fn OpenThreadToken(
+                ThreadHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                OpenAsSelf: i32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        }
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_existing_impersonation_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Verify thread is initially clean (process context)
+        unsafe {
+            assert_thread_not_impersonating();
+        }
+
+        // 2. Create an impersonation token and install it on the current thread
+        let mut proc_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+        let open_res = unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_DUPLICATE,
+                &mut proc_tok,
+            )
+        };
+        assert_ne!(open_res, 0);
+        let _proc_guard = HandleGuard(proc_tok);
+
+        let mut pre_imp_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+        let dup_res = unsafe {
+            DuplicateTokenEx(
+                proc_tok,
+                TOKEN_QUERY | TOKEN_IMPERSONATE,
+                std::ptr::null_mut(),
+                SECURITY_IMPERSONATION,
+                TOKEN_IMPERSONATION,
+                &mut pre_imp_tok,
+            )
+        };
+        assert_ne!(dup_res, 0);
+        let _imp_guard = HandleGuard(pre_imp_tok);
+
+        let set_res = unsafe { SetThreadToken(std::ptr::null_mut(), pre_imp_tok) };
+        assert_ne!(set_res, 0);
+
+        // Verify thread is now actively impersonating
+        let mut active_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+        let check_res =
+            unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut active_tok) };
+        assert_ne!(check_res, 0, "Thread must be actively impersonating");
+        let _active_guard = HandleGuard(active_tok);
+
+        // 3. Call set_directory_owner_to_token_user: must REJECT because thread is already impersonating
+        let res = unsafe { set_directory_owner_to_token_user(&temp_dir) };
+        assert!(
+            res.is_err(),
+            "Operation must reject when thread is already impersonating"
+        );
+        let err = res.err().unwrap();
+        assert!(
+            err.contains("already impersonating"),
+            "Error must indicate rejection due to existing thread impersonation: {}",
+            err
+        );
+
+        // 4. Verify thread security context was NOT silently replaced or removed: thread must STILL be impersonating
+        let mut still_active_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+        let still_active =
+            unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut still_active_tok) };
+        assert_ne!(
+            still_active, 0,
+            "Thread impersonation context must remain preserved and NOT discarded by RevertToSelf"
+        );
+        let _still_guard = HandleGuard(still_active_tok);
+
+        // Clean up thread impersonation back to process context
+        let revert_res = unsafe { RevertToSelf() };
+        assert_ne!(revert_res, 0);
+        unsafe {
+            assert_thread_not_impersonating();
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_impersonation_emergency_cleanup_on_early_exit_and_panic() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_win_cleanup_recovery_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Initial check: thread is in process context
+        unsafe {
+            assert_thread_not_impersonating();
+        }
+
+        // Scenario 1: Early exit / error return after installing impersonation
+        set_fault_inject_windows_impersonation_early_return_err(true);
+        let err_res = unsafe { set_directory_owner_to_token_user(&temp_dir) };
+        set_fault_inject_windows_impersonation_early_return_err(false);
+
+        assert!(
+            err_res.is_err(),
+            "Expected early error return from fault injection"
+        );
+        let err_msg = err_res.err().unwrap();
+        assert!(
+            err_msg.contains("simulated early error while impersonating"),
+            "Unexpected error: {}",
+            err_msg
+        );
+        // Verify ThreadImpersonationGuard::drop restored ordinary process context
+        unsafe {
+            assert_thread_not_impersonating();
+        }
+
+        // Scenario 2: Panic unwinding after installing impersonation
+        set_fault_inject_windows_impersonation_early_panic(true);
+        let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            let _ = set_directory_owner_to_token_user(&temp_dir);
+        }));
+        set_fault_inject_windows_impersonation_early_panic(false);
+
+        assert!(panic_res.is_err(), "Expected panic during fault injection");
+        // Verify ThreadImpersonationGuard::drop restored ordinary process context during unwind
+        unsafe {
+            assert_thread_not_impersonating();
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_token_privileges_aligned_parsing_and_bounds_validation() {
+        const TOKEN_QUERY: u32 = 0x0008;
+
+        extern "system" {
+            fn OpenProcessToken(
+                ProcessHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        }
+
+        let mut token: *mut std::ffi::c_void = std::ptr::null_mut();
+        let open_res = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+        assert_ne!(open_res, 0);
+        let _guard = HandleGuard(token);
+
+        // Verify successful parsing of process token privileges with explicit 8-byte aligned buffer
+        let privs = unsafe { query_token_privileges(token) }
+            .expect("query_token_privileges must succeed on valid process token");
+        assert!(
+            !privs.is_empty(),
+            "Process token must contain at least one privilege entry"
+        );
+
+        // Verify entry alignment
+        for (i, entry) in privs.iter().enumerate() {
+            let addr = entry as *const _ as usize;
+            assert!(
+                addr.is_multiple_of(std::mem::align_of::<LUID_AND_ATTRIBUTES>()),
+                "Entry {} at {:#x} must be naturally aligned",
+                i,
+                addr
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_impersonation_explicit_reversion_succeeds_and_thread_clean() {
+        const TOKEN_QUERY: u32 = 0x0008;
+        const TOKEN_DUPLICATE: u32 = 0x0002;
+        const TOKEN_IMPERSONATE: u32 = 0x0004;
+        const SECURITY_IMPERSONATION: u32 = 2;
+        const TOKEN_IMPERSONATION: u32 = 2;
+
+        extern "system" {
+            fn OpenProcessToken(
+                ProcessHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn DuplicateTokenEx(
+                hExistingToken: *mut std::ffi::c_void,
+                dwDesiredAccess: u32,
+                lpTokenAttributes: *mut std::ffi::c_void,
+                ImpersonationLevel: u32,
+                TokenType: u32,
+                phNewToken: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn SetThreadToken(
+                Thread: *mut *mut std::ffi::c_void,
+                Token: *mut std::ffi::c_void,
+            ) -> i32;
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        }
+
+        unsafe {
+            assert_thread_not_impersonating();
+
+            let mut proc_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+            assert_ne!(
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_QUERY | TOKEN_DUPLICATE,
+                    &mut proc_tok
+                ),
+                0
+            );
+            let _proc_guard = HandleGuard(proc_tok);
+
+            let mut imp_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+            assert_ne!(
+                DuplicateTokenEx(
+                    proc_tok,
+                    TOKEN_QUERY | TOKEN_IMPERSONATE,
+                    std::ptr::null_mut(),
+                    SECURITY_IMPERSONATION,
+                    TOKEN_IMPERSONATION,
+                    &mut imp_tok,
+                ),
+                0
+            );
+            let _imp_guard = HandleGuard(imp_tok);
+
+            assert_ne!(SetThreadToken(std::ptr::null_mut(), imp_tok), 0);
+
+            let mut guard = ThreadImpersonationGuard { active: true };
+            let rev_res = guard.revert();
+            assert!(rev_res.is_ok(), "revert() must succeed: {:?}", rev_res);
+            assert!(
+                !guard.active,
+                "Guard must be disarmed after confirmed reversion"
+            );
+
+            assert_thread_not_impersonating();
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_impersonation_explicit_reversion_error_triggers_emergency_cleanup() {
+        const TOKEN_QUERY: u32 = 0x0008;
+        const TOKEN_DUPLICATE: u32 = 0x0002;
+        const TOKEN_IMPERSONATE: u32 = 0x0004;
+        const SECURITY_IMPERSONATION: u32 = 2;
+        const TOKEN_IMPERSONATION: u32 = 2;
+
+        extern "system" {
+            fn OpenProcessToken(
+                ProcessHandle: *mut std::ffi::c_void,
+                DesiredAccess: u32,
+                TokenHandle: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn DuplicateTokenEx(
+                hExistingToken: *mut std::ffi::c_void,
+                dwDesiredAccess: u32,
+                lpTokenAttributes: *mut std::ffi::c_void,
+                ImpersonationLevel: u32,
+                TokenType: u32,
+                phNewToken: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn SetThreadToken(
+                Thread: *mut *mut std::ffi::c_void,
+                Token: *mut std::ffi::c_void,
+            ) -> i32;
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        }
+
+        unsafe {
+            assert_thread_not_impersonating();
+
+            let mut proc_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+            assert_ne!(
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_QUERY | TOKEN_DUPLICATE,
+                    &mut proc_tok
+                ),
+                0
+            );
+            let _proc_guard = HandleGuard(proc_tok);
+
+            let mut imp_tok: *mut std::ffi::c_void = std::ptr::null_mut();
+            assert_ne!(
+                DuplicateTokenEx(
+                    proc_tok,
+                    TOKEN_QUERY | TOKEN_IMPERSONATE,
+                    std::ptr::null_mut(),
+                    SECURITY_IMPERSONATION,
+                    TOKEN_IMPERSONATION,
+                    &mut imp_tok,
+                ),
+                0
+            );
+            let _imp_guard = HandleGuard(imp_tok);
+
+            assert_ne!(SetThreadToken(std::ptr::null_mut(), imp_tok), 0);
+
+            // Inject fault in explicit revert
+            set_fault_inject_windows_revert_to_self_fail(true);
+            let mut guard = ThreadImpersonationGuard { active: true };
+            let rev_res = guard.revert();
+            set_fault_inject_windows_revert_to_self_fail(false);
+
+            assert!(
+                rev_res.is_err(),
+                "Explicit revert must report error when RevertToSelf fails"
+            );
+            assert!(
+                guard.active,
+                "Guard must remain armed (active == true) when explicit revert fails"
+            );
+
+            // When guard is dropped, emergency cleanup runs
+            drop(guard);
+
+            // Verify emergency cleanup restored clean thread state
+            assert_thread_not_impersonating();
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_impersonation_postcondition_active_token_rejection() {
+        unsafe {
+            assert_thread_not_impersonating();
+            set_fault_inject_windows_postcondition_active_token(true);
+            let mut guard = ThreadImpersonationGuard { active: true };
+            let rev_res = guard.revert();
+            set_fault_inject_windows_postcondition_active_token(false);
+
+            assert!(
+                rev_res.is_err(),
+                "revert() must report error on active token postcondition"
+            );
+            assert!(
+                guard.active,
+                "Guard must NOT be disarmed when postcondition finds an active token"
+            );
+            let err = rev_res.unwrap_err();
+            assert!(
+                err.contains("thread still has active impersonation token"),
+                "Error must indicate active token: {}",
+                err
+            );
+            drop(guard);
+            assert_thread_not_impersonating();
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_impersonation_postcondition_unexpected_error_rejection() {
+        unsafe {
+            assert_thread_not_impersonating();
+            set_fault_inject_windows_postcondition_unexpected_err(true);
+            let mut guard = ThreadImpersonationGuard { active: true };
+            let rev_res = guard.revert();
+            set_fault_inject_windows_postcondition_unexpected_err(false);
+
+            assert!(
+                rev_res.is_err(),
+                "revert() must report error on unexpected Win32 postcondition error"
+            );
+            assert!(
+                guard.active,
+                "Guard must NOT be disarmed when postcondition returns unexpected error"
+            );
+            let err = rev_res.unwrap_err();
+            assert!(
+                err.contains("unexpected error 5"),
+                "Error must indicate unexpected error: {}",
+                err
+            );
+            drop(guard);
+            assert_thread_not_impersonating();
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_impersonation_emergency_cleanup_fail_stop_policy() {
+        unsafe {
+            assert_thread_not_impersonating();
+
+            fn panic_hook(msg: &str) {
+                panic!("FAIL_STOP_TRIGGERED: {}", msg);
+            }
+
+            set_emergency_fail_stop_hook(Some(panic_hook));
+            set_fault_inject_windows_emergency_cleanup_fail(true);
+
+            let res = std::panic::catch_unwind(|| {
+                let _guard = ThreadImpersonationGuard { active: true };
+            });
+
+            set_emergency_fail_stop_hook(None);
+            set_fault_inject_windows_emergency_cleanup_fail(false);
+
+            assert!(
+                res.is_err(),
+                "Emergency cleanup failure must trigger fail-stop policy"
+            );
+            let panic_err = res.unwrap_err();
+            let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                String::new()
+            };
+            assert!(
+                msg.contains("FAIL_STOP_TRIGGERED: Emergency RevertToSelf failed"),
+                "Fail-stop must execute with diagnostic message: {}",
+                msg
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_impersonation_emergency_cleanup_subprocess_abort() {
+        if std::env::var("AETHER_TEST_SUBPROCESS_ABORT").is_ok() {
+            set_fault_inject_windows_emergency_cleanup_fail(true);
+            let guard = ThreadImpersonationGuard { active: true };
+            drop(guard);
+            std::process::exit(0);
+        }
+
+        let current_exe = std::env::current_exe().expect("current test exe");
+        let output = std::process::Command::new(current_exe)
+            .arg("tests::test_windows_impersonation_emergency_cleanup_subprocess_abort")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("AETHER_TEST_SUBPROCESS_ABORT", "1")
+            .output()
+            .expect("spawning test subprocess");
+
+        assert!(
+            !output.status.success(),
+            "Subprocess must fail-stop / abort when emergency cleanup fails; got exit status: {:?}",
+            output.status
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_token_privileges_strict_sizing_validation() {
+        // 1. Sizing query unexpectedly succeeded with NULL buffer
+        let res_succ = validate_token_privileges_sizing(1, ERROR_INSUFFICIENT_BUFFER, 16);
+        assert!(res_succ.is_err());
+        assert!(res_succ
+            .unwrap_err()
+            .contains("sizing query unexpectedly succeeded with a NULL buffer"));
+
+        // 2. Sizing query unexpected Win32 error
+        let res_err = validate_token_privileges_sizing(0, 5, 16); // 5 = ERROR_ACCESS_DENIED
+        assert!(res_err.is_err());
+        assert!(res_err
+            .unwrap_err()
+            .contains("unexpected Win32 error 5; expected ERROR_INSUFFICIENT_BUFFER (122)"));
+
+        // 3. Zero required length
+        let res_zero = validate_token_privileges_sizing(0, ERROR_INSUFFICIENT_BUFFER, 0);
+        assert!(res_zero.is_err());
+        assert!(res_zero
+            .unwrap_err()
+            .contains("Invalid required buffer length 0 less than minimum header size 4"));
+
+        // 4. Undersized required length (< sizeof(u32))
+        let res_short = validate_token_privileges_sizing(0, ERROR_INSUFFICIENT_BUFFER, 3);
+        assert!(res_short.is_err());
+        assert!(res_short
+            .unwrap_err()
+            .contains("Invalid required buffer length 3 less than minimum header size 4"));
+
+        // 5. Valid sizing values and aligned allocation calculation
+        let (num_u64_1, cap_bytes_1, cap_u32_1) =
+            validate_token_privileges_sizing(0, ERROR_INSUFFICIENT_BUFFER, 4).unwrap();
+        assert_eq!(num_u64_1, 1);
+        assert_eq!(cap_bytes_1, 8);
+        assert_eq!(cap_u32_1, 8);
+
+        let (num_u64_2, cap_bytes_2, cap_u32_2) =
+            validate_token_privileges_sizing(0, ERROR_INSUFFICIENT_BUFFER, 16).unwrap();
+        assert_eq!(num_u64_2, 2);
+        assert_eq!(cap_bytes_2, 16);
+        assert_eq!(cap_u32_2, 16);
+
+        let (num_u64_3, cap_bytes_3, cap_u32_3) =
+            validate_token_privileges_sizing(0, ERROR_INSUFFICIENT_BUFFER, 17).unwrap();
+        assert_eq!(num_u64_3, 3);
+        assert_eq!(cap_bytes_3, 24);
+        assert_eq!(cap_u32_3, 24);
+
+        // 6. Checked arithmetic overflow or rejected size conversion on extreme required length
+        let res_overflow = validate_token_privileges_sizing(0, ERROR_INSUFFICIENT_BUFFER, u32::MAX);
+        assert!(res_overflow.is_err());
+        let err_overflow = res_overflow.unwrap_err();
+        assert!(
+            err_overflow.contains("overflow") || err_overflow.contains("exceeds u32 range"),
+            "Error must indicate overflow or rejected size conversion: {}",
+            err_overflow
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_token_privileges_malformed_buffer_conditions() {
+        // 1. NULL pointer rejection
+        let res_null = unsafe { parse_token_privileges_buffer(std::ptr::null(), 16, 16) };
+        assert!(res_null.is_err());
+        assert!(res_null.unwrap_err().contains("pointer is NULL"));
+
+        // 2. Actual length greater than allocated buffer capacity
+        let buf_cap = [0u64; 2]; // 16 bytes
+        let res_cap =
+            unsafe { parse_token_privileges_buffer(buf_cap.as_ptr() as *const u8, 16, 24) };
+        assert!(res_cap.is_err());
+        assert!(res_cap
+            .unwrap_err()
+            .contains("exceeding allocated buffer capacity 16"));
+
+        // 3. Header shorter than sizeof(u32)
+        let buf_short = [0u64; 2];
+        let res_short =
+            unsafe { parse_token_privileges_buffer(buf_short.as_ptr() as *const u8, 16, 2) };
+        assert!(res_short.is_err());
+        assert!(res_short
+            .unwrap_err()
+            .contains("less than minimum header size 4"));
+
+        // 4. Misaligned buffer pointer
+        let raw_bytes = [0u8; 32];
+        let unaligned_ptr = unsafe { raw_bytes.as_ptr().add(1) };
+        let res_align = unsafe { parse_token_privileges_buffer(unaligned_ptr, 30, 28) };
+        assert!(res_align.is_err());
+        assert!(res_align
+            .unwrap_err()
+            .contains("violates u32 header alignment requirement"));
+
+        // 5. Privilege count exceeding available data
+        let mut buf_count = vec![0u64; 2]; // 16 bytes
+        unsafe {
+            *(buf_count.as_mut_ptr() as *mut u32) = 5;
+        }
+        let res_count =
+            unsafe { parse_token_privileges_buffer(buf_count.as_ptr() as *const u8, 16, 16) };
+        assert!(res_count.is_err());
+        assert!(res_count.unwrap_err().contains(
+            "Privilege count 5 requires 64 bytes, but returned buffer contains only 16 bytes"
+        ));
+
+        // 6. Truncated final privilege entry
+        let mut buf_trunc = vec![0u64; 4]; // 32 bytes capacity
+        unsafe {
+            *(buf_trunc.as_mut_ptr() as *mut u32) = 2; // 2 entries require 4 + 2 * 12 = 28 bytes
+        }
+        // actual_len is 20: entry 0 is in [4..16], entry 1 requires [16..28] which exceeds actual_len 20
+        let res_trunc =
+            unsafe { parse_token_privileges_buffer(buf_trunc.as_ptr() as *const u8, 32, 20) };
+        assert!(res_trunc.is_err());
+        assert!(res_trunc
+            .unwrap_err()
+            .contains("requires 28 bytes, but returned buffer contains only 20 bytes"));
+
+        // 7. Arithmetic overflow in privilege count calculation
+        let mut buf_overflow = vec![0u64; 2];
+        unsafe {
+            *(buf_overflow.as_mut_ptr() as *mut u32) = u32::MAX;
+        }
+        let res_overflow =
+            unsafe { parse_token_privileges_buffer(buf_overflow.as_ptr() as *const u8, 16, 16) };
+        assert!(res_overflow.is_err());
+        assert!(res_overflow.unwrap_err().contains("overflow"));
+
+        // 8. Properly aligned valid input with 2 entries
+        let mut buf_valid = vec![0u64; 4]; // 32 bytes
+        unsafe {
+            let p_u32 = buf_valid.as_mut_ptr() as *mut u32;
+            *p_u32 = 2;
+            let base_ptr = buf_valid.as_mut_ptr() as *mut u8;
+            let entry0 = base_ptr.add(4) as *mut LUID_AND_ATTRIBUTES;
+            *entry0 = LUID_AND_ATTRIBUTES {
+                luid: LUID {
+                    low_part: 100,
+                    high_part: 0,
+                },
+                attributes: 2,
+            };
+            let entry1 = base_ptr.add(16) as *mut LUID_AND_ATTRIBUTES;
+            *entry1 = LUID_AND_ATTRIBUTES {
+                luid: LUID {
+                    low_part: 200,
+                    high_part: 0,
+                },
+                attributes: 3,
+            };
+        }
+        let res_valid =
+            unsafe { parse_token_privileges_buffer(buf_valid.as_ptr() as *const u8, 32, 28) };
+        assert!(res_valid.is_ok(), "Valid buffer must parse successfully");
+        let privs = res_valid.unwrap();
+        assert_eq!(privs.len(), 2);
+        assert_eq!(privs[0].luid.low_part, 100);
+        assert_eq!(privs[0].luid.high_part, 0);
+        assert_eq!(privs[0].attributes, 2);
+        assert_eq!(privs[1].luid.low_part, 200);
+        assert_eq!(privs[1].luid.high_part, 0);
+        assert_eq!(privs[1].attributes, 3);
+    }
+
+    #[test]
+    fn test_replace_file_publication_staging_removal_failure_surfaces_residual() {
+        use sha2::Digest;
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_replace_staging_fail_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let target = temp_dir.join("test.txt");
+        std::fs::write(&target, b"original content").unwrap();
+
+        let caps = WorkspaceCapability::open(&temp_dir).unwrap();
+        let hooks = ConditionalReplaceHooks {
+            fault_inject_staging_removal: true,
+            ..Default::default()
+        };
+
+        let outcome = caps
+            .replace_file_bytes_conditional_with_hooks(
+                "test.txt",
+                b"new content",
+                Some(&format!("{:x}", sha2::Sha256::digest(b"original content"))),
+                hooks,
+            )
+            .expect("replacement should succeed");
+
+        assert_eq!(outcome.dest_path, caps.root_path().join("test.txt"));
+        assert!(
+            outcome.residual_staging.is_some(),
+            "Residual staging path must be surfaced when staging removal fails"
+        );
+        assert!(
+            !outcome.is_fully_clean(),
+            "Outcome must indicate not fully clean due to residual staging"
+        );
+        let residual = outcome.residual_staging.unwrap();
+        assert!(
+            residual.exists(),
+            "Residual staging artifact must remain on disk: {:?}",
+            residual
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"new content");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_replace_file_stage_write_failure_surfaces_residual_path() {
+        use sha2::Digest;
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_replace_stage_write_fail_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let target = temp_dir.join("test.txt");
+        std::fs::write(&target, b"original content").unwrap();
+
+        let caps = WorkspaceCapability::open(&temp_dir).unwrap();
+        let hooks = ConditionalReplaceHooks {
+            fault_inject_stage_write: true,
+            fault_inject_staging_removal: true,
+            ..Default::default()
+        };
+
+        let res = caps.replace_file_bytes_conditional_with_hooks(
+            "test.txt",
+            b"new content",
+            Some(&format!("{:x}", sha2::Sha256::digest(b"original content"))),
+            hooks,
+        );
+
+        assert!(res.is_err(), "Stage write failure must be returned");
+        let err_str = format!("{:?}", res);
+        assert!(
+            err_str.contains("Injected stage write failure"),
+            "Error must preserve primary error: {}",
+            err_str
+        );
+        assert!(
+            err_str.contains("additionally failed to remove residual staging artifact"),
+            "Error must expose residual staging cleanup failure and artifact path: {}",
+            err_str
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_replace_file_stage_sync_failure_surfaces_residual_path() {
+        use sha2::Digest;
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_replace_stage_sync_fail_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let target = temp_dir.join("test.txt");
+        std::fs::write(&target, b"original content").unwrap();
+
+        let caps = WorkspaceCapability::open(&temp_dir).unwrap();
+        let hooks = ConditionalReplaceHooks {
+            fault_inject_stage_sync: true,
+            fault_inject_staging_removal: true,
+            ..Default::default()
+        };
+
+        let res = caps.replace_file_bytes_conditional_with_hooks(
+            "test.txt",
+            b"new content",
+            Some(&format!("{:x}", sha2::Sha256::digest(b"original content"))),
+            hooks,
+        );
+
+        assert!(res.is_err(), "Stage sync failure must be returned");
+        let err_str = format!("{:?}", res);
+        assert!(
+            err_str.contains("Injected stage sync failure"),
+            "Error must preserve primary error: {}",
+            err_str
+        );
+        assert!(
+            err_str.contains("additionally failed to remove residual staging artifact"),
+            "Error must expose residual staging cleanup failure and artifact path: {}",
+            err_str
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_replace_file_missing_target_collision_surfaces_residual_path() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_missing_collision_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let caps = WorkspaceCapability::open(&temp_dir).unwrap();
+        let hooks = ConditionalReplaceHooks {
+            pre_replace_hook: Some(&|p| {
+                let _ = std::fs::write(p, b"competing creator");
+            }),
+            fault_inject_staging_removal: true,
+            ..Default::default()
+        };
+
+        let res = caps.replace_file_bytes_conditional_with_hooks(
+            "missing.txt",
+            b"new content",
+            None,
+            hooks,
+        );
+
+        assert!(res.is_err(), "Collision must fail");
+        let err_str = format!("{:?}", res);
+        assert!(
+            err_str.contains("Restore race detected"),
+            "Must report restore race: {}",
+            err_str
+        );
+        assert!(
+            err_str.contains("additionally failed to remove residual staging artifact"),
+            "Must surface residual staging artifact on collision: {}",
+            err_str
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_perform_rollback_staging_removal_failure_surfaces_in_error() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aether_rollback_staging_fail_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let target = temp_dir.join("test.txt");
+        std::fs::write(&target, b"original content").unwrap();
+
+        let caps = WorkspaceCapability::open(&temp_dir).unwrap();
+        let hooks = ConditionalReplaceHooks {
+            fault_inject_staging_removal: true,
+            ..Default::default()
+        };
+
+        let res = caps.replace_file_bytes_conditional_with_hooks(
+            "test.txt",
+            b"new content",
+            Some("0000000000000000000000000000000000000000000000000000000000000000"),
+            hooks,
+        );
+
+        assert!(res.is_err(), "Hash mismatch must trigger rollback");
+        let err_str = format!("{:?}", res);
+        assert!(
+            err_str.contains("Restore race detected"),
+            "Error must contain primary restore race error: {}",
+            err_str
+        );
+        assert!(
+            err_str.contains("additionally failed to remove residual staging artifact"),
+            "Error must surface staging removal failure and residual path: {}",
+            err_str
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

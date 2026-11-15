@@ -30,7 +30,7 @@ interface ChatMessage {
 interface AssistantPanelProps {
   activeFilePath?: string;
   activeFileContent?: string;
-  onApplyDiff: (newContent: string) => void;
+  onApplyDiff: (targetPath: string, newContent: string) => void;
   onClose?: () => void;
 }
 
@@ -38,6 +38,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
   activeFilePath,
   activeFileContent,
   onApplyDiff,
+  onClose,
 }) => {
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -241,46 +242,70 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
       return;
     }
 
+    const isPatch = snippet.includes("--- ") || snippet.includes("@@ -") || snippet.includes("diff --git");
+    const isSnippet = snippet.split("\n").length < 15 && (activeFileContent?.split("\n").length || 0) > 30;
+    const defaultOp: StructuredProposal["operation"] = isPatch
+      ? "apply_patch"
+      : isSnippet
+      ? "insert_at"
+      : "replace_file";
+
     const proposal: StructuredProposal = {
       proposal_id: `prop-${Date.now()}`,
       workspace_id: "",
       relative_path: activeFilePath,
-      operation: "modify",
-      base_hash: "", // backend will read disk hash if empty
+      operation: defaultOp,
+      base_hash: "", // Will be strictly bound from preview
       unified_diff: snippet,
       proposed_content: snippet,
+      insertion_line: 1,
     };
 
-    setActiveProposal(proposal);
     try {
       const preview = await TauriService.previewProposal(proposal);
+      // MANDATORY: Bind current disk hash to proposal before application
+      const boundProposal: StructuredProposal = {
+        ...proposal,
+        base_hash: preview.current_disk_hash,
+      };
+      setActiveProposal(boundProposal);
       setReviewPreview(preview);
     } catch (e: any) {
       console.error("Failed to preview proposal:", e);
-      setReviewPreview({
-        proposal_id: proposal.proposal_id,
-        relative_path: activeFilePath,
-        operation: "modify",
-        base_hash: "",
-        current_disk_hash: "",
-        has_conflict: false,
-        original_content: activeFileContent || "",
-        proposed_content: snippet,
-        unified_diff: snippet,
-      });
+      alert(`Failed to preview proposal: ${e}`);
     }
   };
 
-  const handleExecuteApplyProposal = async (force = false) => {
+  const handleRefreshPreview = async () => {
+    if (!activeProposal) return;
+    try {
+      const preview = await TauriService.previewProposal(activeProposal);
+      const boundProposal: StructuredProposal = {
+        ...activeProposal,
+        base_hash: preview.current_disk_hash,
+      };
+      setActiveProposal(boundProposal);
+      setReviewPreview(preview);
+      setApplyMessage("Preview refreshed and aligned with current disk state.");
+    } catch (e: any) {
+      setApplyMessage(`Failed to refresh preview: ${e}`);
+    }
+  };
+
+  const handleExecuteApplyProposal = async () => {
     if (!activeProposal) return;
     setIsApplyingProposal(true);
     setApplyMessage(null);
 
     try {
-      const res = await TauriService.applyProposal(activeProposal, force);
+      const res = await TauriService.applyProposal(activeProposal);
       if (res.success) {
-        onApplyDiff(activeProposal.proposed_content);
-        setApplyMessage(`Changes safely applied! Verified SHA-256: ${res.new_hash.slice(0, 10)}...`);
+        onApplyDiff(activeProposal.relative_path, activeProposal.proposed_content);
+        setApplyMessage(
+          `Changes safely applied! Verified SHA-256: ${res.new_hash.slice(0, 10)}... (Backup: ${
+            res.backup_checkpoint_id || "Durable checkpoint verified"
+          })`
+        );
         setTimeout(() => {
           setActiveProposal(null);
           setReviewPreview(null);
@@ -355,6 +380,24 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
               <option value="gpt-4o">GPT-4o Omnimodal</option>
             )}
           </select>
+          {onClose && (
+            <button
+              onClick={onClose}
+              style={{
+                background: "transparent",
+                border: "none",
+                color: "var(--text-muted)",
+                cursor: "pointer",
+                padding: 3,
+                borderRadius: 3,
+                display: "flex",
+                alignItems: "center",
+              }}
+              title="Close AI Assistant (Ctrl+L)"
+            >
+              <X size={14} />
+            </button>
+          )}
         </div>
       </div>
 
@@ -773,6 +816,25 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                 <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text-primary)" }}>
                   Review AI Code Proposal — {reviewPreview.relative_path}
                 </span>
+                <span
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    padding: "2px 6px",
+                    borderRadius: 3,
+                    background: "var(--bg-root)",
+                    border: "1px solid var(--border-color)",
+                    color: "var(--accent-cyan)",
+                    textTransform: "uppercase",
+                  }}
+                >
+                  {activeProposal?.operation || "replace_file"}
+                </span>
+                {reviewPreview.current_disk_hash && (
+                  <span style={{ fontSize: 10, color: "var(--text-muted)" }}>
+                    Base: {reviewPreview.current_disk_hash.slice(0, 10)}...
+                  </span>
+                )}
               </div>
               <button
                 onClick={() => {
@@ -801,20 +863,39 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                   fontSize: 11,
                   display: "flex",
                   alignItems: "center",
+                  justifyContent: "space-between",
                   gap: 8,
                 }}
               >
-                <AlertTriangle size={15} />
-                <span>
-                  Conflict Detected: This file was modified on disk since the AI generated this proposal. Applying may overwrite local changes.
-                </span>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <AlertTriangle size={15} />
+                  <span>
+                    Conflict Detected: This file was modified on disk since the AI generated this proposal. Please refresh preview to re-align.
+                  </span>
+                </div>
+                <button
+                  onClick={handleRefreshPreview}
+                  style={{
+                    background: "var(--warning)",
+                    border: "none",
+                    color: "#101216",
+                    fontSize: 11,
+                    fontWeight: 700,
+                    borderRadius: 3,
+                    padding: "3px 8px",
+                    cursor: "pointer",
+                  }}
+                >
+                  Refresh Preview
+                </button>
               </div>
             )}
 
             {/* Diff Content Preview */}
             <div style={{ flex: 1, overflowY: "auto", padding: 16 }}>
-              <div style={{ marginBottom: 8, fontSize: 11, color: "var(--text-muted)" }}>
-                Proposed Patch / Content Preview:
+              <div style={{ marginBottom: 8, fontSize: 11, color: "var(--text-muted)", display: "flex", justifyContent: "space-between" }}>
+                <span>Target: {reviewPreview.relative_path}</span>
+                <span>Operation: {activeProposal?.operation}</span>
               </div>
               <pre
                 style={{
@@ -888,14 +969,14 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
               </button>
               {reviewPreview.has_conflict ? (
                 <button
-                  onClick={() => handleExecuteApplyProposal(true)}
+                  onClick={handleRefreshPreview}
                   disabled={isApplyingProposal}
                   style={{
                     padding: "5px 12px",
                     borderRadius: 4,
-                    background: "var(--warning)",
+                    background: "var(--accent-cyan)",
                     border: "none",
-                    color: "#0a0e1a",
+                    color: "#101216",
                     fontSize: 12,
                     fontWeight: 700,
                     cursor: "pointer",
@@ -904,11 +985,11 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                     gap: 6,
                   }}
                 >
-                  <AlertTriangle size={13} /> Force Apply Over Conflict
+                  Refresh Preview to Re-align
                 </button>
               ) : (
                 <button
-                  onClick={() => handleExecuteApplyProposal(false)}
+                  onClick={handleExecuteApplyProposal}
                   disabled={isApplyingProposal}
                   style={{
                     padding: "5px 14px",
@@ -924,7 +1005,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                     gap: 6,
                   }}
                 >
-                  <Check size={14} /> Safe Apply to Disk (Atomic)
+                  <Check size={14} /> {isApplyingProposal ? "Applying..." : "Safe Apply to Disk (Atomic)"}
                 </button>
               )}
             </div>

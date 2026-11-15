@@ -10,6 +10,9 @@ pub trait TerminalBackend: Send + Sync {
     fn write_input(&self, data: &[u8]) -> Result<usize>;
     fn read_output(&self, offset: usize) -> (Vec<u8>, usize, bool);
     fn resize(&self, cols: u16, rows: u16) -> Result<()>;
+    fn get_dimensions(&self) -> (u16, u16) {
+        (80, 24)
+    }
     fn close(&self) -> Result<()>;
     fn pid(&self) -> u32;
     fn is_alive(&self) -> bool;
@@ -32,6 +35,10 @@ impl TerminalBackend for parking_lot::Mutex<crate::conpty::win32::ConPtySession>
         self.lock()
             .resize(cols, rows)
             .map_err(|e| AetherError::Process(e.to_string()))
+    }
+
+    fn get_dimensions(&self) -> (u16, u16) {
+        self.lock().get_dimensions()
     }
 
     fn close(&self) -> Result<()> {

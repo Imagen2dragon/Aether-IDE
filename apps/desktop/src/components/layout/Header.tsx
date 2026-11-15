@@ -5,9 +5,18 @@ import {
   PanelBottom,
   Bot,
   Zap,
+  Folder,
+  Settings,
+  Bell,
+  Minus,
+  Square,
+  X,
+  Sliders,
 } from "lucide-react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 interface HeaderProps {
+  workspaceName?: string;
   onOpenFolder: () => void;
   onOpenFile: () => void;
   onSaveFile: () => void;
@@ -15,10 +24,15 @@ interface HeaderProps {
   onToggleBottomPanel: () => void;
   onToggleAiAssistant: () => void;
   onOpenCommandPalette: () => void;
+  onOpenSettings?: () => void;
   isAiOpen: boolean;
+  isSidebarOpen?: boolean;
+  isBottomPanelOpen?: boolean;
+  dirtyCount?: number;
 }
 
 export const Header: React.FC<HeaderProps> = ({
+  workspaceName = "Aether-IDE",
   onOpenFolder,
   onOpenFile,
   onSaveFile,
@@ -26,7 +40,11 @@ export const Header: React.FC<HeaderProps> = ({
   onToggleBottomPanel,
   onToggleAiAssistant,
   onOpenCommandPalette,
+  onOpenSettings,
   isAiOpen,
+  isSidebarOpen = true,
+  isBottomPanelOpen = false,
+  dirtyCount = 0,
 }) => {
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
 
@@ -36,20 +54,80 @@ export const Header: React.FC<HeaderProps> = ({
 
   const closeMenu = () => setActiveMenu(null);
 
-  return (
-    <header className="workbench-header" onClick={(e) => {
-      if (!(e.target as HTMLElement).closest(".menu-item")) {
-        closeMenu();
+  // Window Controls for native Windows look & feel
+  const handleMinimize = async () => {
+    try {
+      const win = getCurrentWindow();
+      await win.minimize();
+    } catch (e) {
+      console.warn("Minimize not available outside Tauri window:", e);
+    }
+  };
+
+  const handleMaximize = async () => {
+    try {
+      const win = getCurrentWindow();
+      await win.toggleMaximize();
+    } catch (e) {
+      console.warn("Maximize not available outside Tauri window:", e);
+    }
+  };
+
+  const handleClose = async () => {
+    try {
+      if (dirtyCount > 0) {
+        const confirmClose = window.confirm(
+          `You have ${dirtyCount} unsaved change(s). Are you sure you want to exit without saving?`
+        );
+        if (!confirmClose) return;
       }
-    }}>
+      const win = getCurrentWindow();
+      await win.close();
+    } catch (e) {
+      console.warn("Close not available outside Tauri window:", e);
+    }
+  };
+
+  return (
+    <header
+      className="workbench-header"
+      data-tauri-drag-region="true"
+      onDoubleClick={(e) => {
+        // Only maximize if double clicked on empty area of header, not on buttons or menus
+        if ((e.target as HTMLElement).closest("button, .menu-item, .command-search-pill")) return;
+        handleMaximize();
+      }}
+      onClick={(e) => {
+        if (!(e.target as HTMLElement).closest(".menu-item")) {
+          closeMenu();
+        }
+      }}
+    >
       <div className="header-left">
-        <div className="app-brand" title="AetherIDE — Production-Grade AI Engineering Studio">
-          <Zap size={16} className="text-cyan-400" style={{ color: "var(--accent-cyan)" }} />
+        {/* Brand */}
+        <div
+          className="app-brand"
+          title="AetherIDE — Expanded Obsidian Pro Workbench"
+          onClick={onOpenCommandPalette}
+        >
+          <Zap size={16} style={{ color: "var(--accent-cyan)" }} />
           <div className="app-brand-text">
             AETHER<span>IDE</span>
           </div>
         </div>
 
+        {/* Workspace Project Indicator */}
+        <div
+          className="workspace-badge"
+          title={`Active Workspace: ${workspaceName}`}
+          onClick={onOpenFolder}
+          style={{ cursor: "pointer" }}
+        >
+          <Folder size={12} style={{ color: "var(--accent-cyan)" }} />
+          <span>{workspaceName}</span>
+        </div>
+
+        {/* Native Menubar */}
         <nav className="menubar">
           {/* File Menu */}
           <div className={`menu-item ${activeMenu === "file" ? "open" : ""}`}>
@@ -89,6 +167,30 @@ export const Header: React.FC<HeaderProps> = ({
                   <span>Save</span>
                   <span className="shortcut">Ctrl+S</span>
                 </div>
+                <div className="dropdown-separator" />
+                {onOpenSettings && (
+                  <div
+                    className="dropdown-entry"
+                    onClick={() => {
+                      closeMenu();
+                      onOpenSettings();
+                    }}
+                  >
+                    <span>Preferences: Settings</span>
+                    <span className="shortcut">Ctrl+,</span>
+                  </div>
+                )}
+                <div className="dropdown-separator" />
+                <div
+                  className="dropdown-entry"
+                  onClick={() => {
+                    closeMenu();
+                    handleClose();
+                  }}
+                >
+                  <span>Exit</span>
+                  <span className="shortcut">Alt+F4</span>
+                </div>
               </div>
             )}
           </div>
@@ -120,6 +222,29 @@ export const Header: React.FC<HeaderProps> = ({
                 <div className="dropdown-entry" onClick={closeMenu}>
                   <span>Paste</span>
                   <span className="shortcut">Ctrl+V</span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Selection Menu */}
+          <div className={`menu-item ${activeMenu === "selection" ? "open" : ""}`}>
+            <button className="menu-btn" onClick={() => toggleMenu("selection")}>
+              Selection
+            </button>
+            {activeMenu === "selection" && (
+              <div className="dropdown-menu">
+                <div className="dropdown-entry" onClick={closeMenu}>
+                  <span>Select All</span>
+                  <span className="shortcut">Ctrl+A</span>
+                </div>
+                <div className="dropdown-entry" onClick={closeMenu}>
+                  <span>Expand Selection</span>
+                  <span className="shortcut">Shift+Alt+Right</span>
+                </div>
+                <div className="dropdown-entry" onClick={closeMenu}>
+                  <span>Shrink Selection</span>
+                  <span className="shortcut">Shift+Alt+Left</span>
                 </div>
               </div>
             )}
@@ -177,6 +302,119 @@ export const Header: React.FC<HeaderProps> = ({
             )}
           </div>
 
+          {/* Go Menu */}
+          <div className={`menu-item ${activeMenu === "go" ? "open" : ""}`}>
+            <button className="menu-btn" onClick={() => toggleMenu("go")}>
+              Go
+            </button>
+            {activeMenu === "go" && (
+              <div className="dropdown-menu">
+                <div
+                  className="dropdown-entry"
+                  onClick={() => {
+                    closeMenu();
+                    onOpenCommandPalette();
+                  }}
+                >
+                  <span>Go to File...</span>
+                  <span className="shortcut">Ctrl+P</span>
+                </div>
+                <div
+                  className="dropdown-entry"
+                  onClick={() => {
+                    closeMenu();
+                    onOpenCommandPalette();
+                  }}
+                >
+                  <span>Go to Symbol in Workspace...</span>
+                  <span className="shortcut">Ctrl+T</span>
+                </div>
+                <div className="dropdown-separator" />
+                <div className="dropdown-entry" onClick={closeMenu}>
+                  <span>Back</span>
+                  <span className="shortcut">Alt+Left</span>
+                </div>
+                <div className="dropdown-entry" onClick={closeMenu}>
+                  <span>Forward</span>
+                  <span className="shortcut">Alt+Right</span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Run Menu */}
+          <div className={`menu-item ${activeMenu === "run" ? "open" : ""}`}>
+            <button className="menu-btn" onClick={() => toggleMenu("run")}>
+              Run
+            </button>
+            {activeMenu === "run" && (
+              <div className="dropdown-menu">
+                <div
+                  className="dropdown-entry"
+                  onClick={() => {
+                    closeMenu();
+                    onToggleBottomPanel();
+                  }}
+                >
+                  <span>Start Debugging</span>
+                  <span className="shortcut">F5</span>
+                </div>
+                <div
+                  className="dropdown-entry"
+                  onClick={() => {
+                    closeMenu();
+                    onToggleBottomPanel();
+                  }}
+                >
+                  <span>Run Without Debugging</span>
+                  <span className="shortcut">Ctrl+F5</span>
+                </div>
+                <div className="dropdown-separator" />
+                <div
+                  className="dropdown-entry"
+                  onClick={() => {
+                    closeMenu();
+                    onToggleBottomPanel();
+                  }}
+                >
+                  <span>Run Build Task</span>
+                  <span className="shortcut">Ctrl+Shift+B</span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Terminal Menu */}
+          <div className={`menu-item ${activeMenu === "terminal" ? "open" : ""}`}>
+            <button className="menu-btn" onClick={() => toggleMenu("terminal")}>
+              Terminal
+            </button>
+            {activeMenu === "terminal" && (
+              <div className="dropdown-menu">
+                <div
+                  className="dropdown-entry"
+                  onClick={() => {
+                    closeMenu();
+                    onToggleBottomPanel();
+                  }}
+                >
+                  <span>Toggle Terminal</span>
+                  <span className="shortcut">Ctrl+`</span>
+                </div>
+                <div
+                  className="dropdown-entry"
+                  onClick={() => {
+                    closeMenu();
+                    onToggleBottomPanel();
+                  }}
+                >
+                  <span>New Terminal</span>
+                  <span className="shortcut">Ctrl+Shift+`</span>
+                </div>
+              </div>
+            )}
+          </div>
+
           {/* Help Menu */}
           <div className={`menu-item ${activeMenu === "help" ? "open" : ""}`}>
             <button className="menu-btn" onClick={() => toggleMenu("help")}>
@@ -185,10 +423,10 @@ export const Header: React.FC<HeaderProps> = ({
             {activeMenu === "help" && (
               <div className="dropdown-menu">
                 <div className="dropdown-entry" onClick={closeMenu}>
-                  <span>About AetherIDE</span>
+                  <span>About AetherIDE (v0.1.0-beta.3)</span>
                 </div>
                 <div className="dropdown-entry" onClick={closeMenu}>
-                  <span>Documentation</span>
+                  <span>Documentation & Guide</span>
                 </div>
               </div>
             )}
@@ -196,41 +434,44 @@ export const Header: React.FC<HeaderProps> = ({
         </nav>
       </div>
 
-      {/* Center Search Pill / Command Palette */}
+      {/* Center Command Palette / Quick Open Search Pill */}
       <div className="header-center">
         <div
           className="command-search-pill"
           onClick={onOpenCommandPalette}
           title="Search files, symbols, commands (Ctrl+P)"
         >
-          <Search size={13} />
+          <Search size={13} style={{ color: "var(--accent-cyan)" }} />
           <span>AetherIDE — Search files, symbols and commands (Ctrl+P)</span>
         </div>
       </div>
 
-      {/* Right Controls */}
+      {/* Header Right Actions */}
       <div className="header-right">
-        <div className="daemon-indicator" title="Native Rust Core: Healthy & Active">
+        <div className="daemon-indicator" title="Native Rust Engine: Active & Deterministic">
           <div className="status-dot" />
           <span>Rust Engine Online</span>
         </div>
 
+        {/* Sidebar Toggle */}
         <button
-          className="hdr-btn"
+          className={`hdr-btn ${isSidebarOpen ? "active" : ""}`}
           onClick={onToggleSidebar}
           title="Toggle Primary Sidebar (Ctrl+B)"
         >
           <SidebarIcon size={15} />
         </button>
 
+        {/* Bottom Panel Toggle */}
         <button
-          className="hdr-btn"
+          className={`hdr-btn ${isBottomPanelOpen ? "active" : ""}`}
           onClick={onToggleBottomPanel}
-          title="Toggle Bottom Terminal/Problems Panel (Ctrl+`)"
+          title="Toggle Terminal / Panel (Ctrl+`)"
         >
           <PanelBottom size={15} />
         </button>
 
+        {/* AI Assistant Toggle */}
         <button
           className={`hdr-btn ${isAiOpen ? "active" : ""}`}
           onClick={onToggleAiAssistant}
@@ -238,6 +479,42 @@ export const Header: React.FC<HeaderProps> = ({
         >
           <Bot size={15} />
         </button>
+
+        {/* Settings Toggle */}
+        {onOpenSettings && (
+          <button
+            className="hdr-btn"
+            onClick={onOpenSettings}
+            title="Workbench Themes & Settings"
+          >
+            <Sliders size={14} />
+          </button>
+        )}
+
+        {/* Windows Caption Controls */}
+        <div className="window-controls">
+          <button
+            className="caption-btn"
+            onClick={handleMinimize}
+            title="Minimize"
+          >
+            <Minus size={13} />
+          </button>
+          <button
+            className="caption-btn"
+            onClick={handleMaximize}
+            title="Maximize / Restore"
+          >
+            <Square size={11} />
+          </button>
+          <button
+            className="caption-btn close"
+            onClick={handleClose}
+            title="Close"
+          >
+            <X size={13} />
+          </button>
+        </div>
       </div>
     </header>
   );

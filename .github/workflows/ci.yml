@@ -52,6 +52,7 @@ jobs:
         run: |
           cd rust
           cargo test --workspace
+          cargo test --manifest-path ../apps/desktop/src-tauri/Cargo.toml --all-targets
       - name: Build Windows Binaries (Release)
         run: |
           cd rust
@@ -71,12 +72,12 @@ jobs:
       - name: Upload Windows Release Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AetherIDE-v0.1.0-beta.2-windows-x64
+          name: AetherIDE-v0.1.0-beta.3-windows-x64
           path: |
-            dist/AetherIDE-Setup-0.1.0-beta.2-x64.exe
-            dist/AetherIDE-Setup-0.1.0-beta.2-x64.exe.sha256
-            dist/AetherIDE-v0.1.0-beta.2-windows-x64.zip
-            dist/AetherIDE-v0.1.0-beta.2-windows-x64.zip.sha256
+            dist/AetherIDE-Setup-0.1.0-beta.3-x64.exe
+            dist/AetherIDE-Setup-0.1.0-beta.3-x64.exe.sha256
+            dist/AetherIDE-v0.1.0-beta.3-windows-x64.zip
+            dist/AetherIDE-v0.1.0-beta.3-windows-x64.zip.sha256
           if-no-files-found: error
 
   linux-build:
@@ -126,10 +127,10 @@ jobs:
       - name: Upload Linux Release Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AetherIDE-v0.1.0-beta.2-linux-x64
+          name: AetherIDE-v0.1.0-beta.3-linux-x64
           path: |
-            dist/AetherIDE-v0.1.0-beta.2-linux-x64.tar.gz
-            dist/AetherIDE-v0.1.0-beta.2-linux-x64.tar.gz.sha256
+            dist/AetherIDE-v0.1.0-beta.3-linux-x64.tar.gz
+            dist/AetherIDE-v0.1.0-beta.3-linux-x64.tar.gz.sha256
           if-no-files-found: error
 
   macos-build:
@@ -183,10 +184,10 @@ jobs:
       - name: Upload macOS Release Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AetherIDE-v0.1.0-beta.2-macos-arm64
+          name: AetherIDE-v0.1.0-beta.3-macos-arm64
           path: |
-            dist/AetherIDE-v0.1.0-beta.2-macos-arm64.tar.gz
-            dist/AetherIDE-v0.1.0-beta.2-macos-arm64.tar.gz.sha256
+            dist/AetherIDE-v0.1.0-beta.3-macos-arm64.tar.gz
+            dist/AetherIDE-v0.1.0-beta.3-macos-arm64.tar.gz.sha256
           if-no-files-found: error
       - name: Cleanup macOS Keychain
         if: always()

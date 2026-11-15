@@ -166,6 +166,25 @@ impl TerminalManager {
         }
     }
 
+    pub fn get_terminal_dimensions(&self, id: u32) -> Result<(u16, u16)> {
+        #[cfg(windows)]
+        {
+            let lock = self.conpty_sessions.lock();
+            if let Some(session) = lock.get(&id) {
+                return Ok(session.get_dimensions());
+            }
+        }
+        let lock = self.backends.lock();
+        if let Some(backend) = lock.get(&id) {
+            Ok(backend.get_dimensions())
+        } else {
+            Err(AetherError::Process(format!(
+                "Terminal session {} not found",
+                id
+            )))
+        }
+    }
+
     #[cfg(windows)]
     pub fn subscribe_output(&self, id: u32) -> Result<tokio::sync::broadcast::Receiver<Vec<u8>>> {
         let lock = self.conpty_sessions.lock();

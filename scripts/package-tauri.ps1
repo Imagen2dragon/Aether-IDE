@@ -2,7 +2,7 @@
 # Compiles the production frontend and Tauri 2 host into a standalone desktop executable and NSIS installer.
 
 param (
-    [string]$Version = "0.1.0-beta.2",
+    [string]$Version = "0.1.0-beta.3",
     [string]$OutputDir = ""
 )
 

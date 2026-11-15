@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-VERSION="${1:-0.1.0-beta.2}"
+VERSION="${1:-0.1.0-beta.3}"
 PKG_TYPE="${2:-all}" # portable, dmg, all
 REQUIRE_ALL=false
 
