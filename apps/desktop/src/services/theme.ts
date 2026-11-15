@@ -2,6 +2,7 @@ import * as monaco from "monaco-editor";
 
 export type ThemeId =
   | "obsidian-pro"
+  | "vscode-dark"
   | "aurora"
   | "zen"
   | "fusion"
@@ -269,6 +270,7 @@ export class ThemeService {
     }
     const themeMap: Record<ThemeId, string> = {
       "obsidian-pro": "aether-obsidian-pro",
+      "vscode-dark": "vs-dark",
       aurora: "aether-aurora",
       zen: "aether-zen",
       fusion: "aether-fusion",

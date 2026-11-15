@@ -38,17 +38,39 @@ export const App: React.FC = () => {
 
   // Navigation & Layout State (Concept 2 Expanded Obsidian Pro Workbench Defaults)
   const isDesktopViewport = typeof window !== "undefined" && window.innerWidth >= 1200;
+  const urlParams = typeof window !== "undefined" ? new URLSearchParams(window.location.search) : null;
 
-  const [activeView, setActiveView] = useState<ActiveSidebarView>("explorer");
+  const [activeView, setActiveView] = useState<ActiveSidebarView>(() => {
+    if (urlParams) {
+      const v = urlParams.get("view") as ActiveSidebarView;
+      if (v && ["explorer", "search", "git", "debug", "brain", "extensions", "testing", "agents", "mobile", "build", "settings"].includes(v)) {
+        return v;
+      }
+    }
+    const saved = localStorage.getItem("aether_workbench_active_view") as ActiveSidebarView;
+    return saved || "explorer";
+  });
   const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(() => {
+    if (urlParams && urlParams.get("sidebar") !== null) {
+      return urlParams.get("sidebar") === "true";
+    }
     const saved = localStorage.getItem("aether_workbench_sidebar_open");
     return saved !== null ? saved === "true" : true;
   });
   const [isBottomPanelOpen, setIsBottomPanelOpen] = useState<boolean>(() => {
+    if (urlParams && urlParams.get("bottom") !== null) {
+      return urlParams.get("bottom") === "true";
+    }
     const saved = localStorage.getItem("aether_workbench_bottom_open");
     return saved !== null ? saved === "true" : isDesktopViewport;
   });
   const [bottomTab, setBottomTab] = useState<BottomPanelTab>(() => {
+    if (urlParams) {
+      const t = urlParams.get("tab") as BottomPanelTab;
+      if (t && ["terminal", "problems", "output", "debug", "tests", "doctor"].includes(t)) {
+        return t;
+      }
+    }
     const saved = localStorage.getItem("aether_workbench_bottom_tab") as BottomPanelTab;
     if (saved && ["terminal", "problems", "output", "debug", "tests", "doctor"].includes(saved)) {
       return saved;
@@ -56,11 +78,40 @@ export const App: React.FC = () => {
     return "terminal";
   });
   const [isAiOpen, setIsAiOpen] = useState<boolean>(() => {
+    if (urlParams && urlParams.get("ai") !== null) {
+      return urlParams.get("ai") === "true";
+    }
     const saved = localStorage.getItem("aether_workbench_ai_open");
     return saved !== null ? saved === "true" : isDesktopViewport;
   });
-  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
+  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(() => {
+    return urlParams ? urlParams.get("cmd") === "true" : false;
+  });
   const [targetLine, setTargetLine] = useState<{ path: string; line: number } | null>(null);
+
+  // Native Desktop Splash Screen State (900ms launch transition)
+  const [showSplash, setShowSplash] = useState<boolean>(() => {
+    if (typeof window !== "undefined") {
+      if (new URLSearchParams(window.location.search).get("nosplash") === "true") return false;
+      if (sessionStorage.getItem("aether_splash_shown") === "true") return false;
+    }
+    return true;
+  });
+  const [splashFading, setSplashFading] = useState(false);
+
+  useEffect(() => {
+    if (!showSplash) return;
+    const timer = setTimeout(() => {
+      setSplashFading(true);
+      setTimeout(() => {
+        setShowSplash(false);
+        if (typeof window !== "undefined") {
+          sessionStorage.setItem("aether_splash_shown", "true");
+        }
+      }, 250);
+    }, 900);
+    return () => clearTimeout(timer);
+  }, [showSplash]);
 
   // Panel Resizing State (persisted in localStorage)
   const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
@@ -78,11 +129,114 @@ export const App: React.FC = () => {
     return saved ? Math.max(120, Math.min(600, parseInt(saved, 10))) : 230;
   });
 
+  // Default workspace structure
+  const DEFAULT_TREE: WorkspaceNode[] = [
+    {
+      name: "rust",
+      path: "rust",
+      is_directory: true,
+      children: [
+        {
+          name: "crates",
+          path: "rust/crates",
+          is_directory: true,
+          children: [
+            { name: "application-core", path: "rust/crates/application-core", is_directory: true },
+            { name: "checkpoint-engine", path: "rust/crates/checkpoint-engine", is_directory: true },
+            { name: "filesystem-engine", path: "rust/crates/filesystem-engine", is_directory: true },
+            { name: "terminal-manager", path: "rust/crates/terminal-manager", is_directory: true },
+            { name: "agent-orchestrator", path: "rust/crates/agent-orchestrator", is_directory: true },
+            { name: "project-brain", path: "rust/crates/project-brain", is_directory: true },
+          ],
+        },
+        { name: "Cargo.toml", path: "rust/Cargo.toml", is_directory: false },
+      ],
+    },
+    {
+      name: "apps",
+      path: "apps",
+      is_directory: true,
+      children: [
+        {
+          name: "desktop",
+          path: "apps/desktop",
+          is_directory: true,
+          children: [
+            { name: "src", path: "apps/desktop/src", is_directory: true },
+            { name: "package.json", path: "apps/desktop/package.json", is_directory: false },
+            { name: "vite.config.ts", path: "apps/desktop/vite.config.ts", is_directory: false },
+          ],
+        },
+        { name: "ios-companion", path: "apps/ios-companion", is_directory: true },
+        { name: "web-workspace", path: "apps/web-workspace", is_directory: true },
+      ],
+    },
+    {
+      name: "docs",
+      path: "docs",
+      is_directory: true,
+      children: [
+        { name: "ARCHITECTURE.md", path: "docs/ARCHITECTURE.md", is_directory: false },
+        { name: "RELEASE_NOTES.md", path: "docs/RELEASE_NOTES.md", is_directory: false },
+      ],
+    },
+    {
+      name: "README.md",
+      path: "README.md",
+      is_directory: false,
+    },
+    {
+      name: "Cargo.toml",
+      path: "Cargo.toml",
+      is_directory: false,
+    },
+  ];
+
+  const INITIAL_TABS: OpenFileTab[] = [
+    {
+      path: "rust/crates/application-core/src/lib.rs",
+      name: "lib.rs",
+      content: `//! AetherIDE Systems Core
+//! Production-grade Rust-first autonomous software engineering runtime.
+
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+/// Central application engine coordinating all native subsystems.
+pub struct ApplicationEngine {
+    state: Arc<RwLock<EngineState>>,
+}
+
+impl ApplicationEngine {
+    pub async fn initialize() -> Result<Self, CoreError> {
+        tracing::info!("Initializing AetherIDE Native Systems Engine v0.1.0-beta.3");
+        Ok(Self {
+            state: Arc::new(RwLock::new(EngineState::default())),
+        })
+    }
+
+    pub async fn dispatch_swarm(&self, goal: &str) -> Result<ExecutionTrace, SwarmError> {
+        // Dispatches multi-agent DAG with Kahn topological verification
+        Ok(ExecutionTrace::completed())
+    }
+}`,
+      isDirty: false,
+      language: "rust",
+    },
+    {
+      path: "README.md",
+      name: "README.md",
+      content: `# AetherIDE\n\nProduction-Grade, Rust-First AI-Native IDE and Autonomous Software Engineering Ecosystem.`,
+      isDirty: false,
+      language: "markdown",
+    },
+  ];
+
   // Workspace & Files State
-  const [workspaceRoots, setWorkspaceRoots] = useState<string[]>([]);
-  const [workspaceTree, setWorkspaceTree] = useState<WorkspaceNode[]>([]);
-  const [openTabs, setOpenTabs] = useState<OpenFileTab[]>([]);
-  const [activeTabPath, setActiveTabPath] = useState<string | null>(null);
+  const [workspaceRoots, setWorkspaceRoots] = useState<string[]>(["ide"]);
+  const [workspaceTree, setWorkspaceTree] = useState<WorkspaceNode[]>(DEFAULT_TREE);
+  const [openTabs, setOpenTabs] = useState<OpenFileTab[]>(INITIAL_TABS);
+  const [activeTabPath, setActiveTabPath] = useState<string | null>(INITIAL_TABS[0].path);
 
   // Diagnostics & Logs
   const [diagnostics, setDiagnostics] = useState<Record<string, Diagnostic[]>>({});
@@ -358,6 +512,26 @@ export const App: React.FC = () => {
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "o") {
         e.preventDefault();
         handleOpenFile();
+      } else if ((e.ctrlKey || e.metaKey) && e.key === ",") {
+        e.preventDefault();
+        setActiveView("settings");
+        setIsSidebarOpen(true);
+      } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "e") {
+        e.preventDefault();
+        setActiveView("explorer");
+        setIsSidebarOpen(true);
+      } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "g") {
+        e.preventDefault();
+        setActiveView("git");
+        setIsSidebarOpen(true);
+      } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "d") {
+        e.preventDefault();
+        setActiveView("debug");
+        setIsSidebarOpen(true);
+      } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "x") {
+        e.preventDefault();
+        setActiveView("extensions");
+        setIsSidebarOpen(true);
       }
     };
 
@@ -400,6 +574,7 @@ export const App: React.FC = () => {
         isAiOpen={isAiOpen}
         isSidebarOpen={isSidebarOpen}
         isBottomPanelOpen={isBottomPanelOpen}
+        dirtyCount={openTabs.filter((t) => t.isDirty).length}
       />
 
       {/* 2. Main Workbench Body */}
@@ -426,6 +601,8 @@ export const App: React.FC = () => {
             }
           }}
           gitDirtyCount={gitDirtyCount}
+          onToggleAi={() => setIsAiOpen((prev) => !prev)}
+          isAiOpen={isAiOpen}
         />
 
         {/* 2.2 Primary Sidebar */}
@@ -625,6 +802,72 @@ export const App: React.FC = () => {
           setIsSidebarOpen(true);
         }}
       />
+      {/* 5. Native Windows 900ms Launch Splash Screen */}
+      {showSplash && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "#1E1E1E",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 99999,
+            opacity: splashFading ? 0 : 1,
+            transition: "opacity 0.25s ease-out",
+            pointerEvents: splashFading ? "none" : "all",
+            userSelect: "none",
+          }}
+        >
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 16 }}>
+            {/* Æ Logo Mark */}
+            <div
+              style={{
+                width: 72,
+                height: 72,
+                borderRadius: 18,
+                background: "linear-gradient(135deg, #0F172A 0%, #1E293B 100%)",
+                border: "2px solid #28D7F2",
+                boxShadow: "0 8px 24px rgba(40, 215, 242, 0.25)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                fontSize: 34,
+                fontWeight: 900,
+                color: "#28D7F2",
+                letterSpacing: -1,
+              }}
+            >
+              Æ
+            </div>
+
+            <div style={{ textAlign: "center" }}>
+              <h1 style={{ fontSize: 22, fontWeight: 800, color: "#FFFFFF", letterSpacing: 0.5, margin: 0 }}>
+                Aether<span style={{ color: "#28D7F2" }}>IDE</span>
+              </h1>
+              <p style={{ fontSize: 12, color: "#858585", margin: "6px 0 0 0" }}>
+                Loading workspace...
+              </p>
+            </div>
+
+            {/* Animated Loading Bar */}
+            <div
+              style={{
+                width: 200,
+                height: 3,
+                background: "#2B2B2B",
+                borderRadius: 2,
+                overflow: "hidden",
+                marginTop: 8,
+                position: "relative",
+              }}
+            >
+              <div className="splash-progress-bar" />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

@@ -10,6 +10,7 @@ import {
   Settings,
   Bot,
   HardDrive,
+  Sparkles,
 } from "lucide-react";
 import type { ActiveSidebarView } from "../../types/workbench";
 
@@ -17,12 +18,16 @@ interface ActivityBarProps {
   activeView: ActiveSidebarView;
   onSelectView: (view: ActiveSidebarView) => void;
   gitDirtyCount?: number;
+  onToggleAi?: () => void;
+  isAiOpen?: boolean;
 }
 
 export const ActivityBar: React.FC<ActivityBarProps> = ({
   activeView,
   onSelectView,
   gitDirtyCount = 0,
+  onToggleAi,
+  isAiOpen = false,
 }) => {
   return (
     <div className="activity-bar">
@@ -67,16 +72,7 @@ export const ActivityBar: React.FC<ActivityBarProps> = ({
           <PlayCircle size={19} />
         </button>
 
-        {/* 5. AI Workspace & Brain */}
-        <button
-          className={`activity-btn ${activeView === "brain" ? "active" : ""}`}
-          onClick={() => onSelectView("brain")}
-          title="AI Workspace — Architectural Brain & AST Impact Radar"
-        >
-          <Network size={19} />
-        </button>
-
-        {/* 6. Extensions */}
+        {/* 5. Extensions */}
         <button
           className={`activity-btn ${activeView === "extensions" ? "active" : ""}`}
           onClick={() => onSelectView("extensions")}
@@ -85,16 +81,19 @@ export const ActivityBar: React.FC<ActivityBarProps> = ({
           <Blocks size={19} />
         </button>
 
-        {/* 7. Testing */}
-        <button
-          className={`activity-btn ${activeView === "testing" ? "active" : ""}`}
-          onClick={() => onSelectView("testing")}
-          title="Testing & Test Suite Explorer"
-        >
-          <FlaskConical size={19} />
-        </button>
+        {/* 6. AI Assistant Sidecar Toggle (Adaptive Hybrid Ctrl+L) */}
+        {onToggleAi && (
+          <button
+            className={`activity-btn ${isAiOpen ? "active" : ""}`}
+            onClick={onToggleAi}
+            title="Toggle AI Assistant Sidecar (Ctrl+L)"
+            style={{ position: "relative" }}
+          >
+            <Sparkles size={19} style={{ color: isAiOpen ? "var(--accent-cyan)" : undefined }} />
+          </button>
+        )}
 
-        {/* Multi-Agent Swarm */}
+        {/* 7. Multi-Agent Swarm */}
         <button
           className={`activity-btn ${activeView === "agents" ? "active" : ""}`}
           onClick={() => onSelectView("agents")}
@@ -103,7 +102,25 @@ export const ActivityBar: React.FC<ActivityBarProps> = ({
           <Bot size={19} />
         </button>
 
-        {/* Build & Storage */}
+        {/* 8. AI Workspace & Brain */}
+        <button
+          className={`activity-btn ${activeView === "brain" ? "active" : ""}`}
+          onClick={() => onSelectView("brain")}
+          title="AI Workspace — Architectural Brain & AST Impact Radar"
+        >
+          <Network size={19} />
+        </button>
+
+        {/* 9. Testing */}
+        <button
+          className={`activity-btn ${activeView === "testing" ? "active" : ""}`}
+          onClick={() => onSelectView("testing")}
+          title="Testing & Test Suite Explorer"
+        >
+          <FlaskConical size={19} />
+        </button>
+
+        {/* 10. Build & Storage */}
         <button
           className={`activity-btn ${activeView === "build" ? "active" : ""}`}
           onClick={() => onSelectView("build")}
@@ -118,7 +135,7 @@ export const ActivityBar: React.FC<ActivityBarProps> = ({
         <button
           className={`activity-btn ${activeView === "settings" ? "active" : ""}`}
           onClick={() => onSelectView("settings")}
-          title="Workbench Settings, Themes & Customization"
+          title="Workbench Settings, Themes & Customization (Ctrl+,)"
         >
           <Settings size={19} />
         </button>

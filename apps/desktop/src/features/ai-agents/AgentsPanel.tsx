@@ -47,7 +47,23 @@ export const AgentsPanel: React.FC = () => {
       const list = await TauriService.listPersonas();
       setPersonas(list);
     } catch (e) {
-      console.error(e);
+      console.warn("Using baseline agent personas:", e);
+      setPersonas([
+        { role_id: "architect", display_name: "Principal Architect", description: "System design, module decomposition, and architectural conformance.", system_prompt: "You are the Principal Architect.", default_tools: ["brain", "search"] },
+        { role_id: "frontend", display_name: "Frontend Developer", description: "UI engineering, React components, CSS, and layout responsiveness.", system_prompt: "You are the Frontend Developer.", default_tools: ["filesystem", "vite"] },
+        { role_id: "backend", display_name: "Backend Developer", description: "Microservices, IPC protocols, and business logic execution.", system_prompt: "You are the Backend Developer.", default_tools: ["filesystem", "ipc"] },
+        { role_id: "systems", display_name: "Systems Engineer", description: "Rust native systems, ConPTY terminals, and Windows NTFS kernel hooks.", system_prompt: "You are the Systems Engineer.", default_tools: ["cargo", "conpty"] },
+        { role_id: "security", display_name: "Security Reviewer", description: "Sandboxing, token privileges, ACL enforcement, and vulnerability analysis.", system_prompt: "You are the Security Reviewer.", default_tools: ["audit", "dacl"] },
+        { role_id: "debugger", display_name: "Debugging Specialist", description: "Automated regression isolation, stack trace inspection, and bug fixing.", system_prompt: "You are the Debugging Specialist.", default_tools: ["terminal", "test"] },
+        { role_id: "mobile", display_name: "Mobile Developer", description: "React Native + Expo SDK 52 mobile engineering.", system_prompt: "You are the Mobile Developer.", default_tools: ["expo", "metro"] },
+        { role_id: "database", display_name: "Database Engineer", description: "SQLite WAL optimization, indexing, and migration schema design.", system_prompt: "You are the Database Engineer.", default_tools: ["sqlite", "sql"] },
+        { role_id: "devops", display_name: "DevOps Engineer", description: "CI/CD pipelines, release packaging, and cross-platform installers.", system_prompt: "You are the DevOps Engineer.", default_tools: ["git", "installer"] },
+        { role_id: "tester", display_name: "Testing Specialist", description: "Unit, integration, and property-based test harness construction.", system_prompt: "You are the Testing Specialist.", default_tools: ["cargo_test", "assert"] },
+        { role_id: "performance", display_name: "Performance Engineer", description: "Latency profiling, zero-copy buffers, and AST indexing optimization.", system_prompt: "You are the Performance Engineer.", default_tools: ["profile", "benchmark"] },
+        { role_id: "reviewer", display_name: "Code Reviewer", description: "Static analysis, style conformance, and readability audits.", system_prompt: "You are the Code Reviewer.", default_tools: ["clippy", "diff"] },
+        { role_id: "researcher", display_name: "Technical Researcher", description: "Ecosystem discovery, algorithmic prototyping, and RFC drafting.", system_prompt: "You are the Technical Researcher.", default_tools: ["web", "docs"] },
+        { role_id: "documentation", display_name: "Documentation Engineer", description: "API reference manuals, architecture specs, and user guides.", system_prompt: "You are the Documentation Engineer.", default_tools: ["markdown", "specs"] },
+      ]);
     }
   };
 

@@ -1,8 +1,13 @@
 # AetherIDE — Official Brand Identity & Design Guide
 
 **Product Positioning:** AetherIDE — Your AI-Native Engineering Environment  
-**Version:** `0.1.0-beta.2`  
+**Version:** `0.1.0-beta.3`  
 **License:** Apache 2.0 / MIT Dual License  
+
+> [!IMPORTANT]
+> **IMMUTABLE BRAND LOCK DIRECTIVE:**
+> The logo assets specified in this guide constitute the permanent, canonical official main logo and visual identity for AetherIDE.
+> **DO NOT alter, replace, regenerate, or modify these logo assets under any circumstance unless directly and explicitly instructed to do so by the user.**
 
 ---
 

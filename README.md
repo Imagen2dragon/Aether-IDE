@@ -1,10 +1,17 @@
-# AetherIDE
+<div align="center">
+
+<img src="branding/source/aetheride-logo.svg" alt="AetherIDE Official Logo" width="680" />
+
+<br/>
 
 > **Production-Grade, Rust-First AI-Native IDE and Autonomous Software Engineering Ecosystem**
 
 [![Rust Version](https://img.shields.io/badge/rust-1.80%2B-blue.svg)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20iOS%20%7C%20Web-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-purple.svg)]()
+[![Release](https://img.shields.io/badge/release-v0.1.0--beta.3-cyan.svg)](https://github.com/Imagen2dragon/Aether-IDE/releases/latest)
+
+</div>
 
 ---
 

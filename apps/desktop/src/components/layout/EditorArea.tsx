@@ -300,7 +300,7 @@ export const EditorArea: React.FC<EditorAreaProps> = ({
                   Aether<span style={{ color: "var(--accent-cyan)" }}>IDE</span>
                 </h1>
                 <p style={{ fontSize: 13, color: "var(--text-muted)" }}>
-                  Concept 2 — Expanded Obsidian Pro Workbench • Production v0.1.0-beta.2
+                  Concept 2 — Expanded Obsidian Pro Workbench • Production v0.1.0-beta.3
                 </p>
               </div>
             </div>

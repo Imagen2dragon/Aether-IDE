@@ -59,6 +59,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   };
 
   const themes: Array<{ id: ThemeId; name: string; desc: string; color: string }> = [
+    { id: "vscode-dark", name: "VS Code Dark+", desc: "Microsoft Visual Studio Code Dark+ Classic", color: "#007ACC" },
     { id: "obsidian-pro", name: "Obsidian Pro (Concept 2)", desc: "Electric Cyan & Deep Obsidian", color: "#28D7F2" },
     { id: "aurora", name: "Aurora", desc: "Emerald Green & Deep Midnight Navy", color: "#10B981" },
     { id: "zen", name: "ZEN", desc: "Warm Amber & Minimalist Ink Black", color: "#F59E0B" },

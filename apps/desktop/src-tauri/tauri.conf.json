@@ -17,10 +17,12 @@
         "title": "AetherIDE",
         "width": 1440,
         "height": 900,
-        "minWidth": 800,
-        "minHeight": 600,
-        "decorations": true,
+        "minWidth": 1024,
+        "minHeight": 640,
+        "decorations": false,
+        "shadow": true,
         "resizable": true,
+        "transparent": false,
         "backgroundColor": [30, 30, 30, 255]
       }
     ],

@@ -28,6 +28,7 @@ interface HeaderProps {
   isAiOpen: boolean;
   isSidebarOpen?: boolean;
   isBottomPanelOpen?: boolean;
+  dirtyCount?: number;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -43,6 +44,7 @@ export const Header: React.FC<HeaderProps> = ({
   isAiOpen,
   isSidebarOpen = true,
   isBottomPanelOpen = false,
+  dirtyCount = 0,
 }) => {
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
 
@@ -73,6 +75,12 @@ export const Header: React.FC<HeaderProps> = ({
 
   const handleClose = async () => {
     try {
+      if (dirtyCount > 0) {
+        const confirmClose = window.confirm(
+          `You have ${dirtyCount} unsaved change(s). Are you sure you want to exit without saving?`
+        );
+        if (!confirmClose) return;
+      }
       const win = getCurrentWindow();
       await win.close();
     } catch (e) {
@@ -83,6 +91,12 @@ export const Header: React.FC<HeaderProps> = ({
   return (
     <header
       className="workbench-header"
+      data-tauri-drag-region="true"
+      onDoubleClick={(e) => {
+        // Only maximize if double clicked on empty area of header, not on buttons or menus
+        if ((e.target as HTMLElement).closest("button, .menu-item, .command-search-pill")) return;
+        handleMaximize();
+      }}
       onClick={(e) => {
         if (!(e.target as HTMLElement).closest(".menu-item")) {
           closeMenu();
@@ -153,6 +167,19 @@ export const Header: React.FC<HeaderProps> = ({
                   <span>Save</span>
                   <span className="shortcut">Ctrl+S</span>
                 </div>
+                <div className="dropdown-separator" />
+                {onOpenSettings && (
+                  <div
+                    className="dropdown-entry"
+                    onClick={() => {
+                      closeMenu();
+                      onOpenSettings();
+                    }}
+                  >
+                    <span>Preferences: Settings</span>
+                    <span className="shortcut">Ctrl+,</span>
+                  </div>
+                )}
                 <div className="dropdown-separator" />
                 <div
                   className="dropdown-entry"
@@ -275,6 +302,119 @@ export const Header: React.FC<HeaderProps> = ({
             )}
           </div>
 
+          {/* Go Menu */}
+          <div className={`menu-item ${activeMenu === "go" ? "open" : ""}`}>
+            <button className="menu-btn" onClick={() => toggleMenu("go")}>
+              Go
+            </button>
+            {activeMenu === "go" && (
+              <div className="dropdown-menu">
+                <div
+                  className="dropdown-entry"
+                  onClick={() => {
+                    closeMenu();
+                    onOpenCommandPalette();
+                  }}
+                >
+                  <span>Go to File...</span>
+                  <span className="shortcut">Ctrl+P</span>
+                </div>
+                <div
+                  className="dropdown-entry"
+                  onClick={() => {
+                    closeMenu();
+                    onOpenCommandPalette();
+                  }}
+                >
+                  <span>Go to Symbol in Workspace...</span>
+                  <span className="shortcut">Ctrl+T</span>
+                </div>
+                <div className="dropdown-separator" />
+                <div className="dropdown-entry" onClick={closeMenu}>
+                  <span>Back</span>
+                  <span className="shortcut">Alt+Left</span>
+                </div>
+                <div className="dropdown-entry" onClick={closeMenu}>
+                  <span>Forward</span>
+                  <span className="shortcut">Alt+Right</span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Run Menu */}
+          <div className={`menu-item ${activeMenu === "run" ? "open" : ""}`}>
+            <button className="menu-btn" onClick={() => toggleMenu("run")}>
+              Run
+            </button>
+            {activeMenu === "run" && (
+              <div className="dropdown-menu">
+                <div
+                  className="dropdown-entry"
+                  onClick={() => {
+                    closeMenu();
+                    onToggleBottomPanel();
+                  }}
+                >
+                  <span>Start Debugging</span>
+                  <span className="shortcut">F5</span>
+                </div>
+                <div
+                  className="dropdown-entry"
+                  onClick={() => {
+                    closeMenu();
+                    onToggleBottomPanel();
+                  }}
+                >
+                  <span>Run Without Debugging</span>
+                  <span className="shortcut">Ctrl+F5</span>
+                </div>
+                <div className="dropdown-separator" />
+                <div
+                  className="dropdown-entry"
+                  onClick={() => {
+                    closeMenu();
+                    onToggleBottomPanel();
+                  }}
+                >
+                  <span>Run Build Task</span>
+                  <span className="shortcut">Ctrl+Shift+B</span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Terminal Menu */}
+          <div className={`menu-item ${activeMenu === "terminal" ? "open" : ""}`}>
+            <button className="menu-btn" onClick={() => toggleMenu("terminal")}>
+              Terminal
+            </button>
+            {activeMenu === "terminal" && (
+              <div className="dropdown-menu">
+                <div
+                  className="dropdown-entry"
+                  onClick={() => {
+                    closeMenu();
+                    onToggleBottomPanel();
+                  }}
+                >
+                  <span>Toggle Terminal</span>
+                  <span className="shortcut">Ctrl+`</span>
+                </div>
+                <div
+                  className="dropdown-entry"
+                  onClick={() => {
+                    closeMenu();
+                    onToggleBottomPanel();
+                  }}
+                >
+                  <span>New Terminal</span>
+                  <span className="shortcut">Ctrl+Shift+`</span>
+                </div>
+              </div>
+            )}
+          </div>
+
           {/* Help Menu */}
           <div className={`menu-item ${activeMenu === "help" ? "open" : ""}`}>
             <button className="menu-btn" onClick={() => toggleMenu("help")}>
@@ -283,7 +423,7 @@ export const Header: React.FC<HeaderProps> = ({
             {activeMenu === "help" && (
               <div className="dropdown-menu">
                 <div className="dropdown-entry" onClick={closeMenu}>
-                  <span>About AetherIDE (Expanded Obsidian Pro)</span>
+                  <span>About AetherIDE (v0.1.0-beta.3)</span>
                 </div>
                 <div className="dropdown-entry" onClick={closeMenu}>
                   <span>Documentation & Guide</span>

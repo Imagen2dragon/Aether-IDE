@@ -1036,3 +1036,53 @@ footer.workbench-statusbar {
   color: var(--accent-cyan);
   font-weight: 600;
 }
+
+/* 7. VS Code Dark+ Theme Preset */
+[data-theme="vscode-dark"] {
+  --bg-root: #1E1E1E;
+  --bg-surface: #252526;
+  --bg-floating: #252526;
+  --bg-editor: #1E1E1E;
+  --bg-panel: #1E1E1E;
+  --bg-header: #3C3C3C;
+  --bg-activity: #333333;
+  --bg-sidebar: #252526;
+  --bg-statusbar: #007ACC;
+  --bg-card: #252526;
+  --bg-hover: #2A2D2E;
+  --bg-active: #37373D;
+  --border-color: #2B2B2B;
+  --border-light: #454545;
+  --border-focus: #007ACC;
+  --text-primary: #CCCCCC;
+  --text-secondary: #969696;
+  --text-muted: #858585;
+  --text-dim: #6E6E6E;
+  --primary-accent: #007ACC;
+  --accent-cyan: #007ACC;
+  --accent-glow: rgba(0, 122, 204, 0.2);
+}
+
+[data-theme="vscode-dark"] .workbench-statusbar {
+  background: #007ACC !important;
+  color: #FFFFFF !important;
+}
+
+[data-theme="vscode-dark"] .workbench-statusbar span,
+[data-theme="vscode-dark"] .workbench-statusbar svg {
+  color: #FFFFFF !important;
+}
+
+/* Splash Screen Animation */
+@keyframes splashProgress {
+  0% { transform: translateX(-100%); width: 40%; }
+  50% { transform: translateX(50%); width: 60%; }
+  100% { transform: translateX(200%); width: 40%; }
+}
+
+.splash-progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #28D7F2, #6366F1);
+  border-radius: 2px;
+  animation: splashProgress 0.9s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}

@@ -402,7 +402,14 @@ export class TauriService {
   }
 
   // --- Event Listeners Helper ---
-  static onEvent<T>(event: string, callback: (payload: T) => void): Promise<UnlistenFn> {
-    return listen<T>(event, (e) => callback(e.payload));
+  static async onEvent<T>(event: string, callback: (payload: T) => void): Promise<UnlistenFn> {
+    try {
+      if (typeof window !== "undefined" && (window as any).__TAURI_INTERNALS__) {
+        return await listen<T>(event, (e) => callback(e.payload));
+      }
+      return () => {};
+    } catch {
+      return () => {};
+    }
   }
 }
