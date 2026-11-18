@@ -1,215 +1,76 @@
-<div align="center">
+# Visual Studio Code - Open Source ("Code - OSS")
+[![Feature Requests](https://img.shields.io/github/issues/microsoft/vscode/feature-request.svg)](https://github.com/microsoft/vscode/issues?q=is%3Aopen+is%3Aissue+label%3Afeature-request+sort%3Areactions-%2B1-desc)
+[![Bugs](https://img.shields.io/github/issues/microsoft/vscode/bug.svg)](https://github.com/microsoft/vscode/issues?utf8=✓&q=is%3Aissue+is%3Aopen+label%3Abug)
 
-<img src="branding/source/aetheride-logo.svg" alt="AetherIDE Official Logo" width="680" />
+## The Repository
 
-<br/>
+This repository ("`Code - OSS`") is where we (Microsoft) develop the [Visual Studio Code](https://code.visualstudio.com) product together with the community. Not only do we work on code and issues here, but we also publish our [roadmap](https://github.com/microsoft/vscode/wiki/Roadmap), [monthly iteration plans](https://github.com/microsoft/vscode/wiki/Iteration-Plans), and our [endgame plans](https://github.com/microsoft/vscode/wiki/Running-the-Endgame). This source code is available to everyone under the standard [MIT license](https://github.com/microsoft/vscode/blob/main/LICENSE.txt).
 
-> **Production-Grade, Rust-First AI-Native IDE and Autonomous Software Engineering Ecosystem**
+## Visual Studio Code
 
-[![Rust Version](https://img.shields.io/badge/rust-1.80%2B-blue.svg)](https://www.rust-lang.org)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20iOS%20%7C%20Web-brightgreen.svg)]()
-[![License](https://img.shields.io/badge/license-MIT-purple.svg)]()
-[![Release](https://img.shields.io/badge/release-v0.1.0--beta.3-cyan.svg)](https://github.com/Imagen2dragon/Aether-IDE/releases/latest)
+<p align="center">
+  <img alt="VS Code in action" src="https://github.com/user-attachments/assets/56af271c-949d-454c-a3ea-16188c063414">
+</p>
 
-</div>
+[Visual Studio Code](https://code.visualstudio.com) is a distribution of the `Code - OSS` repository with Microsoft-specific customizations released under a traditional [Microsoft product license](https://code.visualstudio.com/License/).
 
----
+[Visual Studio Code](https://code.visualstudio.com) combines the simplicity of a code editor with what developers need for their core edit-build-debug cycle. It provides comprehensive code editing, navigation, and understanding support along with lightweight debugging, a rich extensibility model, and lightweight integration with existing tools.
 
-## 🌟 Executive Overview
-**AetherIDE** is a unified, high-performance software engineering platform designed from the ground up to synthesize the best aspects of Visual Studio Code, Cursor, Claude Code, and modern autonomous coding systems into a single cohesive development environment.
+Visual Studio Code is updated monthly with new features and bug fixes. You can download it for Windows, macOS, and Linux on the [Visual Studio Code website](https://code.visualstudio.com/Download). To get the latest releases every day, install the [Insiders build](https://code.visualstudio.com/insiders).
 
-Unlike simple UI wrappers or chatbot sidebars, AetherIDE is powered by a multithreaded native **Rust systems core** that executes heavy operations—incremental AST parsing, full-text symbol search, Git worktrees, terminal streaming, process isolation, and multi-agent coordination—at sub-millisecond speeds with zero memory corruption vulnerabilities.
+## Contributing
 
----
+There are many ways in which you can participate in this project, for example:
 
-## 💾 Download AetherIDE — Latest Version
+* [Submit bugs and feature requests](https://github.com/microsoft/vscode/issues), and help us verify them as they are checked in
+* Review [source code changes](https://github.com/microsoft/vscode/pulls)
+* Review the [documentation](https://github.com/microsoft/vscode-docs) and make pull requests for anything from typos to new content.
 
-> **Universal Download Portal:** Always download the latest official binaries directly from **[GitHub Releases Latest](https://github.com/Imagen2dragon/Aether-IDE/releases/latest)**.
+If you are interested in fixing issues and contributing directly to the codebase, please see the document [How to Contribute](https://github.com/microsoft/vscode/wiki/How-to-Contribute), which covers the following:
 
-All production-packaged cross-platform releases, installers, and cryptographic verification checksums are published on **[GitHub Releases](https://github.com/Imagen2dragon/Aether-IDE/releases/latest)**. Select the correct asset for your operating system under the latest release.
+* [How to build and run from source](https://github.com/microsoft/vscode/wiki/How-to-Contribute)
+* [The development workflow, including debugging and running tests](https://github.com/microsoft/vscode/wiki/How-to-Contribute#debugging)
+* [Coding guidelines](https://github.com/microsoft/vscode/wiki/Coding-Guidelines)
+* [Submitting pull requests](https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests)
+* [Finding an issue to work on](https://github.com/microsoft/vscode/wiki/How-to-Contribute#where-to-contribute)
+* [Contributing to translations](https://aka.ms/vscodeloc)
 
-### 🚀 Direct Package Links (v0.1.0-beta.3)
+## Feedback
 
-| Operating System | Distribution Format | Direct Download | Verification Digest |
-| :--- | :--- | :--- | :--- |
-| **Windows 10/11 x64** | **Setup Installer (.exe)** *(Recommended)* | [**AetherIDE-Setup-0.1.0-beta.3-x64.exe**](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.3/AetherIDE-Setup-0.1.0-beta.3-x64.exe) | [SHA-256](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.3/AetherIDE-Setup-0.1.0-beta.3-x64.exe.sha256) |
-| **Windows 10/11 x64** | **Portable (.zip)** | [AetherIDE-v0.1.0-beta.3-windows-x64.zip](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.3/AetherIDE-v0.1.0-beta.3-windows-x64.zip) | [SHA-256](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.3/AetherIDE-v0.1.0-beta.3-windows-x64.zip.sha256) |
-| **Linux x64** | **Portable Tarball (.tar.gz)** | [AetherIDE-v0.1.0-beta.3-linux-x64.tar.gz](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.3/AetherIDE-v0.1.0-beta.3-linux-x64.tar.gz) | [SHA-256](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.3/AetherIDE-v0.1.0-beta.3-linux-x64.tar.gz.sha256) |
-| **macOS ARM64** | **Apple Silicon (.tar.gz)** | [AetherIDE-v0.1.0-beta.3-macos-arm64.tar.gz](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.3/AetherIDE-v0.1.0-beta.3-macos-arm64.tar.gz) | [SHA-256](https://github.com/Imagen2dragon/Aether-IDE/releases/download/v0.1.0-beta.3/AetherIDE-v0.1.0-beta.3-macos-arm64.tar.gz.sha256) |
+* Ask a question on [Stack Overflow](https://stackoverflow.com/questions/tagged/vscode)
+* [Request a new feature](CONTRIBUTING.md)
+* Upvote [popular feature requests](https://github.com/microsoft/vscode/issues?q=is%3Aopen+is%3Aissue+label%3Afeature-request+sort%3Areactions-%2B1-desc)
+* [File an issue](https://github.com/microsoft/vscode/issues)
+* Connect with the extension author community on [GitHub Discussions](https://github.com/microsoft/vscode-discussions/discussions) or [Slack](https://aka.ms/vscode-dev-community)
+* Follow [@code](https://x.com/code) and let us know what you think!
 
-👉 **[View All Available Releases & Historical Changelogs](https://github.com/Imagen2dragon/Aether-IDE/releases)**
+See our [wiki](https://github.com/microsoft/vscode/wiki/Feedback-Channels) for a description of each of these channels and information on some other available community-driven channels.
 
-### 🔒 Cryptographic SHA-256 Verification
+## Related Projects
 
-To verify the integrity of your downloaded package, compare its computed hash with the published `.sha256` digest:
+Many of the core components and extensions to VS Code live in their own repositories on GitHub. For example, the [node debug adapter](https://github.com/microsoft/vscode-node-debug) and the [mono debug adapter](https://github.com/microsoft/vscode-mono-debug) repositories are separate from each other. For a complete list, please visit the [Related Projects](https://github.com/microsoft/vscode/wiki/Related-Projects) page on our [wiki](https://github.com/microsoft/vscode/wiki).
 
-**Windows (PowerShell):**
-```powershell
-Get-FileHash -Algorithm SHA256 .\AetherIDE-Setup-0.1.0-beta.3-x64.exe
-```
+## Bundled Extensions
 
-**Linux / macOS (Terminal):**
-```bash
-sha256sum -c AetherIDE-v0.1.0-beta.3-linux-x64.tar.gz.sha256
-# or on macOS:
-shasum -a 256 -c AetherIDE-v0.1.0-beta.3-macos-arm64.tar.gz.sha256
-```
+VS Code includes a set of built-in extensions located in the [extensions](extensions) folder, including grammars and snippets for many languages. Extensions that provide rich language support (inline suggestions, Go to Definition) for a language have the suffix `language-features`. For example, the `json` extension provides coloring for `JSON` and the `json-language-features` extension provides rich language support for `JSON`.
 
-### 💻 Installation & Operating System Support
+## Development Container
 
-- **Windows 10/11 x64:** Run `AetherIDE-Setup-0.1.0-beta.3-x64.exe` to perform a non-administrative, per-user installation (installs to `%LOCALAPPDATA%\Programs\AetherIDE`). Creates Start Menu and optional Desktop shortcuts, registers the clean uninstaller, and optionally adds the `aether` CLI to your user `PATH`.
-  > *Note on Code Signing:* As an open-source beta release, binaries are compiled deterministically and published with authoritative SHA-256 checksums without a paid commercial EV certificate. When launching the installer, Windows SmartScreen may show an "Unknown Publisher" prompt. Click **More info** -> **Run anyway**.
-- **Linux x64:** Extract the `.tar.gz` archive to your desired location (e.g., `tar -xzf AetherIDE-v0.1.0-beta.3-linux-x64.tar.gz -C ~/.local/share/`) and execute `./AetherIDE`. Requires `glibc 2.35+`, `webkit2gtk-4.1` (or `4.0`), and `gnome-keyring` / `dbus`.
-- **macOS ARM64:** Extract `AetherIDE-v0.1.0-beta.3-macos-arm64.tar.gz` and move `AetherIDE.app` to `/Applications`. Requires Apple Silicon (M1/M2/M3/M4) running macOS 13 (Ventura) or newer.
+This repository includes a Visual Studio Code Dev Containers / GitHub Codespaces development container.
 
-For complete release details and changelog, see the [v0.1.0-beta.3 Release Notes](docs/RELEASE_NOTES.md).
+* For [Dev Containers](https://aka.ms/vscode-remote/download/containers), use the **Dev Containers: Clone Repository in Container Volume...** command, which creates a Docker volume for better disk I/O on macOS and Windows.
+  * If you already have VS Code and Docker installed, you can also click [here](https://vscode.dev/redirect?url=vscode://ms-vscode-remote.remote-containers/cloneInVolume?url=https://github.com/microsoft/vscode) to get started. This will cause VS Code to automatically install the Dev Containers extension if needed, clone the source code into a container volume, and spin up a dev container for use.
 
----
+* For Codespaces, install the [GitHub Codespaces](https://marketplace.visualstudio.com/items?itemName=GitHub.codespaces) extension in VS Code, and use the **Codespaces: Create New Codespace** command.
 
-## 🚀 Key Architectural Pillars
+Docker / the Codespace should have at least **4 cores and 6 GB of RAM (8 GB recommended)** to run a full build. See the [development container README](.devcontainer/README.md) for more information.
 
-### 1. 🦀 Rust-First Core (`rust/`)
-- **24 Modular Crates:** Including `application-core`, `ipc-protocol`, `filesystem-engine`, `database-engine`, `symbol-index`, `process-manager`, `model-gateway`, `agent-orchestrator`, `terminal-manager`, `workspace-sync`, and `diagnostics`.
-- **Storage-Aware External Build Cache:** Compilation cache offloaded to `%LOCALAPPDATA%\AetherIDE\build-cache\` with zero OneDrive lockups, reclaiming 11.81 GB (net 2.49 GB footprint).
-- **Cross-Platform Native Subsystems:** `TerminalBackend` trait supporting Windows ConPTY and Unix/macOS POSIX OpenPTY; `DesktopHost` trait supporting Win32 WebView2, Linux WebKitGTK, and macOS WKWebView.
-- **Real-Time CRDT Collaboration:** Yrs (Yjs V1 compatible) deterministic synchronization with ephemeral cursor tracking and Ed25519 Role-Based Access Control.
-- **Autonomous AI Swarms & Three-Way Merging:** DAG task scheduling with Kahn's cycle detection, isolated Git worktrees, and visual 3-way conflict resolution.
-- **High-Speed IPC:** Windows Named Pipes (`\\.\pipe\aether-daemon-ipc`) and authenticated loopback TCP.
-- **Embedded Storage:** SQLite with WAL mode, memory-mapped I/O, and FTS5 full-text code search.
+## Code of Conduct
 
-### 2. 🤖 14-Persona Autonomous AI Engineering Team (`crates/agent-orchestrator`)
-- **Specialized Roles:** Principal Architect, Frontend Developer, Backend Developer, Database Engineer, Mobile Developer, Rust/C++ Systems Engineer, Debugging Specialist, Testing Specialist, Security Reviewer, Code Reviewer, DevOps Engineer, Technical Researcher, Documentation Engineer, Performance Engineer.
-- **3 Autonomy Modes:**
-  - *Observe Mode:* Read-only analysis and proposal formulation.
-  - *Assist Mode:* User approval required for all staged changes.
-  - *Autopilot Mode:* Autonomous execution within sandboxed Git worktrees.
-- **Proof of Work Ledger:** Verifiable cryptographic audit trail of every prompt, plan, diff, command output, and test pass/fail assertion.
+This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/). For more information, see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
 
-### 3. 🧠 Living Project Brain & Change Impact Radar (`crates/project-brain`)
-- Real-time dependency graph mapping modules, endpoints, schemas, and tests.
-- Blast radius calculation warning developers of downstream breakage before edits are committed.
+## License
 
-### 4. 📱 Mobile App Studio (`mobile-studio/` & `crates/mobile-build-manager`)
-- Dedicated IDE workspace for building cross-platform mobile apps.
-- Default stack: **React Native + Expo SDK 52 + TypeScript + Expo Router**.
-- Visual Screen Designer with responsive device frames (iPhone 16 Pro, Google Pixel 9, iPad).
-- Automated cloud builds via EAS generating Android APK/AAB and iOS IPA packages.
+Copyright (c) Microsoft Corporation. All rights reserved.
 
-### 5. 📱 iOS & iPadOS Companion Client (`apps/ios-companion/`)
-- Native SwiftUI companion application with shared Rust UniFFI native bridge.
-- Secure QR-code pairing, remote agent control, change approval, and terminal streaming.
-
-### 6. 🌐 Web Workspace & Collaboration (`apps/web-workspace/`)
-- Browser-based cloud workspace connecting to local or remote Aether daemons.
-
----
-
-## 📂 Repository Topology
-
-```
-ide/
-├── apps/
-│   ├── desktop/              # Windows desktop IDE application (Electron / Code - OSS integration)
-│   ├── ios-companion/        # SwiftUI + Rust UniFFI native iOS companion
-│   └── web-workspace/        # React + TypeScript Web IDE client
-├── rust/                     # Complete Rust Workspace (21 Crates)
-│   ├── Cargo.toml
-│   ├── crates/
-│   │   ├── application-core/
-│   │   ├── ipc-protocol/
-│   │   ├── security-core/
-│   │   ├── permission-engine/
-│   │   ├── database-engine/
-│   │   ├── filesystem-engine/
-│   │   ├── syntax-engine/
-│   │   ├── symbol-index/
-│   │   ├── project-indexer/
-│   │   ├── process-manager/
-│   │   ├── git-engine/
-│   │   ├── terminal-manager/
-│   │   ├── model-gateway/
-│   │   ├── agent-runtime/
-│   │   ├── agent-orchestrator/
-│   │   ├── project-brain/
-│   │   ├── checkpoint-engine/
-│   │   ├── diagnostics/
-│   │   └── mobile-build-manager/
-│   ├── services/
-│   │   └── aether-daemon/    # Native background service binary
-│   └── cli/
-│       └── aether-cli/       # Developer CLI binary
-├── extensions/
-│   └── aether-core/          # Core TypeScript IDE extension
-├── scripts/                  # Automated build, test, and packaging scripts
-├── docs/                     # Specifications, architecture, guides, audit records
-└── IMPLEMENTATION_STATUS.md
-```
-
----
-
-## ⚡ Quickstart
-
-### 1. Diagnose Development Environment
-```powershell
-cd rust
-cargo run --bin aether-cli -- doctor
-```
-
-### 2. Build and Launch Aether Daemon
-```powershell
-cd rust
-cargo run --bin aether-daemon
-```
-
-### 3. Test CLI Operations
-```powershell
-# Ping daemon
-cargo run --bin aether-cli -- ping
-
-# Index current codebase
-cargo run --bin aether-cli -- index .
-
-# Search symbol index
-cargo run --bin aether-cli -- search ProjectIndexer
-
-# Dispatch an autonomous agent
-cargo run --bin aether-cli -- agent architect "Audit codebase structure"
-
-# Scaffold a React Native + Expo mobile application
-cargo run --bin aether-cli -- mobile create AetherStore
-```
-
-### 4. Build Windows Release Package
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_release.ps1
-powershell -ExecutionPolicy Bypass -File .\scripts\package_portable_zip.ps1
-```
-
----
-
-## 📄 Documentation Directory
-- [Product Vision](docs/PRODUCT_VISION.md)
-- [Product Requirements (PRD)](docs/PRODUCT_REQUIREMENTS.md)
-- [System Architecture](docs/ARCHITECTURE.md)
-- [Implementation Plan](docs/IMPLEMENTATION_PLAN.md)
-- [Security & Threat Model](docs/SECURITY.md)
-- [Performance & Benchmarks](docs/PERFORMANCE_PLAN.md)
-- [Acceptance Criteria](docs/ACCEPTANCE_CRITERIA.md)
-- [Technical Risk Register](docs/TECHNICAL_RISK_REGISTER.md)
-- [Development Setup](docs/DEVELOPMENT_SETUP.md)
-- [Windows Build Guide](docs/WINDOWS_BUILD.md)
-- [iOS Companion Guide](docs/IOS_BUILD.md)
-- [Mobile App Studio Guide](docs/MOBILE_APP_GUIDE.md)
-- [AI Model Gateway Guide](docs/AI_MODEL_GUIDE.md)
-- [Autonomous Agents Guide](docs/AGENT_GUIDE.md)
-- [Model Context Protocol (MCP)](docs/MCP_GUIDE.md)
-- [Extension Development](docs/EXTENSION_DEVELOPMENT.md)
-- [Deployment Guide](docs/DEPLOYMENT.md)
-- [Troubleshooting](docs/TROUBLESHOOTING.md)
-- [Release Notes](docs/RELEASE_NOTES.md)
-- [Known Limitations](docs/KNOWN_LIMITATIONS.md)
-
----
-
-## 🛡️ License
-Licensed under the [MIT License](LICENSE).
+Licensed under the [MIT](LICENSE.txt) license.
