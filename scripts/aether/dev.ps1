@@ -51,7 +51,7 @@ if (-not $PnpmDirectory) {
 		$hasher = [Security.Cryptography.SHA512]::Create()
 		try { $integrity = 'sha512-' + [Convert]::ToBase64String($hasher.ComputeHash([IO.File]::ReadAllBytes($archive))) }
 		finally { $hasher.Dispose() }
-		if ($integrity -ne $metadata.dist.integrity) { throw 'pnpm archive integrity mismatch.' }
+		if ($integrity -cne $metadata.dist.integrity) { throw 'pnpm archive integrity mismatch.' }
 		New-Item -ItemType Directory -Path $PnpmDirectory -Force | Out-Null
 		& tar -xzf $archive -C $PnpmDirectory --strip-components=1
 		if ($LASTEXITCODE -ne 0) { throw 'Could not extract pnpm.' }
