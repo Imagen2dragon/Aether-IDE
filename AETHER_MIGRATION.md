@@ -32,7 +32,8 @@ The bootstrap verifies downloaded Node archives with official SHA-256 checksums 
 - Bootstrap PowerShell syntax parsed successfully.
 - Verified Node `24.22.1` and pnpm `12.16.0` ran successfully.
 - Frozen-lockfile dependency installation reached native compilation, then failed because node-gyp could not find a registered Windows SDK in the incomplete Visual Studio installation.
-- Native prerequisite repair is in progress. Build, launch, file save, dirty-file close, terminal, extension-host and recovery checks remain pending. This baseline must stay a draft until those checks pass.
+- Administrator prerequisite repair started, but its download log stopped advancing during a Spectre library download. Build, launch, file save, dirty-file close, terminal, extension-host and recovery checks remain pending. This baseline must stay a draft until those checks pass.
+- Both upstream LFS assets uploaded successfully. Publishing the Git branch remains unverified after repeated GitHub TLS closures and HTTP 408 failures; no pull request has been confirmed.
 - The existing installed AetherIDE application has not been replaced by this migration.
 
 ## Following steps, one pull request each
