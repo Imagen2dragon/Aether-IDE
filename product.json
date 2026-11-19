@@ -206,6 +206,12 @@
 	],
 	"onboardingThemes": [
 		{
+			"id": "aether-obsidian",
+			"label": "Aether Obsidian",
+			"themeId": "Aether Obsidian",
+			"type": "dark"
+		},
+		{
 			"id": "dark-2026",
 			"label": "Dark 2026",
 			"themeId": "Dark 2026",
