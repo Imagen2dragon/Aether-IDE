@@ -6,7 +6,9 @@ param(
 	[ValidateSet('Setup', 'Install', 'Build', 'Electron')]
 	[string] $Task = 'Setup',
 	[string] $NodeDirectory,
-	[string] $PnpmDirectory
+	[string] $PnpmDirectory,
+	[switch] $SkipDictationRuntime,
+	[switch] $SkipBrowserDownload
 )
 
 $ErrorActionPreference = 'Stop'
@@ -65,12 +67,22 @@ $previousPath = $env:PATH
 $previousPnpmHome = $env:PNPM_HOME
 $previousFrozenLockfile = $env:PNPM_CONFIG_FROZEN_LOCKFILE
 $previousRegistry = $env:npm_config_registry
+$previousFoundrySkip = $env:FOUNDRY_LOCAL_SKIP_INSTALL
+$previousBrowserSkip = $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD
 try {
 	$env:PATH = $NodeDirectory + ';' + $env:PATH
 	$env:PNPM_HOME = Join-Path $toolsRoot 'pnpm-home'
 	# Upstream postinstall installs additional roots. Propagate the policy to them.
 	$env:PNPM_CONFIG_FROZEN_LOCKFILE = 'true'
 	$env:npm_config_registry = 'https://registry.npmjs.org'
+	if ($Task -eq 'Install' -and $SkipDictationRuntime) {
+		$env:FOUNDRY_LOCAL_SKIP_INSTALL = '1'
+		Write-Warning 'Source preview: local dictation runtime is omitted and must be installed before validating dictation.'
+	}
+	if ($Task -eq 'Install' -and $SkipBrowserDownload) {
+		$env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = '1'
+		Write-Warning 'Source preview: browser test runtime download is omitted; browser tests remain pending.'
+	}
 	$actualPnpm = & $nodeExe $pnpmLauncher --version
 	if ($LASTEXITCODE -ne 0 -or $actualPnpm -ne $pnpmVersion) { throw "Expected pnpm $pnpmVersion; got $actualPnpm" }
 	Write-Output "Node $actualNode; pnpm $actualPnpm; task $Task"
@@ -88,4 +100,6 @@ try {
 	$env:PNPM_HOME = $previousPnpmHome
 	$env:PNPM_CONFIG_FROZEN_LOCKFILE = $previousFrozenLockfile
 	$env:npm_config_registry = $previousRegistry
+	$env:FOUNDRY_LOCAL_SKIP_INSTALL = $previousFoundrySkip
+	$env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = $previousBrowserSkip
 }

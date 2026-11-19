@@ -26,6 +26,8 @@ git lfs pull
 
 The bootstrap verifies downloaded Node archives with official SHA-256 checksums and pnpm archives with npm SHA-512 integrity metadata. Downloads and dependency stores stay under ignored `.build/aether-tools`. Existing installations can be supplied through `-NodeDirectory` and `-PnpmDirectory`; their versions are checked before use.
 
+For the desktop source preview when the optional runtime downloads are unavailable, use `./scripts/aether/dev.ps1 -Task Install -SkipDictationRuntime -SkipBrowserDownload`. These explicit options print their limitations and restore the calling environment afterward. Local dictation and browser-suite validation remain pending; Electron is still required for desktop validation.
+
 ## Step 1 validation
 
 - Pristine source import and existing-main ancestry verified.
@@ -35,7 +37,7 @@ The bootstrap verifies downloaded Node archives with official SHA-256 checksums 
 - The administrator repair installed the missing Spectre libraries. Subsequent native builds passed the previous `MSB8040` failure.
 - Foundry's local dictation runtime download failed across its configured feeds. The source preview uses the SDK's documented `FOUNDRY_LOCAL_SKIP_INSTALL=1` option; local dictation is unavailable and is not an acceptance claim. To reproduce that preview, set this environment variable only for the `Install` command, then restore it. A full release needs the runtime installed and tested.
 - Build, launch, file save, dirty-file close, terminal, extension-host and recovery checks remain pending. This baseline must stay a draft until those checks pass.
-- Both upstream LFS assets uploaded successfully. Publishing the Git branch remains unverified after repeated GitHub TLS closures and HTTP 408 failures; no pull request has been confirmed.
+- Both upstream LFS assets and the migration branch uploaded successfully. Review: https://github.com/Imagen2dragon/Aether-IDE/pull/29 (draft).
 - The existing installed AetherIDE application has not been replaced by this migration.
 
 ## Following steps, one pull request each
