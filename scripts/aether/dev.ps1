@@ -3,7 +3,7 @@
 
 [CmdletBinding()]
 param(
-	[ValidateSet('Setup', 'Install', 'Build', 'Electron', 'Launch')]
+	[ValidateSet('Setup', 'Install', 'Build', 'Electron', 'Launch', 'Package')]
 	[string] $Task = 'Setup',
 	[string] $NodeDirectory,
 	[string] $PnpmDirectory,
@@ -95,6 +95,11 @@ try {
 		switch ($Task) {
 			'Install' { & $nodeExe $pnpmLauncher install --frozen-lockfile --registry=https://registry.npmjs.org --store-dir (Join-Path $toolsRoot 'store') }
 			'Build' { & $nodeExe $pnpmLauncher run build-fast }
+			'Package' {
+				$pendingChanges = & git status --porcelain
+				if ($LASTEXITCODE -ne 0 -or $pendingChanges) { throw 'Commit the source changes before packaging so the embedded revision identifies the build.' }
+				& $nodeExe $pnpmLauncher run gulp vscode-win32-x64
+			}
 			'Electron' { & $nodeExe $pnpmLauncher run electron }
 			'Launch' {
 				& $nodeExe build/lib/preLaunch.ts
