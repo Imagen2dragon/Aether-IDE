@@ -6,7 +6,7 @@
       <stop offset="60%" stop-color="#0F172A" stop-opacity="0.95" />
       <stop offset="100%" stop-color="#070A11" stop-opacity="1" />
     </radialGradient>
-    
+
     <linearGradient id="squircleBorder" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.9" />
       <stop offset="30%" stop-color="#28D7F2" stop-opacity="0.4" />
@@ -88,14 +88,14 @@
              L 216 776
              L 344 776
              L 512 436
-             L 512 168 Z" 
+             L 512 168 Z"
           fill="url(#cyanBeam)" />
 
     <!-- Left Wing Highlights & Chamfer -->
     <path d="M 512 168
              L 216 776
              L 248 776
-             L 512 232 Z" 
+             L 512 232 Z"
           fill="#FFFFFF" opacity="0.25" />
 
     <!-- Right Wing (Violet Beam) -->
@@ -103,14 +103,14 @@
              L 808 776
              L 680 776
              L 512 436
-             L 512 168 Z" 
+             L 512 168 Z"
           fill="url(#violetBeam)" />
 
     <!-- Right Wing Specular -->
     <path d="M 512 168
              L 512 232
              L 776 776
-             L 808 776 Z" 
+             L 808 776 Z"
           fill="#FFFFFF" opacity="0.18" />
 
     <!-- Quantum Horizon Cross-Bridge -->
