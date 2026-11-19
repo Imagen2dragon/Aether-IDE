@@ -1,0 +1,5 @@
+{
+	"buildIOS": "Build iOS App With xtool",
+	"listIOSDevices": "List iOS Devices",
+	"wslDistribution": "WSL distribution containing xtool. Leave empty to use the default WSL distribution."
+}
