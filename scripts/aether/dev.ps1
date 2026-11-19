@@ -96,6 +96,12 @@ try {
 			'Install' { & $nodeExe $pnpmLauncher install --frozen-lockfile --registry=https://registry.npmjs.org --store-dir (Join-Path $toolsRoot 'store') }
 			'Build' { & $nodeExe $pnpmLauncher run build-fast }
 			'Package' {
+				$sdkBinRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin'
+				$sdkBin = Get-ChildItem -LiteralPath $sdkBinRoot -Directory -ErrorAction SilentlyContinue |
+					Where-Object { $_.Name -match '^10\.\d+\.\d+\.\d+$' -and (Test-Path -LiteralPath (Join-Path $_.FullName 'x64/signtool.exe')) } |
+					Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+				if (-not $sdkBin) { throw 'Windows SDK x64 signing tools are required for packaging.' }
+				$env:PATH = (Join-Path $sdkBin.FullName 'x64') + ';' + $env:PATH
 				$pendingChanges = & git status --porcelain
 				if ($LASTEXITCODE -ne 0 -or $pendingChanges) { throw 'Commit the source changes before packaging so the embedded revision identifies the build.' }
 				& $nodeExe $pnpmLauncher run gulp vscode-win32-x64
