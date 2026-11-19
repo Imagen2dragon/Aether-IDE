@@ -31,8 +31,10 @@ The bootstrap verifies downloaded Node archives with official SHA-256 checksums 
 - Pristine source import and existing-main ancestry verified.
 - Bootstrap PowerShell syntax parsed successfully.
 - Verified Node `24.22.1` and pnpm `12.16.0` ran successfully.
-- Frozen-lockfile dependency installation reached native compilation, then failed because node-gyp could not find a registered Windows SDK in the incomplete Visual Studio installation.
-- Administrator prerequisite repair started, but its download log stopped advancing during a Spectre library download. Build, launch, file save, dirty-file close, terminal, extension-host and recovery checks remain pending. This baseline must stay a draft until those checks pass.
+- The initial frozen-lockfile dependency installation failed because node-gyp could not find a registered Windows SDK. Administrator prerequisite repair subsequently registered the SDK, and the retry successfully compiled native components including `@parcel/watcher`.
+- The administrator repair installed the missing Spectre libraries. Subsequent native builds passed the previous `MSB8040` failure.
+- Foundry's local dictation runtime download failed across its configured feeds. The source preview uses the SDK's documented `FOUNDRY_LOCAL_SKIP_INSTALL=1` option; local dictation is unavailable and is not an acceptance claim. To reproduce that preview, set this environment variable only for the `Install` command, then restore it. A full release needs the runtime installed and tested.
+- Build, launch, file save, dirty-file close, terminal, extension-host and recovery checks remain pending. This baseline must stay a draft until those checks pass.
 - Both upstream LFS assets uploaded successfully. Publishing the Git branch remains unverified after repeated GitHub TLS closures and HTTP 408 failures; no pull request has been confirmed.
 - The existing installed AetherIDE application has not been replaced by this migration.
 

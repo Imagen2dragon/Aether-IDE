@@ -63,9 +63,14 @@ if (-not $PnpmDirectory) {
 $pnpmLauncher = Join-Path $PnpmDirectory 'bin/pnpm.mjs'
 $previousPath = $env:PATH
 $previousPnpmHome = $env:PNPM_HOME
+$previousFrozenLockfile = $env:PNPM_CONFIG_FROZEN_LOCKFILE
+$previousRegistry = $env:npm_config_registry
 try {
 	$env:PATH = $NodeDirectory + ';' + $env:PATH
 	$env:PNPM_HOME = Join-Path $toolsRoot 'pnpm-home'
+	# Upstream postinstall installs additional roots. Propagate the policy to them.
+	$env:PNPM_CONFIG_FROZEN_LOCKFILE = 'true'
+	$env:npm_config_registry = 'https://registry.npmjs.org'
 	$actualPnpm = & $nodeExe $pnpmLauncher --version
 	if ($LASTEXITCODE -ne 0 -or $actualPnpm -ne $pnpmVersion) { throw "Expected pnpm $pnpmVersion; got $actualPnpm" }
 	Write-Output "Node $actualNode; pnpm $actualPnpm; task $Task"
@@ -81,4 +86,6 @@ try {
 } finally {
 	$env:PATH = $previousPath
 	$env:PNPM_HOME = $previousPnpmHome
+	$env:PNPM_CONFIG_FROZEN_LOCKFILE = $previousFrozenLockfile
+	$env:npm_config_registry = $previousRegistry
 }
