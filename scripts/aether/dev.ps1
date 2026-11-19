@@ -3,12 +3,13 @@
 
 [CmdletBinding()]
 param(
-	[ValidateSet('Setup', 'Install', 'Build', 'Electron')]
+	[ValidateSet('Setup', 'Install', 'Build', 'Electron', 'Launch')]
 	[string] $Task = 'Setup',
 	[string] $NodeDirectory,
 	[string] $PnpmDirectory,
 	[switch] $SkipDictationRuntime,
-	[switch] $SkipBrowserDownload
+	[switch] $SkipBrowserDownload,
+	[string] $OpenPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -69,12 +70,15 @@ $previousFrozenLockfile = $env:PNPM_CONFIG_FROZEN_LOCKFILE
 $previousRegistry = $env:npm_config_registry
 $previousFoundrySkip = $env:FOUNDRY_LOCAL_SKIP_INSTALL
 $previousBrowserSkip = $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD
+$previousNpmExecPath = $env:npm_execpath
+$previousSkipPrelaunch = $env:VSCODE_SKIP_PRELAUNCH
 try {
 	$env:PATH = $NodeDirectory + ';' + $env:PATH
 	$env:PNPM_HOME = Join-Path $toolsRoot 'pnpm-home'
 	# Upstream postinstall installs additional roots. Propagate the policy to them.
 	$env:PNPM_CONFIG_FROZEN_LOCKFILE = 'true'
 	$env:npm_config_registry = 'https://registry.npmjs.org'
+	$env:npm_execpath = $pnpmLauncher
 	if ($Task -eq 'Install' -and $SkipDictationRuntime) {
 		$env:FOUNDRY_LOCAL_SKIP_INSTALL = '1'
 		Write-Warning 'Source preview: local dictation runtime is omitted and must be installed before validating dictation.'
@@ -92,6 +96,14 @@ try {
 			'Install' { & $nodeExe $pnpmLauncher install --frozen-lockfile --registry=https://registry.npmjs.org --store-dir (Join-Path $toolsRoot 'store') }
 			'Build' { & $nodeExe $pnpmLauncher run build-fast }
 			'Electron' { & $nodeExe $pnpmLauncher run electron }
+			'Launch' {
+				& $nodeExe build/lib/preLaunch.ts
+				if ($LASTEXITCODE -ne 0) { throw 'Desktop prelaunch preparation failed.' }
+				$env:VSCODE_SKIP_PRELAUNCH = '1'
+				$launchArgs = @('--new-window', '--user-data-dir', (Join-Path $repoRoot '.build/aether-user-data'), '--extensions-dir', (Join-Path $repoRoot '.build/aether-extensions'))
+				if ($OpenPath) { $launchArgs += $OpenPath }
+				& ./scripts/code.bat @launchArgs
+			}
 		}
 		if ($Task -ne 'Setup' -and $LASTEXITCODE -ne 0) { throw "$Task failed with exit code $LASTEXITCODE" }
 	} finally { Pop-Location }
@@ -102,4 +114,6 @@ try {
 	$env:npm_config_registry = $previousRegistry
 	$env:FOUNDRY_LOCAL_SKIP_INSTALL = $previousFoundrySkip
 	$env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = $previousBrowserSkip
+	$env:npm_execpath = $previousNpmExecPath
+	$env:VSCODE_SKIP_PRELAUNCH = $previousSkipPrelaunch
 }
