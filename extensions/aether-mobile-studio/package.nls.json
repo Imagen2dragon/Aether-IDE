@@ -1,0 +1,7 @@
+{
+	"displayName": "Mobile Studio",
+	"description": "Build Android apps and inspect connected devices from AetherIDE.",
+	"debugApk": "Build Debug APK",
+	"releaseBundle": "Build Release App Bundle",
+	"listDevices": "List Android Devices"
+}

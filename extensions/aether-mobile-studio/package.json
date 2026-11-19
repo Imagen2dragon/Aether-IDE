@@ -1,0 +1,35 @@
+{
+	"name": "aether-mobile-studio",
+	"displayName": "%displayName%",
+	"description": "%description%",
+	"publisher": "aether",
+	"version": "0.1.0",
+	"license": "MIT",
+	"engines": { "vscode": "^1.148.0" },
+	"extensionKind": ["workspace"],
+	"main": "./extension.js",
+	"capabilities": {
+		"virtualWorkspaces": false,
+		"untrustedWorkspaces": { "supported": true }
+	},
+	"contributes": {
+		"commands": [
+			{ "command": "aether.mobile.debugApk", "title": "%debugApk%", "category": "%displayName%" },
+			{ "command": "aether.mobile.releaseBundle", "title": "%releaseBundle%", "category": "%displayName%" },
+			{ "command": "aether.mobile.listDevices", "title": "%listDevices%", "category": "%displayName%" }
+		],
+		"taskDefinitions": [
+			{
+				"type": "aether-android",
+				"required": ["operation"],
+				"properties": { "operation": { "type": "string", "enum": ["debugApk", "releaseBundle", "listDevices"] } }
+			}
+		],
+		"viewsContainers": {
+			"activitybar": [{ "id": "aether-mobile", "title": "%displayName%", "icon": "./mobile.svg" }]
+		},
+		"views": {
+			"aether-mobile": [{ "id": "aether.mobile.android", "name": "Android" }]
+		}
+	}
+}
