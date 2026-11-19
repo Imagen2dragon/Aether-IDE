@@ -1,0 +1,99 @@
+{
+	"name": "aether-engineering-team",
+	"displayName": "Aether Engineering Team",
+	"description": "Read-only specialist roles for AetherIDE Chat.",
+	"version": "0.1.0",
+	"publisher": "aether",
+	"license": "MIT",
+	"engines": {
+		"vscode": "^1.148.0"
+	},
+	"contributes": {
+		"chatAgents": [
+			{
+				"path": "./agents/architect.agent.md",
+				"sessionTypes": [
+					"local"
+				]
+			},
+			{
+				"path": "./agents/frontend.agent.md",
+				"sessionTypes": [
+					"local"
+				]
+			},
+			{
+				"path": "./agents/backend.agent.md",
+				"sessionTypes": [
+					"local"
+				]
+			},
+			{
+				"path": "./agents/database.agent.md",
+				"sessionTypes": [
+					"local"
+				]
+			},
+			{
+				"path": "./agents/mobile.agent.md",
+				"sessionTypes": [
+					"local"
+				]
+			},
+			{
+				"path": "./agents/systems.agent.md",
+				"sessionTypes": [
+					"local"
+				]
+			},
+			{
+				"path": "./agents/debugging.agent.md",
+				"sessionTypes": [
+					"local"
+				]
+			},
+			{
+				"path": "./agents/testing.agent.md",
+				"sessionTypes": [
+					"local"
+				]
+			},
+			{
+				"path": "./agents/security.agent.md",
+				"sessionTypes": [
+					"local"
+				]
+			},
+			{
+				"path": "./agents/review.agent.md",
+				"sessionTypes": [
+					"local"
+				]
+			},
+			{
+				"path": "./agents/devops.agent.md",
+				"sessionTypes": [
+					"local"
+				]
+			},
+			{
+				"path": "./agents/research.agent.md",
+				"sessionTypes": [
+					"local"
+				]
+			},
+			{
+				"path": "./agents/documentation.agent.md",
+				"sessionTypes": [
+					"local"
+				]
+			},
+			{
+				"path": "./agents/performance.agent.md",
+				"sessionTypes": [
+					"local"
+				]
+			}
+		]
+	}
+}
