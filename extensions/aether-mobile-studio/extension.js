@@ -18,6 +18,9 @@ function taskGroup(operation) {
 	if (operation === 'debugApk' || operation === 'releaseBundle') {
 		return 'build';
 	}
+	if (operation === 'unitTests' || operation === 'instrumentedTests') {
+		return 'tests';
+	}
 	if (operation === 'openLogcat') {
 		return 'logcat';
 	}
@@ -28,6 +31,8 @@ function activate(context) {
 	const actions = [
 		{ id: 'debugApk', label: vscode.l10n.t('Build Debug APK'), icon: 'package', gradleTask: 'assembleDebug', artifacts: '**/build/outputs/apk/**/debug/*.apk' },
 		{ id: 'releaseBundle', label: vscode.l10n.t('Build Release App Bundle'), icon: 'archive', gradleTask: 'bundleRelease', artifacts: '**/build/outputs/bundle/{release,*Release}/*.aab' },
+		{ id: 'unitTests', label: vscode.l10n.t('Run Unit Tests'), icon: 'beaker', gradleTask: 'testDebugUnitTest', test: true },
+		{ id: 'instrumentedTests', label: vscode.l10n.t('Run Instrumented Tests'), icon: 'device-mobile', gradleTask: 'connectedDebugAndroidTest', test: true, requiresDevice: true },
 		{ id: 'listDevices', label: vscode.l10n.t('List Android Devices'), icon: 'device-mobile' },
 		{ id: 'startEmulator', label: vscode.l10n.t('Start Android Emulator'), icon: 'vm' },
 		{ id: 'installApk', label: vscode.l10n.t('Install APK on Device'), icon: 'cloud-download' },
@@ -103,7 +108,7 @@ function activate(context) {
 				const build = action.gradleTask ? await createBuildTask(action) : undefined;
 				const task = action.gradleTask ? build?.task : await createDeviceTask(action, entry?.uri);
 				if (task) {
-					if (build) {
+					if (build?.artifacts) {
 						run = buildOutput.track(task, build.root, action.artifacts);
 					}
 					const execution = await vscode.tasks.executeTask(task);
@@ -138,6 +143,22 @@ async function isFile(uri) {
 }
 
 async function createBuildTask(action) {
+	if (action.requiresDevice) {
+		const adb = await findAdb();
+		const result = await runTool(adb, ['devices', '-l']);
+		if (!result.available) {
+			void vscode.window.showWarningMessage(vscode.l10n.t('ADB is required for instrumented tests. Install Android SDK Platform Tools first.'));
+			return;
+		}
+		if (!result.output.split(/\r?\n/).some(line => /^\S+\s+device(?:\s|$)/.test(line))) {
+			const startEmulator = vscode.l10n.t('Start Emulator');
+			const choice = await vscode.window.showWarningMessage(vscode.l10n.t('Connect an Android device or start an emulator before running instrumented tests.'), startEmulator);
+			if (choice === startEmulator) {
+				await vscode.commands.executeCommand('aether.mobile.startEmulator');
+			}
+			return;
+		}
+	}
 	const wrapper = process.platform === 'win32' ? 'gradlew.bat' : 'gradlew';
 	const projects = [];
 	for (const folder of vscode.workspace.workspaceFolders ?? []) {
@@ -162,8 +183,12 @@ async function createBuildTask(action) {
 	const execution = new vscode.ShellExecution(project.launcher.fsPath, [action.gradleTask, '--console=plain'], {
 		cwd: project.root.fsPath
 	});
-	const task = new vscode.Task({ type: taskType, operation: action.id, runId: randomUUID() }, project.folder, action.label, 'Mobile Studio', execution);
-	task.group = vscode.TaskGroup.Build;
+	const definition = { type: taskType, operation: action.id };
+	if (action.artifacts) {
+		definition.runId = randomUUID();
+	}
+	const task = new vscode.Task(definition, project.folder, action.label, 'Mobile Studio', execution);
+	task.group = action.test ? vscode.TaskGroup.Test : vscode.TaskGroup.Build;
 	task.presentationOptions = { panel: vscode.TaskPanelKind.Dedicated, showReuseMessage: false };
 	return { task, root: project.root };
 }

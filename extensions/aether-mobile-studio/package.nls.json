@@ -3,6 +3,8 @@
 	"description": "Build Android apps and install APKs on connected devices from AetherIDE.",
 	"debugApk": "Build Debug APK",
 	"releaseBundle": "Build Release App Bundle",
+	"unitTests": "Run Unit Tests",
+	"instrumentedTests": "Run Instrumented Tests",
 	"listDevices": "List Android Devices",
 	"startEmulator": "Start Android Emulator",
 	"checkEnvironment": "Check Android Toolchain",
