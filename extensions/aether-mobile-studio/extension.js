@@ -36,16 +36,43 @@ function activate(context) {
 	];
 	const buildOutput = registerBuildOutput(context, taskType);
 	const outputAction = { id: 'openBuildOutput', label: vscode.l10n.t('Open Build Output'), icon: 'output' };
-
+	const treeChanges = new vscode.EventEmitter();
+	const toolchain = { id: 'toolchain', label: vscode.l10n.t('Toolchain'), description: vscode.l10n.t('SDK, ADB, Java, Gradle'), icon: 'server', collapsibleState: vscode.TreeItemCollapsibleState.Collapsed };
+	let toolchainRows;
+	const refreshToolchain = async () => {
+		toolchainRows = await collectToolchain();
+		toolchain.description = vscode.l10n.t('{0} of {1} ready', toolchainRows.filter(row => row.icon === 'check').length, toolchainRows.length);
+		treeChanges.fire(toolchain);
+	};
+	context.subscriptions.push(treeChanges);
 	context.subscriptions.push(vscode.window.registerTreeDataProvider('aether.mobile.android', {
-		getChildren: () => [...actions, outputAction],
+		onDidChangeTreeData: treeChanges.event,
+		getChildren: async element => {
+			if (element?.id === toolchain.id) {
+				if (!toolchainRows) {
+					await refreshToolchain();
+				}
+				return [
+					{ id: 'checkEnvironment', label: vscode.l10n.t('Refresh Toolchain Check'), icon: 'refresh', command: true },
+					...toolchainRows
+				];
+			}
+			return [toolchain, ...actions, outputAction];
+		},
 		getTreeItem: action => {
-			const item = new vscode.TreeItem(action.label);
+			const item = new vscode.TreeItem(action.label, action.collapsibleState);
+			if (action.description) {
+				item.description = action.description;
+			}
 			item.iconPath = new vscode.ThemeIcon(action.icon);
-			item.command = { command: 'aether.mobile.' + action.id, title: action.label };
+			item.tooltip = action.tooltip;
+			if (action.command || action.id !== toolchain.id && action.kind !== 'diagnostic') {
+				item.command = { command: 'aether.mobile.' + action.id, title: action.label };
+			}
 			return item;
 		}
 	}));
+	context.subscriptions.push(vscode.commands.registerCommand('aether.mobile.checkEnvironment', refreshToolchain));
 
 	const executions = new Map();
 	context.subscriptions.push(vscode.tasks.onDidEndTask(({ execution }) => {
@@ -144,20 +171,139 @@ async function createBuildTask(action) {
 async function findAdb() {
 	const sdk = await findSdk();
 	const executable = process.platform === 'win32' ? 'adb.exe' : 'adb';
-	return sdk ? path.join(sdk, 'platform-tools', executable) : executable;
+	const candidate = sdk && path.join(sdk, 'platform-tools', executable);
+	return candidate && await isFile(vscode.Uri.file(candidate)) ? candidate : executable;
 }
 
 async function findSdk() {
-	const executable = process.platform === 'win32' ? 'adb.exe' : 'adb';
-	const defaultSdk = process.platform === 'win32'
-		? process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Android', 'Sdk')
-		: process.platform === 'darwin' ? path.join(os.homedir(), 'Library', 'Android', 'sdk') : path.join(os.homedir(), 'Android', 'Sdk');
-	for (const sdk of new Set([process.env.ANDROID_HOME, process.env.ANDROID_SDK_ROOT, defaultSdk].filter(Boolean))) {
-		if (await isFile(vscode.Uri.file(path.join(sdk, 'platform-tools', executable)))) {
-			return sdk;
+	for (const sdk of await getSdkCandidates()) {
+		try {
+			const stat = await vscode.workspace.fs.stat(vscode.Uri.file(sdk));
+			if (stat.type & vscode.FileType.Directory) {
+				return sdk;
+			}
+		} catch (error) {
+			if (!(error instanceof vscode.FileSystemError) || error.code !== 'FileNotFound') {
+				throw error;
+			}
 		}
 	}
 	return undefined;
+}
+
+async function getSdkCandidates() {
+	const defaultSdk = process.platform === 'win32'
+		? process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Android', 'Sdk')
+		: process.platform === 'darwin' ? path.join(os.homedir(), 'Library', 'Android', 'sdk') : path.join(os.homedir(), 'Android', 'Sdk');
+	const candidates = [];
+	for (const folder of vscode.workspace.workspaceFolders ?? []) {
+		for (const root of [folder.uri, vscode.Uri.joinPath(folder.uri, 'android')]) {
+			const properties = vscode.Uri.joinPath(root, 'local.properties');
+			if (await isFile(properties)) {
+				const contents = (await vscode.workspace.fs.readFile(properties)).toString();
+				const sdkDir = contents.match(/^\s*sdk\.dir\s*[:=]\s*(.+?)\s*$/m)?.[1]
+					?.replace(/\\\\/g, '\\').replace(/\\:/g, ':');
+				if (sdkDir) {
+					candidates.push(path.isAbsolute(sdkDir) ? sdkDir : path.resolve(root.fsPath, sdkDir));
+				}
+			}
+		}
+	}
+	candidates.push(process.env.ANDROID_HOME, process.env.ANDROID_SDK_ROOT, defaultSdk);
+	const seen = new Set();
+	return candidates.filter(candidate => {
+		if (!candidate) {
+			return false;
+		}
+		const key = process.platform === 'win32' ? path.resolve(candidate).toLowerCase() : path.resolve(candidate);
+		if (seen.has(key)) {
+			return false;
+		}
+		seen.add(key);
+		return true;
+	});
+}
+
+async function collectToolchain() {
+	const sdk = await findSdk();
+	const adb = await findAdb();
+	const emulatorName = process.platform === 'win32' ? 'emulator.exe' : 'emulator';
+	const emulatorCandidate = sdk && path.join(sdk, 'emulator', emulatorName);
+	const emulator = emulatorCandidate && await isFile(vscode.Uri.file(emulatorCandidate)) ? emulatorCandidate : 'emulator';
+	const javaName = process.platform === 'win32' ? 'java.exe' : 'java';
+	const javacName = process.platform === 'win32' ? 'javac.exe' : 'javac';
+	const javaHome = process.env.JAVA_HOME;
+	const javaHomeExecutable = javaHome && path.join(javaHome, 'bin', javaName);
+	const javacHomeExecutable = javaHome && path.join(javaHome, 'bin', javacName);
+	const java = javaHomeExecutable && await isFile(vscode.Uri.file(javaHomeExecutable)) ? javaHomeExecutable : 'java';
+	const javac = javacHomeExecutable && await isFile(vscode.Uri.file(javacHomeExecutable)) ? javacHomeExecutable : 'javac';
+	const [adbResult, emulatorVersion, avdResult, javaResult, javacResult, gradle] = await Promise.all([
+		runTool(adb, ['version']),
+		runTool(emulator, ['-version']),
+		runTool(emulator, ['-list-avds']),
+		runTool(java, ['-version']),
+		runTool(javac, ['-version']),
+		findGradleWrapper()
+	]);
+	const deviceResult = adbResult.available ? await runTool(adb, ['devices', '-l']) : undefined;
+	const avds = avdResult.available ? avdResult.output.split(/\r?\n/).map(name => name.trim()).filter(name => /^[\w.-]+$/.test(name)) : [];
+	const devices = deviceResult?.available ? deviceResult.output.split(/\r?\n/).filter(line => /^\S+\s+device(?:\s|$)/.test(line)).length : 0;
+	const javaVersion = javaResult.available ? javaResult.output.match(/version\s+"?([^"\s]+)/i)?.[1] ?? 'Detected' : undefined;
+	const javacVersion = javacResult.available ? javacResult.output.match(/javac\s+([^\s]+)/i)?.[1] ?? 'Detected' : undefined;
+	const adbVersion = adbResult.available ? adbResult.output.match(/Version\s+([^\s]+)/i)?.[1] ?? 'Detected' : undefined;
+	const emulatorVersionText = emulatorVersion.available ? emulatorVersion.output.match(/version\s+([^\s]+)/i)?.[1] ?? 'Detected' : undefined;
+	return [
+		diagnostic(vscode.l10n.t('Android SDK'), sdk ?? vscode.l10n.t('Not found'), sdk ? vscode.l10n.t('SDK location: {0}', sdk) : vscode.l10n.t('Set ANDROID_HOME or ANDROID_SDK_ROOT'), Boolean(sdk)),
+		diagnostic(vscode.l10n.t('ADB Platform Tools'), adbVersion ? vscode.l10n.t('ADB {0}', adbVersion) : vscode.l10n.t('Not found'), adbVersion ? adb : vscode.l10n.t('Install Android SDK Platform Tools'), Boolean(adbVersion)),
+		diagnostic(vscode.l10n.t('Android Emulator'), emulatorVersionText ? vscode.l10n.t('Emulator {0}', emulatorVersionText) : vscode.l10n.t('Not installed'), avds.length ? vscode.l10n.t('{0} virtual devices: {1}', avds.length, avds.join(', ')) : emulatorVersionText ? vscode.l10n.t('No AVD found. Create one in Device Manager.') : vscode.l10n.t('Install Android Emulator and create an AVD in Device Manager'), Boolean(emulatorVersionText && avds.length)),
+		diagnostic(vscode.l10n.t('Java Development Kit'), javaVersion && javacVersion ? vscode.l10n.t('Java {0} · JDK {1}', javaVersion, javacVersion) : vscode.l10n.t('Incomplete'), javaVersion && javacVersion ? vscode.l10n.t('JDK location: {0}', javaHome ?? vscode.l10n.t('PATH')) : vscode.l10n.t('Install a JDK and set JAVA_HOME or add java and javac to PATH'), Boolean(javaVersion && javacVersion)),
+		diagnostic(vscode.l10n.t('Gradle Wrapper'), gradle ?? vscode.l10n.t('Not found'), gradle ?? vscode.l10n.t('Open an Android Gradle project at its root or in android/'), Boolean(gradle)),
+		diagnostic(vscode.l10n.t('Connected Devices'), devices ? vscode.l10n.t('{0} connected', devices) : vscode.l10n.t('None connected'), devices ? adb : vscode.l10n.t('Connect a device or start an AVD'), devices > 0)
+	];
+}
+
+function diagnostic(label, status, description, ready) {
+	return {
+		id: 'diagnostic-' + label,
+		label,
+		description: status,
+		tooltip: description,
+		icon: ready ? 'check' : 'warning',
+		kind: 'diagnostic'
+	};
+}
+
+async function findGradleWrapper() {
+	const wrapper = process.platform === 'win32' ? 'gradlew.bat' : 'gradlew';
+	for (const folder of vscode.workspace.workspaceFolders ?? []) {
+		for (const root of [folder.uri, vscode.Uri.joinPath(folder.uri, 'android')]) {
+			if (!(await isFile(vscode.Uri.joinPath(root, wrapper))) ||
+				!(await isFile(vscode.Uri.joinPath(root, 'settings.gradle'))) && !(await isFile(vscode.Uri.joinPath(root, 'settings.gradle.kts')))) {
+				continue;
+			}
+			const properties = vscode.Uri.joinPath(root, 'gradle', 'wrapper', 'gradle-wrapper.properties');
+			if (await isFile(properties)) {
+				const contents = (await vscode.workspace.fs.readFile(properties)).toString();
+				const version = contents.match(/^\s*distributionUrl\s*=\s*.*?gradle-([\d.]+)(?:-(?:all|bin))?\.zip/m)?.[1];
+				return vscode.l10n.t('{0} · Gradle {1}', vscode.workspace.asRelativePath(root, true), version ?? vscode.l10n.t('version not declared'));
+			}
+			return vscode.workspace.asRelativePath(root, true);
+		}
+	}
+	return undefined;
+}
+
+async function runTool(executable, args) {
+	try {
+		const { stdout, stderr } = await execFileAsync(executable, args, { windowsHide: true, timeout: 10000, maxBuffer: 256 * 1024 });
+		return { available: true, output: `${stdout}\n${stderr}`.trim() };
+	} catch (error) {
+		if (error.code === 'ENOENT') {
+			return { available: false, output: '' };
+		}
+		const output = `${error.stdout ?? ''}\n${error.stderr ?? ''}`.trim();
+		return { available: Boolean(output), output };
+	}
 }
 
 async function createDeviceTask(action, artifact) {

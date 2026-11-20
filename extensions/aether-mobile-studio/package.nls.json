@@ -5,6 +5,7 @@
 	"releaseBundle": "Build Release App Bundle",
 	"listDevices": "List Android Devices",
 	"startEmulator": "Start Android Emulator",
+	"checkEnvironment": "Check Android Toolchain",
 	"installApk": "Install APK on Device",
 	"launchApp": "Launch App on Device",
 	"openLogcat": "Open Android Logcat",
