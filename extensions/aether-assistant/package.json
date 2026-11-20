@@ -20,7 +20,7 @@
 		},
 		"configurationDefaults": {
 			"workbench.colorTheme": "Aether Obsidian",
-			"workbench.startupEditor": "none",
+			"workbench.startupEditor": "welcomePageInEmptyWorkbench",
 			"workbench.secondarySideBar.defaultVisibility": "visibleInWorkspace",
 			"chat.disableAIFeatures": true,
 			"chat.agent.enabled": false,

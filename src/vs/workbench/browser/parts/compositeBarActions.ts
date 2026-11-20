@@ -5,6 +5,7 @@
 
 import './media/paneCompositePart.css';
 import { localize } from '../../../nls.js';
+import product from '../../../platform/product/common/product.js';
 import { Action, IAction, Separator } from '../../../base/common/actions.js';
 import { $, addDisposableListener, append, clearNode, EventHelper, EventType, getDomNodePagePosition, hide, show } from '../../../base/browser/dom.js';
 import { ICommandService } from '../../../platform/commands/common/commands.js';
@@ -161,6 +162,7 @@ export class CompositeBarActionViewItem extends BaseActionViewItem {
 	protected override readonly options: ICompositeBarActionViewItemOptions;
 
 	private badgeContent: HTMLElement | undefined;
+	private railCaption: HTMLElement | undefined;
 	private readonly badgeDisposable = this._register(new MutableDisposable<DisposableStore>());
 	private mouseUpTimeout: Timeout | undefined;
 	private keybindingLabel: string | undefined | null;
@@ -273,6 +275,9 @@ export class CompositeBarActionViewItem extends BaseActionViewItem {
 
 		// Label
 		this.label = append(container, $('a'));
+		if (product.aetherAssistant && this.options.icon) {
+			this.railCaption = append(container, $('span.aether-rail-caption', { 'aria-hidden': 'true' }));
+		}
 
 		// Badge
 		this.badge = append(container, $('.badge'));
@@ -402,6 +407,15 @@ export class CompositeBarActionViewItem extends BaseActionViewItem {
 
 		if (!this.options.icon) {
 			this.label.textContent = this.action.label;
+		}
+		if (this.railCaption) {
+			switch (this.action.id) {
+				case 'workbench.view.explorer': this.railCaption.textContent = localize('aether.rail.files', "Files"); break;
+				case 'workbench.view.scm': this.railCaption.textContent = localize('aether.rail.git', "Git"); break;
+				case 'workbench.view.debug': this.railCaption.textContent = localize('aether.rail.run', "Run"); break;
+				case 'workbench.view.extension.aether-mobile': this.railCaption.textContent = localize('aether.rail.mobile', "Mobile"); break;
+				default: this.railCaption.textContent = this.action.label;
+			}
 		}
 	}
 

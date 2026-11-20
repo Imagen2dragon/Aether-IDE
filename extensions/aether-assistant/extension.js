@@ -148,9 +148,10 @@ function activate(context) {
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src ${webview.cspSource}">
 <meta name="viewport" content="width=device-width, initial-scale=1"><link rel="stylesheet" href="${resource('assistant.css')}">
 <title>Aether Assistant</title></head><body>
-<main><header><p id="status" role="status">Checking local models…</p><div class="actions"><button id="refresh" type="button">Refresh Models</button><button id="clear" type="button">New Conversation</button></div></header>
+<main><header><div class="choices"><label>Local model<select id="model"></select></label><label>Specialist<select id="role"><option value="">General</option></select></label></div>
+<p id="status" role="status">Checking local models…</p><div class="actions"><button id="refresh" type="button">Refresh Models</button><button id="clear" type="button">New Conversation</button></div></header>
 <section id="messages" role="log" aria-label="Conversation"><p id="empty">Ask a question or paste a snippet. The assistant sees only what you share here.</p></section>
-<form id="composer"><div class="choices"><label>Local model<select id="model"></select></label><label>Specialist<select id="role"><option value="">General</option></select></label></div><label for="prompt">Message</label><textarea id="prompt" rows="3" maxlength="8000" placeholder="Ask Aether…"></textarea>
+<form id="composer"><label for="prompt">Message</label><textarea id="prompt" rows="2" maxlength="8000" placeholder="Ask Aether…"></textarea>
 <footer><span>Ollama</span><button id="stop" type="button" hidden>Stop</button><button id="send" type="submit" disabled>Send</button></footer></form>
 </main><script src="${resource('assistant.js')}"></script></body></html>`;
 		}

@@ -105,6 +105,7 @@ async function createBuildTask(action) {
 	});
 	const task = new vscode.Task({ type: taskType, operation: action.id }, project.folder, action.label, 'Mobile Studio', execution);
 	task.group = vscode.TaskGroup.Build;
+	task.presentationOptions = { panel: vscode.TaskPanelKind.Dedicated, showReuseMessage: false };
 	return task;
 }
 
