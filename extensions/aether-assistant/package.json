@@ -1,0 +1,29 @@
+{
+	"name": "aether-assistant",
+	"displayName": "%name%",
+	"description": "%description%",
+	"version": "0.1.0",
+	"publisher": "aether",
+	"license": "MIT",
+	"engines": { "vscode": "^1.148.0" },
+	"extensionKind": ["ui"],
+	"main": "./extension.js",
+	"capabilities": { "untrustedWorkspaces": { "supported": true } },
+	"contributes": {
+		"commands": [{ "command": "aether.assistant.open", "title": "%open%" }],
+		"keybindings": [{ "command": "aether.assistant.open", "key": "ctrl+alt+i", "mac": "cmd+alt+i" }],
+		"viewsContainers": {
+			"panel": [{ "id": "aether-assistant", "title": "%name%", "icon": "./assistant.svg" }]
+		},
+		"views": {
+			"aether-assistant": [{ "id": "aether.assistant.view", "name": "%name%", "type": "webview" }]
+		},
+		"configurationDefaults": {
+			"workbench.colorTheme": "Aether Obsidian",
+			"workbench.startupEditor": "none",
+			"chat.disableAIFeatures": true,
+			"chat.agent.enabled": false,
+			"workbench.welcomePage.experimentalOnboarding": false
+		}
+	}
+}
