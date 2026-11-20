@@ -18,6 +18,8 @@
 			{ "command": "aether.mobile.releaseBundle", "title": "%releaseBundle%", "category": "%displayName%" },
 			{ "command": "aether.mobile.unitTests", "title": "%unitTests%", "category": "%displayName%" },
 			{ "command": "aether.mobile.instrumentedTests", "title": "%instrumentedTests%", "category": "%displayName%" },
+			{ "command": "aether.mobile.openTestResults", "title": "%testResults%", "category": "%displayName%" },
+			{ "command": "aether.mobile.openTestReport", "title": "%openTestReport%", "category": "%displayName%" },
 			{ "command": "aether.mobile.listDevices", "title": "%listDevices%", "category": "%displayName%" },
 			{ "command": "aether.mobile.startEmulator", "title": "%startEmulator%", "category": "%displayName%" },
 			{ "command": "aether.mobile.checkEnvironment", "title": "%checkEnvironment%", "category": "%displayName%" },
@@ -45,8 +47,14 @@
 		},
 		"views": {
 			"aether-mobile": [{ "id": "aether.mobile.android", "name": "Android" }],
-			"aether-build-output": [{ "id": "aether.mobile.buildOutput", "name": "%buildOutputTitle%" }]
+			"aether-build-output": [
+				{ "id": "aether.mobile.buildOutput", "name": "%buildOutputTitle%" },
+				{ "id": "aether.mobile.testResults", "name": "%testResults%" }
+			]
 		},
-		"viewsWelcome": [{ "view": "aether.mobile.buildOutput", "contents": "%buildOutputEmpty%" }]
+		"viewsWelcome": [
+			{ "view": "aether.mobile.buildOutput", "contents": "%buildOutputEmpty%" },
+			{ "view": "aether.mobile.testResults", "contents": "%testResultsEmpty%" }
+		]
 	}
 }
