@@ -16,35 +16,41 @@ async function request(route, options) {
 
 async function readRoles() {
 	const team = vscode.extensions.getExtension('aether.aether-engineering-team');
-	const roles = new Map();
-	for (const entry of team?.packageJSON.contributes?.chatAgents ?? []) {
-		if (!/^\.\/agents\/[a-z]+\.agent\.md$/.test(entry.path)) {
-			continue;
-		}
-		const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(team.extensionUri, entry.path));
-		const match = new TextDecoder().decode(bytes).match(/^---\r?\nname: Aether (.+)\r?\n[\s\S]*?\r?\n---\r?\n([\s\S]*)$/);
-		if (match) {
-			roles.set(match[1].trim(), match[2].trim());
-		}
-	}
-	return roles;
+	return team ? (await team.activate()).roles : new Map();
 }
 
 function activate(context) {
+	const roles = readRoles().catch(() => new Map());
+	let draft;
+	let publishDraft;
 	context.subscriptions.push(vscode.commands.registerCommand('aether.assistant.open',
 		() => vscode.commands.executeCommand('aether.assistant.view.focus')));
+	context.subscriptions.push(vscode.commands.registerCommand('aether.assistant.prepareDraft', async selection => {
+		if (!(await roles).has(selection?.role)) {
+			return;
+		}
+		draft = { role: selection.role, text: typeof selection.text === 'string' ? selection.text.slice(0, 1200) : '' };
+		await vscode.commands.executeCommand('aether.assistant.open');
+		publishDraft?.();
+	}));
 	context.subscriptions.push(vscode.window.registerWebviewViewProvider('aether.assistant.view', {
 		resolveWebviewView(view) {
 			const webview = view.webview;
 			webview.options = { enableScripts: true, localResourceRoots: [context.extensionUri] };
 			const post = (type, payload = {}) => webview.postMessage({ type, ...payload });
-			const roles = readRoles().catch(() => new Map());
+			publishDraft = () => { if (draft) { void post('draft', { draft }); } };
 			let models = [];
 			let discovery = 0;
 			let active;
 			let history = [];
 			let conversation;
 			const messageListener = webview.onDidReceiveMessage(async message => {
+				if (message?.type === 'draftApplied') {
+					if (draft?.role === message.role && draft?.text === message.text) {
+						draft = undefined;
+					}
+					return;
+				}
 				if (message?.type === 'stop') {
 					active?.abort();
 					return;
@@ -56,6 +62,7 @@ function activate(context) {
 					return;
 				}
 				if (message?.type === 'models') {
+					publishDraft?.();
 					const generation = ++discovery;
 					try {
 						const response = await request('/api/tags', { signal: AbortSignal.timeout(4000) });
@@ -88,7 +95,7 @@ function activate(context) {
 				}
 				let answer = '';
 				try {
-					const instructions = (await roles).get(message.role) ??
+					const instructions = (await roles).get(message.role)?.instructions ??
 						'You are Aether Assistant. Help the user with engineering questions. Use only the information they provide and be explicit about what you cannot verify.';
 					const response = await request('/api/chat', {
 						method: 'POST',
@@ -139,6 +146,7 @@ function activate(context) {
 				}
 			});
 			view.onDidDispose(() => {
+				publishDraft = undefined;
 				++discovery;
 				active?.abort();
 				messageListener.dispose();
@@ -149,7 +157,7 @@ function activate(context) {
 <meta name="viewport" content="width=device-width, initial-scale=1"><link rel="stylesheet" href="${resource('assistant.css')}">
 <title>Aether Assistant</title></head><body>
 <main><header><div class="choices"><label>Local model<select id="model"></select></label><label>Specialist<select id="role"><option value="">General</option></select></label></div>
-<p id="status" role="status">Checking local models…</p><div class="actions"><button id="refresh" type="button">Refresh Models</button><button id="clear" type="button">New Conversation</button></div></header>
+<p id="status" role="status">Checking local models…</p><div class="actions"><button id="refresh" type="button">Refresh Models</button><button id="clear" type="button">New Conversation</button><button id="team-draft" type="button" hidden>Use Team Draft</button></div></header>
 <section id="messages" role="log" aria-label="Conversation"><p id="empty">Ask a question or paste a snippet. The assistant sees only what you share here.</p></section>
 <form id="composer"><label for="prompt">Message</label><textarea id="prompt" rows="2" maxlength="8000" placeholder="Ask Aether…"></textarea>
 <footer><span>Ollama</span><button id="stop" type="button" hidden>Stop</button><button id="send" type="submit" disabled>Send</button></footer></form>
