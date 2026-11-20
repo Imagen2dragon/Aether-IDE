@@ -8,6 +8,8 @@
 	const prompt = get('prompt');
 	const status = get('status');
 	const send = get('send');
+	const planButton = get('plan');
+	const empty = get('empty');
 	const teamDraft = get('team-draft');
 	let busy = false;
 	let reply;
@@ -19,6 +21,7 @@
 	function setBusy(value) {
 		busy = value;
 		send.disabled = busy || !model.value;
+		planButton.disabled = send.disabled;
 		get('refresh').disabled = busy;
 		get('clear').disabled = busy;
 		get('stop').hidden = !busy;
@@ -34,7 +37,7 @@
 		}
 	}
 	function append(label, text, kind) {
-		get('empty')?.remove();
+		empty.remove();
 		const item = document.createElement('article');
 		item.className = kind;
 		const heading = document.createElement('strong');
@@ -46,16 +49,39 @@
 		messages.scrollTop = messages.scrollHeight;
 		return body;
 	}
+	function renderPlan(body, plan) {
+		const card = document.createElement('section');
+		card.className = 'proposed-plan';
+		const title = document.createElement('h2');
+		title.textContent = 'Proposed Plan';
+		const summary = document.createElement('p');
+		summary.textContent = plan.summary;
+		card.append(title, summary);
+		for (const [label, items] of [['Steps', plan.steps], ['Checks to Run', plan.checks]]) {
+			const heading = document.createElement('h3');
+			heading.textContent = label;
+			const list = document.createElement('ol');
+			for (const text of items) {
+				const item = document.createElement('li');
+				item.textContent = text;
+				list.append(item);
+			}
+			card.append(heading, list);
+		}
+		body.replaceWith(card);
+		messages.scrollTop += card.getBoundingClientRect().top - messages.getBoundingClientRect().top;
+	}
 	function discover() {
 		get('refresh').disabled = true;
 		send.disabled = true;
+		planButton.disabled = true;
 		status.textContent = 'Checking local models…';
 		host.postMessage({ type: 'models' });
 	}
 	get('refresh').addEventListener('click', discover);
 	get('clear').addEventListener('click', () => {
 		host.postMessage({ type: 'clear' });
-		messages.replaceChildren();
+		messages.replaceChildren(empty);
 		prompt.focus();
 	});
 	get('stop').addEventListener('click', () => host.postMessage({ type: 'stop' }));
@@ -80,10 +106,11 @@
 		}
 		append('You', text, 'user');
 		reply = append(role.value || 'Aether', '', 'assistant');
+		const mode = event.submitter === planButton ? 'plan' : 'chat';
 		setBusy(true);
 		prompt.value = '';
-		status.textContent = 'Generating locally…';
-		host.postMessage({ type: 'send', model: model.value, role: role.value, text });
+		status.textContent = mode === 'plan' ? 'Preparing a proposed plan…' : 'Generating locally…';
+		host.postMessage({ type: 'send', model: model.value, role: role.value, text, mode });
 	});
 	window.addEventListener('message', ({ data }) => {
 		if (data.type === 'draft') {
@@ -103,7 +130,9 @@
 				messages.scrollTop = messages.scrollHeight;
 			}
 		} else if (data.type === 'complete') {
-			if (data.error && reply && !reply.textContent) {
+			if (data.plan && reply) {
+				renderPlan(reply, data.plan);
+			} else if (data.error && reply && !reply.textContent) {
 				reply.textContent = data.error;
 			}
 			status.textContent = data.error ?? 'Local models ready';

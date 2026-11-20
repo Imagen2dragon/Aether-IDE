@@ -12,6 +12,11 @@ p { margin: 0; }
 article { padding: 10px 12px; margin: 0 0 8px; border-inline-start: 2px solid var(--vscode-chat-slashCommandForeground, var(--vscode-focusBorder)); overflow-wrap: anywhere; }
 article p { white-space: pre-wrap; margin-top: 4px; line-height: 1.5; }
 article.user { background: var(--vscode-chat-requestBackground); border: 1px solid var(--vscode-chat-requestBorder, var(--vscode-panel-border)); border-radius: 4px; }
+.proposed-plan { margin-top: 8px; padding: 9px; border: 1px solid var(--vscode-chat-slashCommandForeground, var(--vscode-focusBorder)); border-radius: 5px; }
+.proposed-plan h2 { margin: 0; font-size: 14px; color: var(--vscode-chat-slashCommandForeground, var(--vscode-foreground)); }
+.proposed-plan h3 { margin: 9px 0 4px; font-size: 12px; }
+.proposed-plan ol { margin: 0; padding-inline-start: 20px; }
+.proposed-plan li + li { margin-top: 4px; }
 form { display: grid; gap: 6px; padding-top: 8px; border-top: 1px solid var(--vscode-panel-border); }
 label { color: var(--vscode-descriptionForeground); }
 .choices { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
