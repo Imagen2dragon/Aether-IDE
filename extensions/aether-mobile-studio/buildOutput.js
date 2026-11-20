@@ -30,6 +30,9 @@ function registerBuildOutput(context, taskType) {
 				const item = new vscode.TreeItem(label);
 				item.tooltip = entry.uri.fsPath;
 				item.iconPath = new vscode.ThemeIcon('package');
+				if (entry.uri.path.toLowerCase().endsWith('.apk')) {
+					item.contextValue = 'aether-apk-artifact';
+				}
 				item.command = { command: 'revealInExplorer', title: vscode.l10n.t('Reveal Artifact in Explorer'), arguments: [entry.uri] };
 				return item;
 			}

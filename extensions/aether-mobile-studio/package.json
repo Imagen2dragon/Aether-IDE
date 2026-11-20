@@ -17,14 +17,18 @@
 			{ "command": "aether.mobile.debugApk", "title": "%debugApk%", "category": "%displayName%" },
 			{ "command": "aether.mobile.releaseBundle", "title": "%releaseBundle%", "category": "%displayName%" },
 			{ "command": "aether.mobile.listDevices", "title": "%listDevices%", "category": "%displayName%" },
+			{ "command": "aether.mobile.installApk", "title": "%installApk%", "category": "%displayName%" },
 			{ "command": "aether.mobile.openBuildOutput", "title": "%buildOutput%", "category": "%displayName%" }
 		],
+		"menus": {
+			"view/item/context": [{ "command": "aether.mobile.installApk", "when": "view == aether.mobile.buildOutput && viewItem == aether-apk-artifact", "group": "navigation" }]
+		},
 		"taskDefinitions": [
 			{
 				"type": "aether-android",
 				"required": ["operation"],
 				"properties": {
-					"operation": { "type": "string", "enum": ["debugApk", "releaseBundle", "listDevices"] },
+					"operation": { "type": "string", "enum": ["debugApk", "releaseBundle", "listDevices", "installApk"] },
 					"runId": { "type": "string" }
 				}
 			}

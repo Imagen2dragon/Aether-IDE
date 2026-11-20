@@ -6,16 +6,24 @@
 const path = require('node:path');
 const os = require('node:os');
 const { randomUUID } = require('node:crypto');
+const { execFile } = require('node:child_process');
+const { promisify } = require('node:util');
 const vscode = require('vscode');
 const { registerBuildOutput } = require('./buildOutput.js');
 
 const taskType = 'aether-android';
+const execFileAsync = promisify(execFile);
+
+function taskGroup(operation) {
+	return operation === 'debugApk' || operation === 'releaseBundle' ? 'build' : 'devices';
+}
 
 function activate(context) {
 	const actions = [
 		{ id: 'debugApk', label: vscode.l10n.t('Build Debug APK'), icon: 'package', gradleTask: 'assembleDebug', artifacts: '**/build/outputs/apk/**/debug/*.apk' },
 		{ id: 'releaseBundle', label: vscode.l10n.t('Build Release App Bundle'), icon: 'archive', gradleTask: 'bundleRelease', artifacts: '**/build/outputs/bundle/{release,*Release}/*.aab' },
-		{ id: 'listDevices', label: vscode.l10n.t('List Android Devices'), icon: 'device-mobile' }
+		{ id: 'listDevices', label: vscode.l10n.t('List Android Devices'), icon: 'device-mobile' },
+		{ id: 'installApk', label: vscode.l10n.t('Install APK on Device'), icon: 'cloud-download' }
 	];
 	const buildOutput = registerBuildOutput(context, taskType);
 	const outputAction = { id: 'openBuildOutput', label: vscode.l10n.t('Open Build Output'), icon: 'output' };
@@ -32,21 +40,24 @@ function activate(context) {
 
 	const executions = new Map();
 	context.subscriptions.push(vscode.tasks.onDidEndTask(({ execution }) => {
-		const group = execution.task.definition.operation === 'listDevices' ? 'devices' : 'build';
+		if (execution.task.definition.type !== taskType) {
+			return;
+		}
+		const group = taskGroup(execution.task.definition.operation);
 		if (executions.get(group) === execution) {
 			executions.delete(group);
 		}
 	}));
 
 	for (const action of actions) {
-		context.subscriptions.push(vscode.commands.registerCommand('aether.mobile.' + action.id, async () => {
+		context.subscriptions.push(vscode.commands.registerCommand('aether.mobile.' + action.id, async entry => {
 			if (!vscode.workspace.isTrusted) {
 				void vscode.window.showWarningMessage(vscode.l10n.t('Trust this workspace before running Android tools.'));
 				return;
 			}
-			const group = action.gradleTask ? 'build' : 'devices';
+			const group = taskGroup(action.id);
 			if (executions.has(group) || vscode.tasks.taskExecutions.some(execution =>
-				execution.task.definition.type === taskType && (execution.task.definition.operation !== 'listDevices') === (group === 'build'))) {
+				execution.task.definition.type === taskType && taskGroup(execution.task.definition.operation) === group)) {
 				void vscode.window.showInformationMessage(vscode.l10n.t('An Android task is already running. Use the Tasks menu to terminate it.'));
 				return;
 			}
@@ -54,7 +65,7 @@ function activate(context) {
 			let run;
 			try {
 				const build = action.gradleTask ? await createBuildTask(action) : undefined;
-				const task = action.gradleTask ? build?.task : await createDeviceTask(action);
+				const task = action.gradleTask ? build?.task : await createDeviceTask(action, entry?.uri);
 				if (task) {
 					if (build) {
 						run = buildOutput.track(task, build.root, action.artifacts);
@@ -121,21 +132,74 @@ async function createBuildTask(action) {
 	return { task, root: project.root };
 }
 
-async function createDeviceTask(action) {
+async function findAdb() {
 	const executable = process.platform === 'win32' ? 'adb.exe' : 'adb';
 	const defaultSdk = process.platform === 'win32'
 		? process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Android', 'Sdk')
 		: process.platform === 'darwin' ? path.join(os.homedir(), 'Library', 'Android', 'sdk') : path.join(os.homedir(), 'Android', 'Sdk');
-	let adb;
 	for (const sdk of new Set([process.env.ANDROID_HOME, process.env.ANDROID_SDK_ROOT, defaultSdk].filter(Boolean))) {
 		const candidate = path.join(sdk, 'platform-tools', executable);
 		if (await isFile(vscode.Uri.file(candidate))) {
-			adb = candidate;
-			break;
+			return candidate;
 		}
 	}
-	const execution = new vscode.ProcessExecution(adb ?? executable, ['devices', '-l']);
+	return executable;
+}
+
+async function createDeviceTask(action, artifact) {
+	const adb = await findAdb();
+	if (action.id === 'installApk') {
+		return createInstallTask(action, adb, artifact);
+	}
+	const execution = new vscode.ProcessExecution(adb, ['devices', '-l']);
 	return new vscode.Task({ type: taskType, operation: action.id }, vscode.TaskScope.Global, action.label, 'Mobile Studio', execution);
+}
+
+async function createInstallTask(action, adb, artifact) {
+	let stdout;
+	try {
+		({ stdout } = await execFileAsync(adb, ['devices', '-l'], { windowsHide: true, timeout: 10000, maxBuffer: 256 * 1024 }));
+	} catch (error) {
+		if (error.code === 'ENOENT') {
+			throw new Error(vscode.l10n.t('ADB was not found. Install Android SDK Platform Tools or add adb to PATH.'));
+		}
+		throw error;
+	}
+	const rows = stdout.split(/\r?\n/).map(line => line.match(/^(\S+)\s+(device|offline|unauthorized)(?:\s+(.*))?$/)).filter(Boolean);
+	const devices = rows.filter(([, , state]) => state === 'device').map(([, serial, , details]) => {
+		const model = details?.match(/(?:^|\s)model:(\S+)/)?.[1]?.replaceAll('_', ' ');
+		return { label: model ?? serial, description: model ? serial : undefined, serial };
+	});
+	if (!devices.length) {
+		const message = rows.length
+			? vscode.l10n.t('No Android device is ready. Authorize USB debugging on the device or wait for the emulator to finish starting.')
+			: vscode.l10n.t('No Android device or emulator is connected. Connect a device with USB debugging enabled or start an emulator.');
+		void vscode.window.showWarningMessage(message);
+		return;
+	}
+	const device = await vscode.window.showQuickPick(devices, { placeHolder: vscode.l10n.t('Select the Android device for APK installation') });
+	if (!device) {
+		return;
+	}
+	const [apk] = artifact instanceof vscode.Uri ? [artifact] : await vscode.window.showOpenDialog({
+		canSelectFiles: true,
+		canSelectFolders: false,
+		canSelectMany: false,
+		defaultUri: vscode.workspace.workspaceFolders?.[0]?.uri,
+		filters: { APK: ['apk'] },
+		openLabel: vscode.l10n.t('Install APK on {0}', device.label)
+	}) ?? [];
+	if (!apk) {
+		return;
+	}
+	if (!['file', 'vscode-remote'].includes(apk.scheme) || !path.isAbsolute(apk.fsPath) || !apk.path.toLowerCase().endsWith('.apk') || !await isFile(apk)) {
+		throw new Error(vscode.l10n.t('Select an existing APK file on the build host.'));
+	}
+	const execution = new vscode.ProcessExecution(adb, ['-s', device.serial, 'install', '-r', apk.fsPath]);
+	const label = vscode.l10n.t('Install {0} on {1}', path.basename(apk.fsPath), device.label);
+	const task = new vscode.Task({ type: taskType, operation: action.id }, vscode.TaskScope.Global, label, 'Mobile Studio', execution);
+	task.presentationOptions = { panel: vscode.TaskPanelKind.Dedicated, showReuseMessage: false };
+	return task;
 }
 
 module.exports = { activate };
