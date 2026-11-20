@@ -4,6 +4,7 @@
 	"debugApk": "Build Debug APK",
 	"releaseBundle": "Build Release App Bundle",
 	"listDevices": "List Android Devices",
+	"startEmulator": "Start Android Emulator",
 	"installApk": "Install APK on Device",
 	"launchApp": "Launch App on Device",
 	"openLogcat": "Open Android Logcat",

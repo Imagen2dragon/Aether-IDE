@@ -18,7 +18,10 @@ function taskGroup(operation) {
 	if (operation === 'debugApk' || operation === 'releaseBundle') {
 		return 'build';
 	}
-	return operation === 'openLogcat' ? 'logcat' : 'devices';
+	if (operation === 'openLogcat') {
+		return 'logcat';
+	}
+	return operation === 'startEmulator' ? 'emulator' : 'devices';
 }
 
 function activate(context) {
@@ -26,6 +29,7 @@ function activate(context) {
 		{ id: 'debugApk', label: vscode.l10n.t('Build Debug APK'), icon: 'package', gradleTask: 'assembleDebug', artifacts: '**/build/outputs/apk/**/debug/*.apk' },
 		{ id: 'releaseBundle', label: vscode.l10n.t('Build Release App Bundle'), icon: 'archive', gradleTask: 'bundleRelease', artifacts: '**/build/outputs/bundle/{release,*Release}/*.aab' },
 		{ id: 'listDevices', label: vscode.l10n.t('List Android Devices'), icon: 'device-mobile' },
+		{ id: 'startEmulator', label: vscode.l10n.t('Start Android Emulator'), icon: 'vm' },
 		{ id: 'installApk', label: vscode.l10n.t('Install APK on Device'), icon: 'cloud-download' },
 		{ id: 'launchApp', label: vscode.l10n.t('Launch App on Device'), icon: 'play' },
 		{ id: 'openLogcat', label: vscode.l10n.t('Open Android Logcat'), icon: 'output' }
@@ -138,17 +142,22 @@ async function createBuildTask(action) {
 }
 
 async function findAdb() {
+	const sdk = await findSdk();
+	const executable = process.platform === 'win32' ? 'adb.exe' : 'adb';
+	return sdk ? path.join(sdk, 'platform-tools', executable) : executable;
+}
+
+async function findSdk() {
 	const executable = process.platform === 'win32' ? 'adb.exe' : 'adb';
 	const defaultSdk = process.platform === 'win32'
 		? process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Android', 'Sdk')
 		: process.platform === 'darwin' ? path.join(os.homedir(), 'Library', 'Android', 'sdk') : path.join(os.homedir(), 'Android', 'Sdk');
 	for (const sdk of new Set([process.env.ANDROID_HOME, process.env.ANDROID_SDK_ROOT, defaultSdk].filter(Boolean))) {
-		const candidate = path.join(sdk, 'platform-tools', executable);
-		if (await isFile(vscode.Uri.file(candidate))) {
-			return candidate;
+		if (await isFile(vscode.Uri.file(path.join(sdk, 'platform-tools', executable)))) {
+			return sdk;
 		}
 	}
-	return executable;
+	return undefined;
 }
 
 async function createDeviceTask(action, artifact) {
@@ -156,6 +165,9 @@ async function createDeviceTask(action, artifact) {
 	if (action.id === 'listDevices') {
 		const execution = new vscode.ProcessExecution(adb, ['devices', '-l']);
 		return new vscode.Task({ type: taskType, operation: action.id }, vscode.TaskScope.Global, action.label, 'Mobile Studio', execution);
+	}
+	if (action.id === 'startEmulator') {
+		return createEmulatorTask(action);
 	}
 	const device = await selectDevice(adb, action.label);
 	if (!device) {
@@ -166,6 +178,35 @@ async function createDeviceTask(action, artifact) {
 		case 'launchApp': return createLaunchTask(adb, device);
 		case 'openLogcat': return createLogcatTask(adb, device);
 	}
+}
+
+async function createEmulatorTask(action) {
+	const sdk = await findSdk();
+	const executableName = process.platform === 'win32' ? 'emulator.exe' : 'emulator';
+	const emulator = sdk ? path.join(sdk, 'emulator', executableName) : executableName;
+	let stdout;
+	try {
+		({ stdout } = await execFileAsync(emulator, ['-list-avds'], { windowsHide: true, timeout: 10000, maxBuffer: 256 * 1024 }));
+	} catch (error) {
+		if (error.code === 'ENOENT') {
+			void vscode.window.showWarningMessage(vscode.l10n.t('Android Emulator is not installed. Add it with Android SDK Manager.'));
+			return;
+		}
+		throw error;
+	}
+	const avds = stdout.split(/\r?\n/).map(name => name.trim()).filter(name => /^[\w.-]+$/.test(name));
+	if (!avds.length) {
+		void vscode.window.showWarningMessage(vscode.l10n.t('No virtual device is configured. Create an AVD in Device Manager.'));
+		return;
+	}
+	const avd = await vscode.window.showQuickPick(avds, { title: action.label, placeHolder: vscode.l10n.t('Select a virtual device to start') });
+	if (!avd) {
+		return;
+	}
+	const execution = new vscode.ProcessExecution(emulator, ['-avd', avd]);
+	const task = new vscode.Task({ type: taskType, operation: action.id }, vscode.TaskScope.Global, vscode.l10n.t('Start Emulator: {0}', avd), 'Mobile Studio', execution);
+	task.presentationOptions = { panel: vscode.TaskPanelKind.Dedicated, showReuseMessage: false };
+	return task;
 }
 
 async function selectDevice(adb, title) {
@@ -184,10 +225,15 @@ async function selectDevice(adb, title) {
 		return { label: model ?? serial, description: model ? serial : undefined, serial };
 	});
 	if (!devices.length) {
-		const message = rows.length
-			? vscode.l10n.t('No Android device is ready. Authorize USB debugging on the device or wait for the emulator to finish starting.')
-			: vscode.l10n.t('No Android device or emulator is connected. Connect a device with USB debugging enabled or start an emulator.');
-		void vscode.window.showWarningMessage(message);
+		if (rows.length) {
+			void vscode.window.showWarningMessage(vscode.l10n.t('Android device not ready. Authorize USB debugging or wait for the emulator to start.'));
+		} else {
+			const startEmulator = vscode.l10n.t('Start Emulator');
+			const action = await vscode.window.showWarningMessage(vscode.l10n.t('No Android device is connected. Connect USB or start an emulator.'), startEmulator);
+			if (action === startEmulator) {
+				await vscode.commands.executeCommand('aether.mobile.startEmulator');
+			}
+		}
 		return;
 	}
 	return vscode.window.showQuickPick(devices, { title, placeHolder: vscode.l10n.t('Select an Android device') });
