@@ -13,7 +13,7 @@
 		"commands": [{ "command": "aether.assistant.open", "title": "%open%" }],
 		"keybindings": [{ "command": "aether.assistant.open", "key": "ctrl+alt+i", "mac": "cmd+alt+i" }],
 		"viewsContainers": {
-			"panel": [{ "id": "aether-assistant", "title": "%name%", "icon": "./assistant.svg" }]
+			"secondarySidebar": [{ "id": "aether-assistant", "title": "%name%", "icon": "./assistant.svg" }]
 		},
 		"views": {
 			"aether-assistant": [{ "id": "aether.assistant.view", "name": "%name%", "type": "webview" }]
@@ -21,6 +21,7 @@
 		"configurationDefaults": {
 			"workbench.colorTheme": "Aether Obsidian",
 			"workbench.startupEditor": "none",
+			"workbench.secondarySideBar.defaultVisibility": "visibleInWorkspace",
 			"chat.disableAIFeatures": true,
 			"chat.agent.enabled": false,
 			"workbench.welcomePage.experimentalOnboarding": false
