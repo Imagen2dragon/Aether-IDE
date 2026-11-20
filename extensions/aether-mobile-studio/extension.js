@@ -5,19 +5,23 @@
 
 const path = require('node:path');
 const os = require('node:os');
+const { randomUUID } = require('node:crypto');
 const vscode = require('vscode');
+const { registerBuildOutput } = require('./buildOutput.js');
 
 const taskType = 'aether-android';
 
 function activate(context) {
 	const actions = [
-		{ id: 'debugApk', label: vscode.l10n.t('Build Debug APK'), icon: 'package', gradleTask: 'assembleDebug' },
-		{ id: 'releaseBundle', label: vscode.l10n.t('Build Release App Bundle'), icon: 'archive', gradleTask: 'bundleRelease' },
+		{ id: 'debugApk', label: vscode.l10n.t('Build Debug APK'), icon: 'package', gradleTask: 'assembleDebug', artifacts: '**/build/outputs/apk/**/debug/*.apk' },
+		{ id: 'releaseBundle', label: vscode.l10n.t('Build Release App Bundle'), icon: 'archive', gradleTask: 'bundleRelease', artifacts: '**/build/outputs/bundle/{release,*Release}/*.aab' },
 		{ id: 'listDevices', label: vscode.l10n.t('List Android Devices'), icon: 'device-mobile' }
 	];
+	const buildOutput = registerBuildOutput(context, taskType);
+	const outputAction = { id: 'openBuildOutput', label: vscode.l10n.t('Open Build Output'), icon: 'output' };
 
 	context.subscriptions.push(vscode.window.registerTreeDataProvider('aether.mobile.android', {
-		getChildren: () => actions,
+		getChildren: () => [...actions, outputAction],
 		getTreeItem: action => {
 			const item = new vscode.TreeItem(action.label);
 			item.iconPath = new vscode.ThemeIcon(action.icon);
@@ -47,15 +51,23 @@ function activate(context) {
 				return;
 			}
 			executions.set(group, undefined);
+			let run;
 			try {
-				const task = action.gradleTask ? await createBuildTask(action) : await createDeviceTask(action);
+				const build = action.gradleTask ? await createBuildTask(action) : undefined;
+				const task = action.gradleTask ? build?.task : await createDeviceTask(action);
 				if (task) {
+					if (build) {
+						run = buildOutput.track(task, build.root, action.artifacts);
+					}
 					const execution = await vscode.tasks.executeTask(task);
 					if (vscode.tasks.taskExecutions.includes(execution)) {
 						executions.set(group, execution);
 					}
 				}
 			} catch (error) {
+				if (run) {
+					buildOutput.failedToStart(run, error.message);
+				}
 				void vscode.window.showErrorMessage(vscode.l10n.t('Unable to start Android task: {0}', error.message));
 			} finally {
 				if (!executions.get(group)) {
@@ -103,10 +115,10 @@ async function createBuildTask(action) {
 	const execution = new vscode.ShellExecution(project.launcher.fsPath, [action.gradleTask, '--console=plain'], {
 		cwd: project.root.fsPath
 	});
-	const task = new vscode.Task({ type: taskType, operation: action.id }, project.folder, action.label, 'Mobile Studio', execution);
+	const task = new vscode.Task({ type: taskType, operation: action.id, runId: randomUUID() }, project.folder, action.label, 'Mobile Studio', execution);
 	task.group = vscode.TaskGroup.Build;
 	task.presentationOptions = { panel: vscode.TaskPanelKind.Dedicated, showReuseMessage: false };
-	return task;
+	return { task, root: project.root };
 }
 
 async function createDeviceTask(action) {

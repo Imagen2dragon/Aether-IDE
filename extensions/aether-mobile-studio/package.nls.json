@@ -3,5 +3,8 @@
 	"description": "Build Android apps and inspect connected devices from AetherIDE.",
 	"debugApk": "Build Debug APK",
 	"releaseBundle": "Build Release App Bundle",
-	"listDevices": "List Android Devices"
+	"listDevices": "List Android Devices",
+	"buildOutput": "Open Build Output",
+	"buildOutputTitle": "Build Output",
+	"buildOutputEmpty": "Build an Android project from Mobile Studio to see its result and artifacts here. Full logs open in Terminal."
 }
