@@ -234,7 +234,7 @@ export class StartupPageRunnerContribution extends Disposable implements IWorkbe
 	}
 
 	private tryShowOnboarding(): void {
-		if (this.environmentService.skipWelcome) {
+		if (this.productService.aetherAssistant || this.environmentService.skipWelcome) {
 			return; // skip welcome flag is set
 		}
 
