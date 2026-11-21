@@ -15,6 +15,7 @@ function activate(context) {
 		{ id: 'createIOSProject', label: vscode.l10n.t('Create iOS Project'), icon: 'add', command: true },
 		{ id: 'validateIOSProject', label: vscode.l10n.t('Validate iOS Project'), icon: 'check' },
 		{ id: 'buildIOS', label: vscode.l10n.t('Build iOS App With xtool'), icon: 'package', args: ['dev', 'build'] },
+		{ id: 'deployIOS', label: vscode.l10n.t('Build and Install on iOS Device'), icon: 'play', args: ['dev'] },
 		{ id: 'listIOSDevices', label: vscode.l10n.t('List iOS Devices'), icon: 'device-mobile', args: ['devices'] }
 	];
 	const toolchain = { id: 'toolchain', label: vscode.l10n.t('iOS Toolchain'), icon: 'server', collapsibleState: vscode.TreeItemCollapsibleState.Collapsed };
@@ -99,8 +100,8 @@ function activate(context) {
 			}
 			pending.add(action.id);
 			try {
-				const folder = action.id === 'buildIOS' ? await selectProject() : undefined;
-				if (action.id === 'buildIOS' && !folder) {
+				const folder = ['buildIOS', 'deployIOS'].includes(action.id) ? await selectProject() : undefined;
+				if (['buildIOS', 'deployIOS'].includes(action.id) && !folder) {
 					return;
 				}
 				const task = new vscode.Task({ type, operation: action.id }, folder ?? vscode.TaskScope.Global,
