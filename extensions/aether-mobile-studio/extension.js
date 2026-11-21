@@ -10,6 +10,7 @@ const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const vscode = require('vscode');
 const { registerBuildOutput } = require('./buildOutput.js');
+const { registerTestResults } = require('./testResults.js');
 
 const taskType = 'aether-android';
 const execFileAsync = promisify(execFile);
@@ -41,6 +42,8 @@ function activate(context) {
 	];
 	const buildOutput = registerBuildOutput(context, taskType);
 	const outputAction = { id: 'openBuildOutput', label: vscode.l10n.t('Open Build Output'), icon: 'output' };
+	const testResults = registerTestResults(context, taskType);
+	const testResultsAction = { id: 'openTestResults', label: vscode.l10n.t('Open Test Results'), icon: 'beaker' };
 	const treeChanges = new vscode.EventEmitter();
 	const toolchain = { id: 'toolchain', label: vscode.l10n.t('Toolchain'), description: vscode.l10n.t('SDK, ADB, Java, Gradle'), icon: 'server', collapsibleState: vscode.TreeItemCollapsibleState.Collapsed };
 	let toolchainRows;
@@ -62,7 +65,7 @@ function activate(context) {
 					...toolchainRows
 				];
 			}
-			return [toolchain, ...actions, outputAction];
+			return [toolchain, ...actions, outputAction, testResultsAction];
 		},
 		getTreeItem: action => {
 			const item = new vscode.TreeItem(action.label, action.collapsibleState);
@@ -110,6 +113,8 @@ function activate(context) {
 				if (task) {
 					if (build?.artifacts) {
 						run = buildOutput.track(task, build.root, action.artifacts);
+					} else if (build && action.test) {
+						run = testResults.track(task, build.root);
 					}
 					const execution = await vscode.tasks.executeTask(task);
 					if (vscode.tasks.taskExecutions.includes(execution)) {
@@ -118,7 +123,11 @@ function activate(context) {
 				}
 			} catch (error) {
 				if (run) {
-					buildOutput.failedToStart(run, error.message);
+					if (action.test) {
+						testResults.failedToStart(run, error.message);
+					} else {
+						buildOutput.failedToStart(run, error.message);
+					}
 				}
 				void vscode.window.showErrorMessage(vscode.l10n.t('Unable to start Android task: {0}', error.message));
 			} finally {
@@ -184,7 +193,7 @@ async function createBuildTask(action) {
 		cwd: project.root.fsPath
 	});
 	const definition = { type: taskType, operation: action.id };
-	if (action.artifacts) {
+	if (action.artifacts || action.test) {
 		definition.runId = randomUUID();
 	}
 	const task = new vscode.Task(definition, project.folder, action.label, 'Mobile Studio', execution);
