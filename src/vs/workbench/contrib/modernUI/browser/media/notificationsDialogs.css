@@ -73,10 +73,11 @@
 .modern-ui-notifications-dialogs.monaco-workbench > .notifications-toasts {
 	right: calc(var(--modern-ui-notifications-inline-inset, var(--vscode-spacing-size80)) - var(--vscode-spacing-size40));
 	bottom: calc(var(--modern-ui-notifications-block-end-inset, var(--vscode-spacing-size360)) - var(--vscode-spacing-size40));
+	max-inline-size: calc(100vw - 2 * var(--modern-ui-notifications-inline-inset, var(--vscode-spacing-size80)));
 }
 
 .modern-ui-notifications-dialogs.monaco-workbench > .notifications-toasts .notification-toast-container:not(:last-child) > .notification-toast {
-	margin-bottom: var(--vscode-spacing-sizeNone);
+	margin-bottom: var(--vscode-spacing-size60);
 }
 
 .modern-ui-notifications-dialogs.monaco-workbench.nostatusbar > .notifications-toasts:not(.top-right) {

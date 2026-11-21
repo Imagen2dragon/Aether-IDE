@@ -413,6 +413,7 @@ export class CompositeBarActionViewItem extends BaseActionViewItem {
 				case 'workbench.view.explorer': this.railCaption.textContent = localize('aether.rail.files', "Files"); break;
 				case 'workbench.view.scm': this.railCaption.textContent = localize('aether.rail.git', "Git"); break;
 				case 'workbench.view.debug': this.railCaption.textContent = localize('aether.rail.run', "Run"); break;
+				case 'workbench.view.extension.aether-team': this.railCaption.textContent = localize('aether.rail.team', "Team"); break;
 				case 'workbench.view.extension.aether-mobile': this.railCaption.textContent = localize('aether.rail.mobile', "Mobile"); break;
 				default: this.railCaption.textContent = this.action.label;
 			}
