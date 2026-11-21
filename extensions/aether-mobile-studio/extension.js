@@ -19,7 +19,7 @@ function taskGroup(operation) {
 	if (operation === 'debugApk' || operation === 'releaseBundle') {
 		return 'build';
 	}
-	if (operation === 'buildAndInstallDebugApk') {
+	if (operation === 'buildAndInstallDebugApk' || operation === 'buildInstallLaunchDebugApk') {
 		return 'build';
 	}
 	if (operation === 'unitTests' || operation === 'instrumentedTests') {
@@ -35,6 +35,7 @@ function activate(context) {
 	const actions = [
 		{ id: 'debugApk', label: vscode.l10n.t('Build Debug APK'), icon: 'package', gradleTask: 'assembleDebug', artifacts: '**/build/outputs/apk/**/debug/*.apk' },
 		{ id: 'buildAndInstallDebugApk', label: vscode.l10n.t('Build & Install Debug APK'), icon: 'cloud-download', gradleTask: 'assembleDebug', artifacts: '**/build/outputs/apk/**/debug/*.apk', installAfterBuild: true },
+		{ id: 'buildInstallLaunchDebugApk', label: vscode.l10n.t('Build, Install & Launch App'), icon: 'play', gradleTask: 'assembleDebug', artifacts: '**/build/outputs/apk/**/debug/*.apk', installAfterBuild: true, launchAfterInstall: true },
 		{ id: 'releaseBundle', label: vscode.l10n.t('Build Release App Bundle'), icon: 'archive', gradleTask: 'bundleRelease', artifacts: '**/build/outputs/bundle/{release,*Release}/*.aab' },
 		{ id: 'unitTests', label: vscode.l10n.t('Run Unit Tests'), icon: 'beaker', gradleTask: 'testDebugUnitTest', test: true },
 		{ id: 'instrumentedTests', label: vscode.l10n.t('Run Instrumented Tests'), icon: 'device-mobile', gradleTask: 'connectedDebugAndroidTest', test: true, requiresDevice: true },
@@ -88,9 +89,10 @@ function activate(context) {
 
 	const executions = new Map();
 	const installAfterBuild = new Map();
+	const launchAfterInstall = new Map();
 	const startedInstallBuilds = new Set();
 	context.subscriptions.push(vscode.tasks.onDidStartTaskProcess(({ execution }) => {
-		if (installAfterBuild.has(execution.task)) {
+		if (installAfterBuild.has(execution.task) || launchAfterInstall.has(execution.task)) {
 			startedInstallBuilds.add(execution.task);
 		}
 	}));
@@ -105,36 +107,56 @@ function activate(context) {
 		if (installAfterBuild.has(execution.task) && !startedInstallBuilds.has(execution.task)) {
 			installAfterBuild.delete(execution.task);
 		}
+		if (launchAfterInstall.has(execution.task) && !startedInstallBuilds.has(execution.task)) {
+			launchAfterInstall.delete(execution.task);
+		}
 	}));
 	context.subscriptions.push(vscode.tasks.onDidEndTaskProcess(async ({ execution, exitCode }) => {
 		const task = execution.task;
-		const root = installAfterBuild.get(task);
-		if (!root) {
+		const build = installAfterBuild.get(task);
+		if (build) {
+			installAfterBuild.delete(task);
+			startedInstallBuilds.delete(task);
+			if (exitCode !== 0) {
+				return;
+			}
+			try {
+				const artifacts = await vscode.workspace.findFiles(new vscode.RelativePattern(build.root, '**/build/outputs/apk/**/debug/*.apk'), null, 32);
+				if (!artifacts.length) {
+					void vscode.window.showWarningMessage(vscode.l10n.t('The debug build succeeded, but no APK was found in the standard Gradle output folders.'));
+					return;
+				}
+				let artifact = artifacts[0];
+				if (artifacts.length > 1) {
+					const choice = await vscode.window.showQuickPick(artifacts.map(uri => ({ label: vscode.workspace.asRelativePath(uri, false), description: uri.fsPath, uri })), {
+						placeHolder: vscode.l10n.t('Select the debug APK to install')
+					});
+					artifact = choice?.uri;
+				}
+				if (artifact) {
+					await vscode.commands.executeCommand('aether.mobile.installApk', { uri: artifact, launchAfterInstall: build.launchAfterInstall });
+				}
+			} catch (error) {
+				void vscode.window.showErrorMessage(vscode.l10n.t('The debug APK was built, but AetherIDE could not start installation: {0}', error.message));
+			}
 			return;
 		}
-		installAfterBuild.delete(task);
+		const install = launchAfterInstall.get(task);
+		if (!install) {
+			return;
+		}
+		launchAfterInstall.delete(task);
 		startedInstallBuilds.delete(task);
 		if (exitCode !== 0) {
 			return;
 		}
 		try {
-			const artifacts = await vscode.workspace.findFiles(new vscode.RelativePattern(root, '**/build/outputs/apk/**/debug/*.apk'), null, 32);
-			if (!artifacts.length) {
-				void vscode.window.showWarningMessage(vscode.l10n.t('The debug build succeeded, but no APK was found in the standard Gradle output folders.'));
-				return;
-			}
-			let artifact = artifacts[0];
-			if (artifacts.length > 1) {
-				const choice = await vscode.window.showQuickPick(artifacts.map(uri => ({ label: vscode.workspace.asRelativePath(uri, false), description: uri.fsPath, uri })), {
-					placeHolder: vscode.l10n.t('Select the debug APK to install')
-				});
-				artifact = choice?.uri;
-			}
-			if (artifact) {
-				await vscode.commands.executeCommand('aether.mobile.installApk', { uri: artifact });
+			const launchTask = await createLaunchTask(install.adb, install.device);
+			if (launchTask) {
+				await vscode.tasks.executeTask(launchTask);
 			}
 		} catch (error) {
-			void vscode.window.showErrorMessage(vscode.l10n.t('The debug APK was built, but AetherIDE could not start installation: {0}', error.message));
+			void vscode.window.showErrorMessage(vscode.l10n.t('The APK was installed, but AetherIDE could not launch the app: {0}', error.message));
 		}
 	}));
 
@@ -157,7 +179,10 @@ function activate(context) {
 				const task = action.gradleTask ? build?.task : await createDeviceTask(action, entry?.uri);
 				if (task) {
 					if (action.installAfterBuild) {
-						installAfterBuild.set(task, build.root);
+						installAfterBuild.set(task, { root: build.root, launchAfterInstall: action.launchAfterInstall });
+					}
+					if (action.id === 'installApk' && entry?.launchAfterInstall) {
+						launchAfterInstall.set(task, { adb: task.execution.executable, device: { serial: task.execution.args[1], label: task.execution.args[1] } });
 					}
 					if (build?.artifacts) {
 						run = buildOutput.track(task, build.root, action.artifacts);
