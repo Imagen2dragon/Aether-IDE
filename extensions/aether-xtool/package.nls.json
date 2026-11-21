@@ -2,6 +2,7 @@
 	"createIOSProject": "Create iOS Project",
 	"validateIOSProject": "Validate iOS Project",
 	"buildIOS": "Build iOS App With xtool",
+	"testIOS": "Run Swift Package Tests",
 	"deployIOS": "Build and Install on iOS Device",
 	"listIOSDevices": "List iOS Devices",
 	"checkIOSToolchain": "Check iOS Toolchain",
