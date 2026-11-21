@@ -16,15 +16,27 @@
 		"commands": [
 			{ "command": "aether.mobile.debugApk", "title": "%debugApk%", "category": "%displayName%" },
 			{ "command": "aether.mobile.releaseBundle", "title": "%releaseBundle%", "category": "%displayName%" },
+			{ "command": "aether.mobile.unitTests", "title": "%unitTests%", "category": "%displayName%" },
+			{ "command": "aether.mobile.instrumentedTests", "title": "%instrumentedTests%", "category": "%displayName%" },
+			{ "command": "aether.mobile.openTestResults", "title": "%testResults%", "category": "%displayName%" },
+			{ "command": "aether.mobile.openTestReport", "title": "%openTestReport%", "category": "%displayName%" },
 			{ "command": "aether.mobile.listDevices", "title": "%listDevices%", "category": "%displayName%" },
+			{ "command": "aether.mobile.startEmulator", "title": "%startEmulator%", "category": "%displayName%" },
+			{ "command": "aether.mobile.checkEnvironment", "title": "%checkEnvironment%", "category": "%displayName%" },
+			{ "command": "aether.mobile.installApk", "title": "%installApk%", "category": "%displayName%" },
+			{ "command": "aether.mobile.launchApp", "title": "%launchApp%", "category": "%displayName%" },
+			{ "command": "aether.mobile.openLogcat", "title": "%openLogcat%", "category": "%displayName%" },
 			{ "command": "aether.mobile.openBuildOutput", "title": "%buildOutput%", "category": "%displayName%" }
 		],
+		"menus": {
+			"view/item/context": [{ "command": "aether.mobile.installApk", "when": "view == aether.mobile.buildOutput && viewItem == aether-apk-artifact", "group": "navigation" }]
+		},
 		"taskDefinitions": [
 			{
 				"type": "aether-android",
 				"required": ["operation"],
 				"properties": {
-					"operation": { "type": "string", "enum": ["debugApk", "releaseBundle", "listDevices"] },
+					"operation": { "type": "string", "enum": ["debugApk", "releaseBundle", "unitTests", "instrumentedTests", "listDevices", "startEmulator", "installApk", "launchApp", "openLogcat"] },
 					"runId": { "type": "string" }
 				}
 			}
@@ -35,8 +47,14 @@
 		},
 		"views": {
 			"aether-mobile": [{ "id": "aether.mobile.android", "name": "Android" }],
-			"aether-build-output": [{ "id": "aether.mobile.buildOutput", "name": "%buildOutputTitle%" }]
+			"aether-build-output": [
+				{ "id": "aether.mobile.buildOutput", "name": "%buildOutputTitle%" },
+				{ "id": "aether.mobile.testResults", "name": "%testResults%" }
+			]
 		},
-		"viewsWelcome": [{ "view": "aether.mobile.buildOutput", "contents": "%buildOutputEmpty%" }]
+		"viewsWelcome": [
+			{ "view": "aether.mobile.buildOutput", "contents": "%buildOutputEmpty%" },
+			{ "view": "aether.mobile.testResults", "contents": "%testResultsEmpty%" }
+		]
 	}
 }
