@@ -460,6 +460,11 @@ export class ChatEntitlementService extends Disposable implements IChatEntitleme
 			return;
 		}
 
+		if (productService.aetherAssistant) {
+			ChatEntitlementContextKeys.Setup.hidden.bindTo(this.contextKeyService).set(true);
+			return;
+		}
+
 		if (!productService.defaultChatAgent) {
 			return; // we need a default chat agent configured going forward from here
 		}
@@ -743,6 +748,7 @@ export class ChatEntitlementService extends Disposable implements IChatEntitleme
 	}
 
 	setForceHidden(hidden: boolean): void {
+		hidden ||= product.aetherAssistant === true;
 		if (this.context) {
 			this.context.value.setForceHidden(hidden);
 		} else {

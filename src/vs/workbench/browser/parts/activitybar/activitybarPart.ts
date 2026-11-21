@@ -42,6 +42,7 @@ import { IWorkbenchEnvironmentService } from '../../../services/environment/comm
 import { IViewsService } from '../../../services/views/common/viewsService.js';
 import { SwitchCompositeViewAction } from '../compositeBarActions.js';
 import { IHostService } from '../../../services/host/browser/host.js';
+import product from '../../../../platform/product/common/product.js';
 
 export class ActivitybarPart extends Part {
 
@@ -49,6 +50,7 @@ export class ActivitybarPart extends Part {
 	static readonly COMPACT_ACTION_HEIGHT = 28;
 
 	static readonly ACTIVITYBAR_WIDTH = 48;
+	static readonly AETHER_ACTIVITYBAR_WIDTH = 62;
 	static readonly COMPACT_ACTIVITYBAR_WIDTH = 36;
 
 	/** Narrower dimensions used when the floating panels (Modern UI) experiment is enabled. */
@@ -112,7 +114,10 @@ export class ActivitybarPart extends Part {
 			}
 			return ActivitybarPart.FLOATING_ACTIVITYBAR_WIDTH;
 		}
-		return this._isCompact ? ActivitybarPart.COMPACT_ACTIVITYBAR_WIDTH : ActivitybarPart.ACTIVITYBAR_WIDTH;
+		if (this._isCompact) {
+			return ActivitybarPart.COMPACT_ACTIVITYBAR_WIDTH;
+		}
+		return product.aetherAssistant ? ActivitybarPart.AETHER_ACTIVITYBAR_WIDTH : ActivitybarPart.ACTIVITYBAR_WIDTH;
 	}
 
 	/** The action (item) height that drives visible item sizing. */
@@ -295,6 +300,7 @@ export class ActivitybarPart extends Part {
 
 	protected override createContentArea(parent: HTMLElement): HTMLElement {
 		this.element = parent;
+		this.element.classList.toggle('aether-activity-rail', product.aetherAssistant === true);
 		this.content = append(this.element, $('.content'));
 
 		this.updateCompactStyle();
