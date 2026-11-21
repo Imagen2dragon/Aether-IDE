@@ -12,6 +12,8 @@ const execFileAsync = promisify(execFile);
 
 function activate(context) {
 	const actions = [
+		{ id: 'createIOSProject', label: vscode.l10n.t('Create iOS Project'), icon: 'add', command: true },
+		{ id: 'validateIOSProject', label: vscode.l10n.t('Validate iOS Project'), icon: 'check' },
 		{ id: 'buildIOS', label: vscode.l10n.t('Build iOS App With xtool'), icon: 'package', args: ['dev', 'build'] },
 		{ id: 'listIOSDevices', label: vscode.l10n.t('List iOS Devices'), icon: 'device-mobile', args: ['devices'] }
 	];
@@ -56,8 +58,35 @@ function activate(context) {
 		}
 	}));
 	context.subscriptions.push(vscode.commands.registerCommand('aether.mobile.checkIOSToolchain', refreshToolchain));
+	context.subscriptions.push(vscode.commands.registerCommand('aether.mobile.createIOSProject', () => createIOSProject(creatingProjects)));
+	context.subscriptions.push(vscode.commands.registerCommand('aether.mobile.validateIOSProject', validateIOSWorkspace));
+	const creatingProjects = new Map();
+	context.subscriptions.push(vscode.tasks.onDidEndTaskProcess(async ({ execution, exitCode }) => {
+		const project = creatingProjects.get(execution.task);
+		if (!project) {
+			return;
+		}
+		creatingProjects.delete(execution.task);
+		if (exitCode !== 0) {
+			void vscode.window.showErrorMessage(exitCode === undefined
+				? vscode.l10n.t('iOS project creation stopped. Check the xtool task terminal.')
+				: vscode.l10n.t('iOS project creation failed with exit code {0}. Check the xtool task terminal.', exitCode));
+			return;
+		}
+		try {
+			const result = await inspectIOSProject(project.uri);
+			if (!result.valid) {
+				void vscode.window.showErrorMessage(vscode.l10n.t('xtool finished, but the project is missing required files: {0}', result.missing.join(', ')));
+				return;
+			}
+			void vscode.window.showInformationMessage(vscode.l10n.t('Created iOS project "{0}".', project.name));
+			await vscode.commands.executeCommand('vscode.openFolder', project.uri, { forceNewWindow: false });
+		} catch (error) {
+			void vscode.window.showErrorMessage(vscode.l10n.t('Project was created, but AetherIDE could not open it: {0}', error.message));
+		}
+	}));
 	const pending = new Set();
-	for (const action of actions) {
+	for (const action of actions.filter(action => action.args)) {
 		context.subscriptions.push(vscode.commands.registerCommand('aether.mobile.' + action.id, async () => {
 			if (!vscode.workspace.isTrusted) {
 				void vscode.window.showWarningMessage(vscode.l10n.t('Trust this workspace before running xtool.'));
@@ -86,6 +115,86 @@ function activate(context) {
 				pending.delete(action.id);
 			}
 		}));
+	}
+}
+
+async function createIOSProject(creatingProjects) {
+	if (!vscode.workspace.isTrusted) {
+		void vscode.window.showWarningMessage(vscode.l10n.t('Trust this workspace before running xtool.'));
+		return;
+	}
+	const input = await vscode.window.showInputBox({
+		title: vscode.l10n.t('Create iOS Project'),
+		prompt: vscode.l10n.t('Choose a Swift package name. AetherIDE creates the project from xtool’s template.'),
+		placeHolder: 'MyApp',
+		validateInput: value => /^[A-Za-z][A-Za-z0-9]*$/.test(value.trim()) ? undefined : vscode.l10n.t('Use letters and numbers only, starting with a letter.')
+	});
+	if (!input) {
+		return;
+	}
+	const name = input.trim();
+	const parents = await vscode.window.showOpenDialog({
+		canSelectFiles: false,
+		canSelectFolders: true,
+		canSelectMany: false,
+		defaultUri: vscode.workspace.workspaceFolders?.[0]?.uri,
+		openLabel: vscode.l10n.t('Choose Project Location'),
+		title: vscode.l10n.t('Choose a parent folder for {0}', name)
+	});
+	const parent = parents?.[0];
+	if (!parent) {
+		return;
+	}
+	const projectUri = vscode.Uri.joinPath(parent, name);
+	try {
+		await vscode.workspace.fs.stat(projectUri);
+		void vscode.window.showWarningMessage(vscode.l10n.t('A folder named "{0}" already exists in that location. Choose another name or location.', name));
+		return;
+	} catch (error) {
+		if (!(error instanceof vscode.FileSystemError) || error.code !== 'FileNotFound') {
+			void vscode.window.showErrorMessage(vscode.l10n.t('Unable to check the project destination: {0}', error.message));
+			return;
+		}
+	}
+	const task = new vscode.Task({ type, operation: 'createIOSProject' }, vscode.TaskScope.Global,
+		vscode.l10n.t('Create iOS Project: {0}', name), 'Mobile Studio', createExecution(['new', name], parent.fsPath));
+	task.presentationOptions = { reveal: vscode.TaskRevealKind.Always, panel: vscode.TaskPanelKind.Dedicated };
+	creatingProjects.set(task, { name, uri: projectUri });
+	try {
+		await vscode.tasks.executeTask(task);
+	} catch (error) {
+		creatingProjects.delete(task);
+		void vscode.window.showErrorMessage(vscode.l10n.t('Unable to start xtool project creation: {0}', error.message));
+	}
+}
+
+async function validateIOSWorkspace() {
+	const folders = vscode.workspace.workspaceFolders ?? [];
+	if (!folders.length) {
+		void vscode.window.showWarningMessage(vscode.l10n.t('Open an iOS project folder before validating it.'));
+		return;
+	}
+	let folder = folders[0];
+	if (folders.length > 1) {
+		const selected = await vscode.window.showQuickPick(folders.map(candidate => ({ label: candidate.name, description: candidate.uri.fsPath, folder: candidate })), {
+			placeHolder: vscode.l10n.t('Select the iOS project to validate')
+		});
+		folder = selected?.folder;
+		if (!folder) {
+			return;
+		}
+	}
+	try {
+		const result = await inspectIOSProject(folder.uri);
+		if (!result.valid) {
+			void vscode.window.showWarningMessage(vscode.l10n.t('This folder is not a complete xtool project. Missing: {0}', result.missing.join(', ')));
+			return;
+		}
+		void vscode.window.showInformationMessage(result.hasBuildServerConfig
+			? vscode.l10n.t('iOS project is ready: Package.swift, xtool.yml, and SourceKit-LSP configuration are present.')
+			: vscode.l10n.t('iOS project is valid. Add .bsp/xtool.json to enable xtool build information in the editor.'));
+	} catch (error) {
+		void vscode.window.showErrorMessage(vscode.l10n.t('Unable to validate the iOS project: {0}', error.message));
 	}
 }
 
@@ -145,15 +254,40 @@ function diagnostic(label, description, tooltip, ready, kind = 'diagnostic') {
 	return { id: 'ios-diagnostic-' + label, label, description, tooltip, icon: ready ? 'check' : 'warning', kind, ready };
 }
 
+async function isFile(uri) {
+	try {
+		const stat = await vscode.workspace.fs.stat(uri);
+		return (stat.type & vscode.FileType.File) !== 0;
+	} catch (error) {
+		if (error instanceof vscode.FileSystemError && error.code === 'FileNotFound') {
+			return false;
+		}
+		throw error;
+	}
+}
+
+async function inspectIOSProject(uri) {
+	const [hasPackageManifest, hasXtoolConfig, hasBuildServerConfig] = await Promise.all([
+		isFile(vscode.Uri.joinPath(uri, 'Package.swift')),
+		isFile(vscode.Uri.joinPath(uri, 'xtool.yml')),
+		isFile(vscode.Uri.joinPath(uri, '.bsp', 'xtool.json'))
+	]);
+	const missing = [];
+	if (!hasPackageManifest) {
+		missing.push('Package.swift');
+	}
+	if (!hasXtoolConfig) {
+		missing.push('xtool.yml');
+	}
+	return { valid: missing.length === 0, missing, hasBuildServerConfig };
+}
+
 async function findIOSProjects() {
 	let count = 0;
 	for (const folder of vscode.workspace.workspaceFolders ?? []) {
 		try {
-			const [config, manifest] = await Promise.all([
-				vscode.workspace.fs.stat(vscode.Uri.joinPath(folder.uri, 'xtool.yml')),
-				vscode.workspace.fs.stat(vscode.Uri.joinPath(folder.uri, 'Package.swift'))
-			]);
-			if ((config.type & vscode.FileType.File) && (manifest.type & vscode.FileType.File)) {
+			const project = await inspectIOSProject(folder.uri);
+			if (project.valid) {
 				count++;
 			}
 		} catch (error) {
@@ -169,9 +303,8 @@ async function selectProject() {
 	const options = [];
 	for (const folder of vscode.workspace.workspaceFolders ?? []) {
 		try {
-			const config = await vscode.workspace.fs.stat(vscode.Uri.joinPath(folder.uri, 'xtool.yml'));
-			const manifest = await vscode.workspace.fs.stat(vscode.Uri.joinPath(folder.uri, 'Package.swift'));
-			if ((config.type & vscode.FileType.File) && (manifest.type & vscode.FileType.File)) {
+			const project = await inspectIOSProject(folder.uri);
+			if (project.valid) {
 				options.push({ label: folder.name, description: folder.uri.fsPath, folder });
 			}
 		} catch (error) {

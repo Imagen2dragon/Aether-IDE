@@ -1,4 +1,6 @@
 {
+	"createIOSProject": "Create iOS Project",
+	"validateIOSProject": "Validate iOS Project",
 	"buildIOS": "Build iOS App With xtool",
 	"listIOSDevices": "List iOS Devices",
 	"checkIOSToolchain": "Check iOS Toolchain",
