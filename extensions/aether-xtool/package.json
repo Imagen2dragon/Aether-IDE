@@ -13,7 +13,8 @@
 	"contributes": {
 		"commands": [
 			{ "command": "aether.mobile.buildIOS", "title": "%buildIOS%", "category": "Mobile Studio" },
-			{ "command": "aether.mobile.listIOSDevices", "title": "%listIOSDevices%", "category": "Mobile Studio" }
+			{ "command": "aether.mobile.listIOSDevices", "title": "%listIOSDevices%", "category": "Mobile Studio" },
+			{ "command": "aether.mobile.checkIOSToolchain", "title": "%checkIOSToolchain%", "category": "Mobile Studio" }
 		],
 		"views": {
 			"aether-mobile": [{ "id": "aether.mobile.ios", "name": "iOS" }]
