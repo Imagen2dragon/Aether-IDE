@@ -15,6 +15,7 @@
 	"contributes": {
 		"commands": [
 			{ "command": "aether.mobile.debugApk", "title": "%debugApk%", "category": "%displayName%" },
+			{ "command": "aether.mobile.buildAndInstallDebugApk", "title": "%buildAndInstallDebugApk%", "category": "%displayName%" },
 			{ "command": "aether.mobile.releaseBundle", "title": "%releaseBundle%", "category": "%displayName%" },
 			{ "command": "aether.mobile.unitTests", "title": "%unitTests%", "category": "%displayName%" },
 			{ "command": "aether.mobile.instrumentedTests", "title": "%instrumentedTests%", "category": "%displayName%" },
@@ -36,7 +37,7 @@
 				"type": "aether-android",
 				"required": ["operation"],
 				"properties": {
-					"operation": { "type": "string", "enum": ["debugApk", "releaseBundle", "unitTests", "instrumentedTests", "listDevices", "startEmulator", "installApk", "launchApp", "openLogcat"] },
+					"operation": { "type": "string", "enum": ["debugApk", "buildAndInstallDebugApk", "releaseBundle", "unitTests", "instrumentedTests", "listDevices", "startEmulator", "installApk", "launchApp", "openLogcat"] },
 					"runId": { "type": "string" }
 				}
 			}
