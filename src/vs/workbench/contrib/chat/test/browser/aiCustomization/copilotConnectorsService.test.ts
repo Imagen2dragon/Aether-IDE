@@ -125,7 +125,7 @@ suite('CopilotConnectorsService', () => {
 		}();
 		const productService = new class extends mock<IProductService>() {
 			override readonly defaultChatAgent = {
-				...product.defaultChatAgent,
+				...product.defaultChatAgent!,
 				mcpConnectorsUrl: 'https://api.github.test/copilot-connectors/api/v1',
 			};
 		}();

@@ -43,10 +43,27 @@ For the desktop source preview when the optional runtime downloads are unavailab
 - Both upstream LFS assets and the migration branch uploaded successfully. Review: https://github.com/Imagen2dragon/Aether-IDE/pull/29 (draft).
 - The existing installed AetherIDE application has not been replaced by this migration.
 
+## Windows desktop preview (step 2)
+
+AetherIDE Preview `1.148.0` was packaged and installed from source commit `3a96c5b0abf2043a24bc8b1e9ee925cc2e0ad30f`. It has separate product, settings, extension, server, mutex and protocol identities. The Windows icon is copied byte-for-byte from the existing AetherIDE project; the existing SVG symbol is reused. Upstream license notices remain included.
+
+```powershell
+./scripts/aether/dev.ps1 -Task Package
+./scripts/aether/install-preview.ps1
+```
+
+Packaging requires a clean, committed checkout and discovers the installed Windows SDK x64 signing tools. The display name identifies the preview while the package uses the standard OSS build path. After fixing SDK tool discovery, native packaging completed through upstream's `vscode-win32-x64-ci` task using the already validated application bundles; the intervening change only affected the PowerShell bootstrap.
+
+The installer creates a new release directory under `$env:LOCALAPPDATA/Programs/AetherIDE Preview/releases`, verifies the executable and product metadata, then creates AetherIDE Preview shortcuts in the Desktop and Start Menu. Its `current.json` records the source commit and retained previous release. Legacy installations are preserved. The installed executable is self-contained and runs from the Programs directory.
+
+Installed-build checks passed: launch, direct Ctrl+S persistence, the dirty-file close prompt, explicit native Save-on-close, application exit, restoration of an unsaved edit after reopening, and saving the recovered edit. Native terminal spawn, output and exit also passed under the installed Electron runtime using its packaged node-pty dependency. Dialog and recovery checks used an isolated test profile. The reproduced agent-management startup timeout did not return.
+
+Review: https://github.com/Imagen2dragon/Aether-IDE/pull/30, stacked on the baseline PR. Release signing, automatic updates, a production installer, remaining upstream onboarding copy, trusted-project terminal UI, debugging, AI providers and mobile toolchains remain later work. Local dictation and browser-suite validation retain the source-preview limitations above.
+
 ## Following steps, one pull request each
 
-1. Finish this baseline: dependency installation, desktop build, isolated launch and native workflow checks.
-2. Add AetherIDE product identity, original logo, application IDs and isolated settings/extensions storage; package and test an installable desktop app.
+1. Completed: source baseline, dependencies, desktop build and core native workflow checks.
+2. Completed for the local Windows preview: Aether identity, original icon, separate application data, packaging, versioned installation and installed-build smoke checks.
 3. Validate and document editing, Explorer, search, Git, terminal, debugging, extensions, keyboard shortcuts, save/close and recovery as release gates. Fix demonstrated regressions within the upstream architecture.
 4. Reintroduce Aether AI capabilities through services and extensions, with real provider configuration, cancellation and reviewable edits.
 5. Add mobile toolchain discovery and diagnostics for Android and iOS/xtool, followed by actual sample-app build and device tests. Record platform and signing requirements explicitly.

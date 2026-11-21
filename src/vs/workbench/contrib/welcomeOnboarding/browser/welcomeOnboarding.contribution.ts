@@ -11,6 +11,7 @@ import { Categories } from '../../../../platform/action/common/actionCommonCateg
 import { Action2, registerAction2 } from '../../../../platform/actions/common/actions.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
 import { ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
+import product from '../../../../platform/product/common/product.js';
 import { IOnboardingService } from '../common/onboardingService.js';
 import { OnboardingVariationA } from './onboardingVariationA.js';
 
@@ -22,12 +23,14 @@ registerAction2(class extends Action2 {
 			id: 'workbench.action.welcomeOnboarding2026',
 			title: localize2('welcomeOnboarding2026', "Welcome Onboarding 2026"),
 			category: Categories.Developer,
-			f1: true,
+			f1: !product.aetherAssistant,
 		});
 	}
 
 	run(accessor: ServicesAccessor): void {
 		const onboardingService = accessor.get(IOnboardingService);
-		onboardingService.show();
+		if (!product.aetherAssistant) {
+			onboardingService.show();
+		}
 	}
 });
