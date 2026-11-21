@@ -26,6 +26,7 @@ import { IHoverService } from '../../../../platform/hover/browser/hover.js';
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
 import { IKeybindingService } from '../../../../platform/keybinding/common/keybinding.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
+import product from '../../../../platform/product/common/product.js';
 import { IStorageService, StorageScope, StorageTarget, WillSaveStateReason } from '../../../../platform/storage/common/storage.js';
 import { defaultKeybindingLabelStyles } from '../../../../platform/theme/browser/defaultStyles.js';
 import { registerIcon } from '../../../../platform/theme/common/iconRegistry.js';
@@ -44,9 +45,10 @@ interface WatermarkEntry {
 const showChatContextKey = ContextKeyExpr.and(ContextKeyExpr.equals('chatSetupHidden', false), ContextKeyExpr.equals('chatSetupDisabledInWorkspace', false));
 
 const openChat: WatermarkEntry = {
-	text: localize('watermark.openChat', "Open Chat"), id: 'workbench.action.chat.open',
+	text: product.aetherAssistant ? localize('watermark.openAetherAssistant', "Open Aether Assistant") : localize('watermark.openChat', "Open Chat"),
+	id: product.aetherAssistant ? 'aether.assistant.open' : 'workbench.action.chat.open',
 	icon: registerIcon('watermark-chat', Codicon.chatSparkle, localize('watermark.chatIcon', "Icon for opening chat in the editor watermark.")),
-	when: { native: showChatContextKey, web: showChatContextKey }
+	when: product.aetherAssistant ? { web: ContextKeyExpr.false() } : { native: showChatContextKey, web: showChatContextKey }
 };
 const showCommands: WatermarkEntry = {
 	text: localize('watermark.showCommands', "Show All Commands"), id: 'workbench.action.showCommands',

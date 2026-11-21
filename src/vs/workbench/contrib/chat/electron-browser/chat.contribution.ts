@@ -239,15 +239,17 @@ class ChatLifecycleHandler extends Disposable {
 	}
 }
 
-registerAction2(OpenWorkspaceInAgentsWindowAction);
-registerAction2(OpenWorkspaceInAgentsWindowChatTitleAction);
-registerAction2(OpenWorkspaceInAgentsWindowTitleBarAction);
-registerAction2(ToggleOpenInAgentsWindowTitleBarAction);
-registerAction2(OpenAgentsWindowAction);
-registerAction2(AgentsLauncherAction);
-registerAction2(OpenChatSessionInAgentsWindowAction);
-if (!product.quality) {
-	registerAction2(ResetCopilotHarnessIntroductionAction);
+if (!product.aetherAssistant) {
+	registerAction2(OpenWorkspaceInAgentsWindowAction);
+	registerAction2(OpenWorkspaceInAgentsWindowChatTitleAction);
+	registerAction2(OpenWorkspaceInAgentsWindowTitleBarAction);
+	registerAction2(ToggleOpenInAgentsWindowTitleBarAction);
+	registerAction2(OpenAgentsWindowAction);
+	registerAction2(AgentsLauncherAction);
+	registerAction2(OpenChatSessionInAgentsWindowAction);
+	if (!product.quality) {
+		registerAction2(ResetCopilotHarnessIntroductionAction);
+	}
 }
 registerAction2(StartVoiceChatAction);
 

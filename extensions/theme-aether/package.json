@@ -1,0 +1,15 @@
+{
+	"name": "theme-aether",
+	"displayName": "Aether Obsidian",
+	"description": "AetherIDE's dark workbench theme.",
+	"version": "1.0.0",
+	"publisher": "aether",
+	"license": "MIT",
+	"engines": { "vscode": "*" },
+	"categories": ["Themes"],
+	"contributes": {
+		"themes": [
+			{ "id": "Aether Obsidian", "label": "Aether Obsidian", "uiTheme": "vs-dark", "path": "./aether-obsidian.json" }
+		]
+	}
+}
