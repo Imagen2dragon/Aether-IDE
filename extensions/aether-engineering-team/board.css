@@ -1,0 +1,35 @@
+/* Copyright (c) Microsoft Corporation. Licensed under the MIT License. */
+* { box-sizing: border-box; }
+body { margin: 0; color: var(--vscode-foreground); background: var(--vscode-editor-background); font-family: var(--vscode-font-family); }
+main { padding: 16px; }
+h1, h2, h3, p { margin: 0; }
+h1 { font-size: 22px; margin-bottom: 5px; }
+header p, #status, .specialist { color: var(--vscode-descriptionForeground); }
+form { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) auto; gap: 8px; align-items: end; margin-top: 16px; }
+label { display: grid; gap: 4px; }
+.notes { grid-column: span 2; grid-row: 2; }
+form button { grid-column: 3; grid-row: 2; }
+input, select, textarea, button { font: inherit; padding: 5px 8px; border: 1px solid var(--vscode-input-border); border-radius: 4px; min-width: 0; }
+input, select, textarea { background: var(--vscode-input-background); color: var(--vscode-input-foreground); }
+textarea { resize: vertical; }
+button { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); cursor: pointer; }
+button:hover { background: var(--vscode-button-secondaryHoverBackground); }
+button:disabled { opacity: .6; cursor: default; }
+#add:not(:disabled) { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+#add:not(:disabled):hover { background: var(--vscode-button-hoverBackground); }
+:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: 2px; }
+#status:not(:empty) { margin-top: 10px; }
+#board { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 16px; }
+.lane { min-height: 112px; background: var(--vscode-sideBar-background); border: 1px solid var(--vscode-panel-border); border-radius: 5px; padding: 8px; }
+.lane h2 { color: var(--vscode-panelTitle-activeForeground); font-size: 13px; margin-bottom: 8px; }
+.card { background: var(--vscode-input-background); border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border)); border-radius: 4px; padding: 8px; margin-bottom: 6px; overflow-wrap: anywhere; }
+.card h3 { font-size: 13px; }
+.specialist { font-size: 12px; }
+.task-notes { margin-top: 6px; white-space: pre-wrap; }
+.card-actions { display: grid; gap: 5px; margin-top: 8px; }
+.remove { background: transparent; }
+@media (max-width: 680px) { #board { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 330px) {
+	#board, form { grid-template-columns: minmax(0, 1fr); }
+	.notes, form button { grid-column: auto; grid-row: auto; }
+}

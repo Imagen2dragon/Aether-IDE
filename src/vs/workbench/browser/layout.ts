@@ -19,6 +19,7 @@ import { isTemporaryWorkspace, IWorkspaceContextService, WorkbenchState } from '
 import { IStorageService, StorageScope, StorageTarget } from '../../platform/storage/common/storage.js';
 import { IConfigurationChangeEvent, IConfigurationService, isConfigured } from '../../platform/configuration/common/configuration.js';
 import { ChatAIDisabledSettingId } from '../../platform/chat/common/chatSettings.js';
+import product from '../../platform/product/common/product.js';
 import { ITitleService } from '../services/title/browser/titleService.js';
 import { ServicesAccessor } from '../../platform/instantiation/common/instantiation.js';
 import { StartupKind, ILifecycleService } from '../services/lifecycle/common/lifecycle.js';
@@ -3603,6 +3604,7 @@ class LayoutStateModel extends Disposable {
 			// New users: Show auxiliary bar even in empty workspaces,
 			// but not if the user explicitly hides it or AI features are disabled.
 			if (
+				!product.aetherAssistant &&
 				this.isNew[StorageScope.APPLICATION] &&
 				configuration.value !== 'hidden' &&
 				!this.configurationService.getValue<boolean>(ChatAIDisabledSettingId)

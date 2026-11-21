@@ -232,3 +232,30 @@
 	left: auto;
 	right: 0;
 }
+
+.aether-rail-caption {
+	display: none;
+}
+
+.monaco-workbench:not(.floating-panels) .activitybar.aether-activity-rail:not(.compact) .composite-bar .action-item:has(> .aether-rail-caption) > .action-label {
+	transform: translateY(-7px);
+}
+
+.monaco-workbench:not(.floating-panels) .activitybar.aether-activity-rail:not(.compact) .composite-bar .aether-rail-caption {
+	position: absolute;
+	inset: auto 3px 4px;
+	z-index: 1;
+	display: block;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	text-align: center;
+	font-size: 10px;
+	line-height: 12px;
+	pointer-events: none;
+	color: var(--vscode-activityBar-inactiveForeground);
+}
+
+.monaco-workbench .activitybar.aether-activity-rail .action-item.checked > .aether-rail-caption {
+	color: var(--vscode-activityBar-foreground);
+}

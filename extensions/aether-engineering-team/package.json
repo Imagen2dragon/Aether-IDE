@@ -1,14 +1,24 @@
 {
 	"name": "aether-engineering-team",
 	"displayName": "Aether Engineering Team",
-	"description": "Read-only specialist roles for AetherIDE Chat.",
+	"description": "Plan and review workspace tasks with Aether's specialist roles.",
 	"version": "0.1.0",
 	"publisher": "aether",
 	"license": "MIT",
+	"main": "./extension.js",
+	"extensionKind": ["ui"],
+	"capabilities": { "untrustedWorkspaces": { "supported": true } },
 	"engines": {
 		"vscode": "^1.148.0"
 	},
 	"contributes": {
+		"commands": [{ "command": "aether.team.open", "title": "Open Engineering Board", "category": "Aether" }],
+		"viewsContainers": {
+			"activitybar": [{ "id": "aether-team", "title": "Engineering Team", "icon": "./team.svg" }]
+		},
+		"views": {
+			"aether-team": [{ "id": "aether.team.specialists", "name": "Specialists" }]
+		},
 		"chatAgents": [
 			{
 				"path": "./agents/architect.agent.md",
