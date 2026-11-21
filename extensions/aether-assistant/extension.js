@@ -67,6 +67,15 @@ function activate(context) {
 			let history = [];
 			let conversation;
 			const messageListener = webview.onDidReceiveMessage(async message => {
+				if (message?.type === 'copy' && typeof message.text === 'string' && message.text.length && message.text.length <= 64000) {
+					try {
+						await vscode.env.clipboard.writeText(message.text);
+						void post('copied');
+					} catch {
+						void post('copyFailed');
+					}
+					return;
+				}
 				if (message?.type === 'draftApplied') {
 					if (draft?.role === message.role && draft?.text === message.text) {
 						draft = undefined;
@@ -196,11 +205,19 @@ function activate(context) {
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src ${webview.cspSource}">
 <meta name="viewport" content="width=device-width, initial-scale=1"><link rel="stylesheet" href="${resource('assistant.css')}">
 <title>Aether Assistant</title></head><body>
-<main><header><div class="choices"><label>Local model<select id="model"></select></label><label>Specialist<select id="role"><option value="">General</option></select></label></div>
-<p id="status" role="status">Checking local models…</p><div class="actions"><button id="refresh" type="button">Refresh Models</button><button id="clear" type="button">New Conversation</button><button id="team-draft" type="button" hidden>Use Team Draft</button></div></header>
-<section id="messages" role="log" aria-label="Conversation"><p id="empty">Ask a question or request a proposed plan. The assistant sees only what you share here.</p></section>
-<form id="composer"><label for="prompt">Message</label><textarea id="prompt" rows="2" maxlength="8000" placeholder="Ask Aether…"></textarea>
-<footer><span>Ollama</span><button id="stop" type="button" hidden>Stop</button><button id="plan" type="submit" disabled aria-label="Generate a proposed plan">Plan</button><button id="send" type="submit" disabled>Send</button></footer></form>
+<main>
+<header class="assistant-header">
+<div class="toolbar"><span id="connection" role="status" data-state="checking">Checking Ollama</span><div class="session-actions"><button id="refresh" class="quiet" type="button" aria-label="Refresh Models" title="Refresh Models">Refresh</button><button id="clear" class="quiet" type="button">New Chat</button></div></div>
+<div class="choices"><label>Model<select id="model"></select></label><label>Specialist<select id="role"><option value="">General</option></select></label></div>
+<button id="team-draft" type="button" hidden>Use Team Draft</button>
+</header>
+<div class="conversation"><section id="messages" role="log" aria-label="Conversation"><div id="empty"><h2>Ask Aether</h2><p>Ask a question, paste code, or switch to Plan to request a proposal.</p></div></section><button id="latest" type="button" hidden>Jump to Latest</button></div>
+<form id="composer">
+<label class="screen-reader-only" for="prompt">Message</label><textarea id="prompt" rows="2" maxlength="8000" placeholder="Ask Aether…" aria-describedby="status"></textarea>
+<div class="composer-actions"><fieldset class="mode"><legend class="screen-reader-only">Response Mode</legend><label><input type="radio" name="mode" value="chat" checked><span>Chat</span></label><label><input id="plan-mode" type="radio" name="mode" value="plan"><span>Plan</span></label></fieldset>
+<button id="stop" type="button" hidden>Stop</button><button id="send" type="submit" disabled>Send</button></div>
+<p id="status" role="status"></p>
+</form>
 </main><script src="${resource('assistant.js')}"></script></body></html>`;
 		}
 	}));
