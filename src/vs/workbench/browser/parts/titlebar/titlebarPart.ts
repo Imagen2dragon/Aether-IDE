@@ -44,6 +44,7 @@ import { EDITOR_CORE_NAVIGATION_COMMANDS } from '../editor/editorCommands.js';
 import { AnchorAlignment } from '../../../../base/browser/ui/contextview/contextview.js';
 import { EditorPane } from '../editor/editorPane.js';
 import { IKeybindingService } from '../../../../platform/keybinding/common/keybinding.js';
+import product from '../../../../platform/product/common/product.js';
 import { ResolvedKeybinding } from '../../../../base/common/keybindings.js';
 import { EditorCommandsContextActionRunner } from '../editor/editorTabsControl.js';
 import { IEditorCommandsContext, IEditorPartOptionsChangeEvent, IToolbarActions } from '../../../common/editor.js';
@@ -523,6 +524,10 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
 		// App Icon (Windows, Linux)
 		if ((isWindows || isLinux) && !hasNativeTitlebar(this.configurationService, this.titleBarStyle)) {
 			this.appIcon = prepend(this.leftContent, $('a.window-appicon'));
+			if (product.aetherAssistant) {
+				this.appIcon.classList.add('aether-window-brand');
+				append(this.appIcon, $('span.aether-window-wordmark', { 'aria-hidden': 'true' }, 'AetherIDE'));
+			}
 		}
 
 		// Draggable region that we can manipulate for #52522
