@@ -1,7 +1,7 @@
 {
 	"name": "aether-xtool",
 	"displayName": "Aether iOS Tools",
-	"description": "Build xtool SwiftPM apps and list iOS devices from Mobile Studio.",
+	"description": "Create, validate, build, and deploy xtool SwiftPM apps from Mobile Studio.",
 	"publisher": "aether",
 	"version": "0.1.0",
 	"license": "MIT",
@@ -12,6 +12,8 @@
 	"extensionDependencies": ["aether.aether-mobile-studio"],
 	"contributes": {
 		"commands": [
+			{ "command": "aether.mobile.createIOSProject", "title": "%createIOSProject%", "category": "Mobile Studio" },
+			{ "command": "aether.mobile.validateIOSProject", "title": "%validateIOSProject%", "category": "Mobile Studio" },
 			{ "command": "aether.mobile.buildIOS", "title": "%buildIOS%", "category": "Mobile Studio" },
 			{ "command": "aether.mobile.listIOSDevices", "title": "%listIOSDevices%", "category": "Mobile Studio" },
 			{ "command": "aether.mobile.checkIOSToolchain", "title": "%checkIOSToolchain%", "category": "Mobile Studio" }
@@ -20,7 +22,7 @@
 			"aether-mobile": [{ "id": "aether.mobile.ios", "name": "iOS" }]
 		},
 		"taskDefinitions": [
-			{ "type": "aether-xtool", "required": ["operation"], "properties": { "operation": { "type": "string", "enum": ["buildIOS", "listIOSDevices"] } } }
+			{ "type": "aether-xtool", "required": ["operation"], "properties": { "operation": { "type": "string", "enum": ["buildIOS", "listIOSDevices", "createIOSProject"] } } }
 		],
 		"configuration": {
 			"title": "Aether iOS Tools",
