@@ -19,6 +19,8 @@ permissions:
 
 jobs:
   check:
+    # This ruleset definition is specific to microsoft/vscode. Downstream forks manage their own repository rules.
+    if: github.repository == 'microsoft/vscode'
     name: Check rulesets
     runs-on: ubuntu-24.04
     timeout-minutes: 5
