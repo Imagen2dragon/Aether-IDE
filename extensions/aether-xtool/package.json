@@ -15,6 +15,7 @@
 			{ "command": "aether.mobile.createIOSProject", "title": "%createIOSProject%", "category": "Mobile Studio" },
 			{ "command": "aether.mobile.validateIOSProject", "title": "%validateIOSProject%", "category": "Mobile Studio" },
 			{ "command": "aether.mobile.buildIOS", "title": "%buildIOS%", "category": "Mobile Studio" },
+			{ "command": "aether.mobile.testIOS", "title": "%testIOS%", "category": "Mobile Studio" },
 			{ "command": "aether.mobile.deployIOS", "title": "%deployIOS%", "category": "Mobile Studio" },
 			{ "command": "aether.mobile.listIOSDevices", "title": "%listIOSDevices%", "category": "Mobile Studio" },
 			{ "command": "aether.mobile.checkIOSToolchain", "title": "%checkIOSToolchain%", "category": "Mobile Studio" }
@@ -23,7 +24,7 @@
 			"aether-mobile": [{ "id": "aether.mobile.ios", "name": "iOS" }]
 		},
 		"taskDefinitions": [
-			{ "type": "aether-xtool", "required": ["operation"], "properties": { "operation": { "type": "string", "enum": ["buildIOS", "deployIOS", "listIOSDevices", "createIOSProject"] } } }
+			{ "type": "aether-xtool", "required": ["operation"], "properties": { "operation": { "type": "string", "enum": ["buildIOS", "testIOS", "deployIOS", "listIOSDevices", "createIOSProject"] } } }
 		],
 		"configuration": {
 			"title": "Aether iOS Tools",
